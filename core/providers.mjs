@@ -170,7 +170,7 @@ async function assertOk(res, protocol) {
   try {
     detail = truncate(await res.text(), 800);
   } catch {}
-  throw new Error(`模型 API HTTP ${res.status}（${protocol}）：${detail || res.statusText}`);
+  throw new Error(`模型服务返回 HTTP ${res.status}（${protocol}）：${detail || res.statusText}`);
 }
 
 // ---------- 三协议流解析 ----------
@@ -341,7 +341,7 @@ function mockScript(userText) {
       { say: "已创建 hello.txt，内容是「你好，来自 u-agent」。" },
     ];
   }
-  return [{ say: `（Mock 模型）收到：${userText}。请在设置里接入真实模型 API。` }];
+  return [{ say: `（Mock 模型）收到：${userText}。请在设置里接入真实模型通道并填钥匙。` }];
 }
 
 async function* streamMock(provider, messages, tools, signal) {

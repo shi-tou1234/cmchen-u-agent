@@ -75,7 +75,7 @@ export default {
       }
     }
     throw new Error(
-      `所有搜索源都失败了：\n${errs.join("\n")}\n（国内网络建议在设置里配置 Tavily 或 Brave 的 API key）`
+      `所有搜索源都失败了：\n${errs.join("\n")}\n（国内网络建议在设置里配置 Tavily 或 Brave 的搜索钥匙）`
     );
   },
 };
