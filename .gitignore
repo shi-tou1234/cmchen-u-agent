@@ -1,0 +1,9 @@
+# 运行时与数据全在 U 盘、不进 git（重新产出：双击 setup-uagent.bat）
+runtime/
+data/
+app/
+node_modules/
+config.json
+*.log
+PROGRESS.md
+BLOCKED.md
