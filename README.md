@@ -7,7 +7,7 @@
 ## 三步用法
 
 1. **装环境（只做一次）**：双击 `setup-uagent.bat`（需联网，约 1 分钟，自动从 npmmirror 下载便携版 node 22）
-2. **首次配置（只做一次）**：双击 `启动U-Agent.bat` → 浏览器打开后点右上角「设置」→ 选工作区目录、选模型并填 API key（保存在 U 盘里，以后永不再配）
+2. **首次配置（只做一次）**：双击 `启动U-Agent.bat` → 浏览器打开后先设置启动密码（每次启动都要输）→ 点右上角「设置」→ 选工作区目录、选模型通道并填钥匙（加密保存在 U 盘里，以后永不再配）
 3. **日常使用**：插 U 盘 → 双击 `启动U-Agent.bat` → 开聊。换任何电脑都不用重装重配
 
 模型走 OpenAI 兼容接口，内置三协议：**OpenAI Chat Completions / OpenAI Responses / Anthropic Messages**（GLM、DeepSeek、OpenAI、Anthropic 预填好，改 key 即用）；没配 key 也能用 **Mock 模式**体验界面。
@@ -48,8 +48,9 @@ runtime|data|config.json   运行时与数据（不进 git）
 
 ## 已知限制
 
-- 目标机需能访问所选模型 API（联网）；Mock 模式离线可用
-- 目标机使用 git 工具需其装有 git；API key 明文存 U 盘 `data\credentials.json`（U 盘别外借）
+- 目标机需能访问所选模型服务（联网）；Mock 模式离线可用
+- 目标机使用 git 工具需其装有 git；钥匙加密存于 U 盘 `data\vault.bin`（网页里不可见、文件不存明文，但属防偷看级防护，U 盘仍别外借）
+- 忘记启动密码：删掉 U 盘 `data\lock.json` 重新设置
 - shell 30 秒超时、输出 200KB 截断；只支持 Win10/11 x64
 
 ## License

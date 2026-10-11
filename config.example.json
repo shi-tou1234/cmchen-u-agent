@@ -1,10 +1,10 @@
 {
   "active": "Mock",
   "providers": [
-    { "name": "Mock", "protocol": "mock", "baseURL": "", "model": "mock-1", "apiKey": "" },
-    { "name": "GLM", "protocol": "openai-chat", "baseURL": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4.7", "apiKey": "" },
-    { "name": "DeepSeek", "protocol": "openai-chat", "baseURL": "https://api.deepseek.com", "model": "deepseek-chat", "apiKey": "" },
-    { "name": "OpenAI", "protocol": "openai-responses", "baseURL": "https://api.openai.com/v1", "model": "gpt-5", "apiKey": "" },
-    { "name": "Anthropic", "protocol": "anthropic", "baseURL": "https://api.anthropic.com", "model": "claude-sonnet-4-5", "apiKey": "" }
+    { "name": "Mock", "protocol": "mock", "baseURL": "", "model": "mock-1", "secret": "" },
+    { "name": "GLM", "protocol": "openai-chat", "baseURL": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4.7", "secret": "" },
+    { "name": "DeepSeek", "protocol": "openai-chat", "baseURL": "https://api.deepseek.com", "model": "deepseek-chat", "secret": "" },
+    { "name": "OpenAI", "protocol": "openai-responses", "baseURL": "https://api.openai.com/v1", "model": "gpt-5", "secret": "" },
+    { "name": "Anthropic", "protocol": "anthropic", "baseURL": "https://api.anthropic.com", "model": "claude-sonnet-4-5", "secret": "" }
   ]
 }
