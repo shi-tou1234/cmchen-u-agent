@@ -91,9 +91,9 @@ sandbox：白名单 = [工作区目录（首启网页里选，存 data/settings.
 
 ```
 A 结构: ls G:/agent 关键文件齐 + cat VERSIONS.json
-B 装机: rm -rf G:/agent/runtime && cmd //c G:\\agent\\setup-uagent.bat
+B 装机: rm -rf G:/agent/runtime && cd G:/agent && ./setup-uagent.bat
         → G:/agent/runtime/node/node.exe --version == v22.21.1
-        → 再跑一遍输出「已就绪」且 runtime 内文件 mtime 不变（幂等）
+        → 再跑一遍输出「已就绪」且 runtime 内文件 mtime 不变（幂等；setup 成功即退出不 pause，报错才 pause）
 C 启动: cd G:/agent && ./启动U-Agent.bat & （后台起，等5秒）→ curl -s http://127.0.0.1:3080/ == 200（中文文件名 bat 从 Git Bash 直接执行已验证可用）
 D 测试: G:/agent/runtime/node/node.exe --test G:/agent/test/ 全绿且 skipped=0
 E 端到端: curl /api/chat（Mock provider）发「在工作区建 hello.txt 写入你好」
@@ -103,6 +103,45 @@ G git: git -C G:/agent status 干净；git ls-files | grep -E "^runtime/|^data/|
         push 后 git ls-remote origin main == 本地 HEAD
 H 反向验证: 临时把 data/settings.json 工作区指向白名单外(如 C:\Windows) → fs_write 被拒（贴拒绝输出）→ 还原后恢复
 I 隔离: 启动前后 %USERPROFILE%\ 下无新增 .u-agent 等目录；%APPDATA%/%LOCALAPPDATA% 无新增相关目录
+```
+
+## v2 追加规格（2026-10-12 领导追加：常用功能补全 + 权限模式）
+
+### 权限模式（五档，UI 右上下拉，随会话保存）
+
+| mode | low | medium | high（fs_delete/fs_write覆盖/shell_run） | 说明 |
+|---|---|---|---|---|
+| confirm（默认） | 执行 | 执行 | 网页弹窗确认 | 逐次确认 |
+| readonly 只读 | 执行 | 拒绝 | 拒绝 | 拒绝文案告知切模式 |
+| plan 计划 | 执行 | 拒绝 | 拒绝 | 同只读 + 系统提示词追加「先调研并输出计划，不执行改动」 |
+| auto 自动审批 | 执行 | 执行 | **拒绝**（危险命令不执行，领导原话） | 高危直接拦，返回提示 |
+| full 完全权限 | 执行 | 执行 | 直接执行 | 全记 audit 日志 |
+
+shell 黑名单（format/shutdown/reg delete/vssadmin/cipher /w/盘根递归删除）在**任何模式**都拒绝——工具内部实现，与模式无关。实现于 core/modes.mjs 的 `gate(mode, risk) → "run"|"confirm"|"deny"`。
+
+### 新增工具
+
+| 工具 | risk | 说明 |
+|---|---|---|
+| web_search(query) | low | 依次尝试：Tavily（settings 里配了 key）→ Brave（配了 key）→ DuckDuckGo HTML 抓取（免 key 尽力而为，失败返回明确错误提示去配 key）；返回前 8 条 标题+URL+摘要 |
+| web_fetch(url) | low | GET 15s 超时，html/json/text 转纯文本（去 script/style/标签），截断 200KB |
+| git_status/git_diff/git_log | low | cwd=工作区，输出截断 100KB；git 未装返回明确错误 |
+| git_commit(message) | medium | git add -A + commit（仅限工作区内的 git 仓库） |
+| git_push/git_pull | medium | 工作区仓库 push/pull origin 当前分支 |
+| spawn_subagent(task, name?) | medium | 子 agent：独立上下文、继承当前模式、最多 15 步、禁再嵌套；独立 jsonl 日志（sessions/sub-*.jsonl）；返回最终文本 |
+
+### 图片输入
+
+- /api/chat 消息支持 text + images[]（base64 dataURL，单张 ≤5MB，单条 ≤4 张）；UI 支持粘贴(Ctrl+V)与文件选择，带缩略图预览
+- 三协议映射：openai-chat→content[].{type:"image_url",image_url:{url:"data:..."}}；openai-responses→{type:"input_image",image_url:"data:..."}；anthropic→content[].{type:"image",source:{type:"base64",media_type,data}}
+- 图片随会话 jsonl 落盘（data 字段保留，U 盘装得下）
+
+### v2 追加验收
+
+```
+J 模式门禁: readonly 模式下 /api/chat 请求 fs_write → SSE 收到 deny 事件且文件未创建；
+        auto 模式下 fs_delete → 拒绝事件；full 模式 → 直接执行；confirm 模式 → confirm_request 且 /api/confirm approve 后执行
+K 图片: /api/chat 带 1 张 1x1 png base64（Mock provider）→ 会话 jsonl 里 user 事件含 images 且长度>0，对话正常完成
 ```
 
 ## 已知限制（写进 README）
