@@ -95,9 +95,30 @@ body{background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"Segoe UI","Mi
 .err{border:1px solid var(--bad);background:#2d1417;color:#ffb3b6;border-radius:10px;padding:10px 14px;margin:10px 0;max-width:900px}
 .hint{color:var(--dim);font-size:12.5px;margin:14px 0;max-width:900px}
 ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
+/* 密码锁 */
+#lock{position:fixed;inset:0;background:var(--bg);z-index:100;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px}
+#lock.hide{display:none}
+#lock .lk-logo{font-size:26px;font-weight:800;letter-spacing:1px}
+#lock .lk-logo span{color:var(--acc)}
+#lock .lk-sub{color:var(--dim);font-size:13px;margin-bottom:10px}
+#lock input{background:var(--bg3);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:11px 14px;font-size:15px;width:260px;text-align:center}
+#lock input:focus{outline:1px solid var(--acc)}
+#lock .lk-btn{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:10px 26px;font-size:14px;cursor:pointer}
+#lock .lk-err{color:var(--bad);font-size:13px;min-height:18px}
+#lock .lk-hint{color:var(--dim);font-size:11.5px;max-width:320px;text-align:center}
 </style>
 </head>
 <body>
+<div id="lock">
+  <div class="lk-logo">u-<span>agent</span></div>
+  <div class="lk-sub" id="lkSub">输入密码解锁</div>
+  <input id="lkPw1" type="password" placeholder="密码" style="display:none">
+  <input id="lkPw2" type="password" placeholder="再输一遍确认" style="display:none">
+  <input id="lkPw" type="password" placeholder="密码">
+  <div class="lk-err" id="lkErr"></div>
+  <button class="lk-btn" id="lkGo">解锁</button>
+  <div class="lk-hint" id="lkHint">密码只存在这台 U 盘里（哈希，不存明文）。忘记密码：删掉 U 盘 data 文件夹里的 lock.json 即可重设。</div>
+</div>
 <div id="side">
   <div class="logo">u-<span>agent</span> 随身 AI</div>
   <button id="newChat">＋ 新会话</button>
@@ -118,7 +139,7 @@ body{background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"Segoe UI","Mi
     <select id="provSel" title="模型"></select>
     <button id="gear">设置</button>
   </div>
-  <div id="msgs"><div class="hint">把 U 盘插上任何 Win10/11 电脑，双击「启动U-Agent.bat」即用。<br>首次使用：点右上角「设置」，选工作区目录、选模型并填 API key（只填这一次，永久保存在 U 盘里）。<br>支持直接粘贴图片提问。删除/覆盖/命令执行等高危操作会先征求你同意。</div></div>
+  <div id="msgs"><div class="hint">把 U 盘插上任何 Win10/11 电脑，双击「启动U-Agent.bat」即用。<br>首次使用：点右上角「设置」，选工作区目录、选模型通道并填钥匙（只填这一次，加密保存在 U 盘里）。<br>支持直接粘贴图片提问。删除/覆盖/命令执行等高危操作会先征求你同意。</div></div>
   <div id="comp">
     <div id="imgs"></div>
     <div id="inRow">
@@ -135,15 +156,19 @@ body{background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"Segoe UI","Mi
   <div class="db">
     <div class="fld"><label>工作区目录（agent 的可操作范围之一，必填）</label>
       <input id="wsInput" placeholder="例如 D:\我的项目 或 U:\agent\workspace"></div>
-    <div class="fld"><label>默认模型</label><select id="actSel"></select></div>
-    <div class="fld"><label>模型 Providers（OpenAI 兼容 chat / OpenAI responses / Anthropic 三种协议）</label>
+    <div class="fld"><label>默认模型通道</label><select id="actSel"></select></div>
+    <div class="fld"><label>模型通道（三种协议：OpenAI 兼容 chat / OpenAI responses / Anthropic）</label>
       <div id="provRows"></div>
-      <button class="btn gray" id="addProv">＋ 添加 provider</button></div>
-    <div class="fld"><label>联网搜索 key（可选；Tavily / Brave 任配其一，国内网络推荐）</label>
-      <input id="kTavily" placeholder="Tavily API key（tvly-…）" style="margin-bottom:8px">
-      <input id="kBrave" placeholder="Brave Search API key"></div>
+      <button class="btn gray" id="addProv">＋ 添加通道</button></div>
+    <div class="fld"><label>搜索钥匙（可选；Tavily / Brave 任配其一，国内网络推荐）</label>
+      <input id="kTavily" type="password" placeholder="Tavily 钥匙（tvly-…）——已保存则留空" style="margin-bottom:8px">
+      <input id="kBrave" type="password" placeholder="Brave 钥匙——已保存则留空"></div>
+    <div class="fld"><label>修改密码（需输当前密码；改完本次会话仍有效）</label>
+      <input id="pwOld" type="password" placeholder="当前密码" style="margin-bottom:8px">
+      <input id="pwNext" type="password" placeholder="新密码（≥4 位）" style="margin-bottom:8px">
+      <button class="btn gray" id="pwChange">修改密码</button></div>
     <button class="btn" id="saveSet">保存设置</button>
-    <p class="hint" style="margin-top:14px">key 明文存在 U 盘 data\credentials.json，U 盘别外借。</p>
+    <p class="hint" style="margin-top:14px">钥匙加密后存在 U 盘 data 文件夹里（不存明文、网页里不显示）；U 盘别外借。</p>
   </div>
 </div>
 <div id="mask"><div id="confirmBox">
@@ -340,24 +365,33 @@ function renderDrawer(){
     const d=el(`<div class="provRow">
       <div class="pr"><input class="nm" value="${p.name||""}" placeholder="名称"><select class="pt">${PROTOCOLS.map(([v,t])=>`<option value="${v}" ${p.protocol===v?"selected":""}>${t}</option>`).join("")}</select></div>
       <div class="pr"><input class="bu" value="${p.baseURL||""}" placeholder="baseURL，如 https://api.deepseek.com"><input class="mo" value="${p.model||""}" placeholder="模型名"></div>
-      <div class="pr"><input class="ky" type="password" value="${p.apiKey||""}" placeholder="API key（留空=保留已存）"><button class="del" title="删除">🗑</button></div>
+      <div class="pr"><input class="ky" type="password" value="" placeholder="钥匙——已保存则留空"><button class="del" title="删除">🗑</button></div>
     </div>`);
     d.querySelector(".nm").oninput=e=>p.name=e.target.value;
     d.querySelector(".pt").onchange=e=>p.protocol=e.target.value;
     d.querySelector(".bu").oninput=e=>p.baseURL=e.target.value;
     d.querySelector(".mo").oninput=e=>p.model=e.target.value;
-    d.querySelector(".ky").oninput=e=>p.apiKey=e.target.value;
+    d.querySelector(".ky").type="password";
+    d.querySelector(".ky").value="";
+    d.querySelector(".ky").placeholder="钥匙——已保存则留空";
+    d.querySelector(".ky").oninput=e=>p.secret=e.target.value;
     d.querySelector(".del").onclick=()=>{drawerProv.splice(ix,1);renderDrawer();};
     $("#provRows").appendChild(d);
   });
 }
-$("#addProv").onclick=()=>{drawerProv.push({name:"新provider",protocol:"openai-chat",baseURL:"",model:"",apiKey:""});renderDrawer();};
+$("#addProv").onclick=()=>{drawerProv.push({name:"新provider",protocol:"openai-chat",baseURL:"",model:"",secret:""});renderDrawer();};
 $("#saveSet").onclick=async()=>{
   const body={workspace:$("#wsInput").value,providers:drawerProv,active:$("#actSel").value,
     searchKeys:{tavily:$("#kTavily").value.trim(),brave:$("#kBrave").value.trim()}};
   const r=await fetch("/api/settings",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
   const j=await r.json();
   if(j.error)addErr(j.error);else{$("#drawer").classList.remove("open");fillProviderSel(j);addHint("设置已保存到 U 盘。");}
+};
+$("#pwChange").onclick=async()=>{
+  const r=await fetch("/api/lock-change",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({old:$("#pwOld").value,next:$("#pwNext").value})});
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){$("#pwOld").value="";$("#pwNext").value="";addHint("密码已修改，下次启动用新密码。");}
+  else addErr(j.error||"修改失败");
 };
 $("#gear").onclick=openDrawer;
 $("#dClose").onclick=()=>$("#drawer").classList.remove("open");
@@ -398,8 +432,30 @@ async function loadSession(id){
 }
 $("#newChat").onclick=()=>{if(sending)return;sessionId=null;msgsEl.innerHTML="";refreshSessions();};
 
-/* ---------- 启动 ---------- */
-(async function init(){
+/* ---------- 密码锁与启动 ---------- */
+let lockMode="unlock";
+function resetLockUI(){lockMode="unlock";$("#lkSub").textContent="输入密码解锁";$("#lkPw1").style.display="none";$("#lkPw2").style.display="none";$("#lkPw").style.display="";$("#lkPw1").value="";$("#lkPw2").value="";$("#lkPw").value="";$("#lkErr").textContent="";$("#lkGo").textContent="解锁";}
+async function doUnlock(pw){
+  const r=await fetch("/api/unlock",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:pw})});
+  if(r.ok){$("#lock").classList.add("hide");mainInit();return true;}
+  $("#lkErr").textContent="密码不对";$("#lkPw").value="";return false;
+}
+async function doSetup(){
+  const a=$("#lkPw1").value,b=$("#lkPw2").value;
+  if(a.length<4){$("#lkErr").textContent="密码至少 4 位";return;}
+  if(a!==b){$("#lkErr").textContent="两次输入不一致";return;}
+  const r=await fetch("/api/lock-set",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:a})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){$("#lkErr").textContent=j.error||"设置失败";return;}
+  $("#lkHint").textContent="密码已保存到 U 盘（哈希）。每次启动都要输入。";
+  await doUnlock(a);
+}
+$("#lkGo").onclick=()=>{lockMode==="setup"?doSetup():doUnlock($("#lkPw").value);};
+for(const id of ["lkPw","lkPw1","lkPw2"]) $("#"+id).addEventListener("keydown",e=>{if(e.key==="Enter")$("#lkGo").click();});
+const _fetch=window.fetch;
+window.fetch=async(...a)=>{const r=await _fetch(...a);if(r&&r.status===401){try{const j=await r.clone().json();if(j.locked){resetLockUI();$("#lock").classList.remove("hide");}}catch{}}return r;};
+
+async function mainInit(){
   try{
     const h=await(await fetch("/api/health")).json();
     const st=await(await fetch("/api/settings")).json();
@@ -408,6 +464,12 @@ $("#newChat").onclick=()=>{if(sending)return;sessionId=null;msgsEl.innerHTML="";
     $("#compHint").textContent=st.workspace?"":HINTS.confirm+"——先点「设置」选工作区";
   }catch(e){addErr("服务未就绪："+e.message);}
   refreshSessions();
+}
+(async function boot(){
+  try{
+    const st=await(await fetch("/api/lock-status")).json();
+    if(st.setup){lockMode="setup";$("#lkSub").textContent="首次使用：设置一个启动密码（每次启动都要输入）";$("#lkPw1").style.display="";$("#lkPw2").style.display="";$("#lkPw").style.display="none";$("#lkGo").textContent="保存并进入";}
+  }catch{}
 })();
 </script>
 </body>

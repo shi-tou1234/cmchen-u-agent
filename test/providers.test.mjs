@@ -31,7 +31,7 @@ test("openai-chat：请求带 function 工具与消息映射，SSE 增量与 too
     ]);
   });
   upstream = up;
-  const provider = { protocol: "openai-chat", baseURL: up.url, model: "m", apiKey: "sk-test" };
+  const provider = { protocol: "openai-chat", baseURL: up.url, model: "m", secret: "sk-test" };
   const messages = [
     { role: "system", text: "sys" },
     { role: "user", text: "看图", images: [{ mediaType: "image/png", data: "aGk=" }] },
@@ -67,7 +67,7 @@ test("openai-responses：input 映射 + function_call_output + output_item 流�
     res.end();
   });
   upstream = up;
-  const provider = { protocol: "openai-responses", baseURL: up.url, model: "m", apiKey: "k" };
+  const provider = { protocol: "openai-responses", baseURL: up.url, model: "m", secret: "k" };
   const messages = [
     { role: "user", text: "hi", images: [{ mediaType: "image/png", data: "aGk=" }] },
     { role: "assistant", text: "", toolCalls: [{ id: "call_1", name: "fs_write", args: {} }] },
@@ -108,7 +108,7 @@ test("anthropic：x-api-key 头、tool_result 合并进 user、tool_use 流解�
     res.end();
   });
   upstream = up;
-  const provider = { protocol: "anthropic", baseURL: up.url, model: "m", apiKey: "ak-test" };
+  const provider = { protocol: "anthropic", baseURL: up.url, model: "m", secret: "ak-test" };
   const messages = [
     { role: "system", text: "sys" },
     { role: "user", text: "看图", images: [{ mediaType: "image/png", data: "aGk=" }] },
@@ -128,7 +128,7 @@ test("上游 HTTP 错误要抛出并带状态码", async () => {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: { message: "bad key" } }));
   });
-  const provider = { protocol: "openai-chat", baseURL: up.url, model: "m", apiKey: "bad" };
+  const provider = { protocol: "openai-chat", baseURL: up.url, model: "m", secret: "bad" };
   await assert.rejects(() => collect(streamChat(provider, [{ role: "user", text: "hi" }], [])), /HTTP 401/);
   await up.close();
 });

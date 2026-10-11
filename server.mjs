@@ -1,7 +1,8 @@
-// u-agent 本地服务：静态页 + API（SSE 聊天 / 确认 / 设置 / 会话）。零 npm 依赖。
+// u-agent 本地服务：静态页 + API（SSE 聊天 / 确认 / 设置 / 会话 / 密码锁）。零 npm 依赖。
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Registry } from "./core/tools.mjs";
 import { runAgent } from "./core/agent-loop.mjs";
@@ -13,8 +14,9 @@ import { readJson, writeJson, genId, truncate } from "./core/util.mjs";
 const UA_HOME = process.env.UA_HOME || path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.join(UA_HOME, "data");
 const CONFIG = path.join(UA_HOME, "config.json");
-const CREDS = path.join(DATA, "credentials.json");
+const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不存明文）
 const SETTINGS = path.join(DATA, "settings.json");
+const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -25,25 +27,45 @@ await registry.load();
 // 兜底：单个未处理拒绝不许炸掉整个常驻服务
 process.on("unhandledRejection", (e) => console.error("[u-agent] 未处理的 Promise 拒绝（已拦截）：", e?.stack || e));
 
-// ---------- 配置 ----------
+// ---------- 配置（钥匙加密入库，不落明文） ----------
+const VAULT_KEY = crypto.createHash("sha256").update("u-agent-local-vault-v1").digest(); // 混淆级防护：防记事本直接偷看
+
+function vaultSave(obj) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", VAULT_KEY, iv);
+  const enc = Buffer.concat([c.update(JSON.stringify(obj), "utf8"), c.final()]);
+  fs.mkdirSync(DATA, { recursive: true });
+  fs.writeFileSync(VAULT, Buffer.concat([iv, c.getAuthTag(), enc]));
+}
+function vaultLoad() {
+  try {
+    const buf = fs.readFileSync(VAULT);
+    const d = crypto.createDecipheriv("aes-256-gcm", VAULT_KEY, buf.subarray(0, 12));
+    d.setAuthTag(buf.subarray(12, 28));
+    return JSON.parse(Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString("utf8"));
+  } catch {
+    return {};
+  }
+}
+
 function defaultProviders() {
   return readJson(EXAMPLE, {}).providers || [
-    { name: "Mock", protocol: "mock", baseURL: "", model: "mock-1", apiKey: "" },
+    { name: "Mock", protocol: "mock", baseURL: "", model: "mock-1", secret: "" },
   ];
 }
 function loadState() {
   const base = readJson(CONFIG, null) || readJson(EXAMPLE, null) || {};
-  const creds = readJson(CREDS, {});
+  const vault = vaultLoad();
   const settings = readJson(SETTINGS, {});
   const providers = (base.providers || defaultProviders()).map((p) => ({
     ...p,
-    apiKey: creds.providers?.[p.name] || p.apiKey || "",
+    secret: vault.providers?.[p.name] || "",
   }));
   return {
     providers,
     active: base.active || settings.active || providers[0]?.name,
     workspace: settings.workspace || "",
-    searchKeys: creds.searchKeys || {},
+    searchKeys: vault.searchKeys || {},
   };
 }
 function saveState(patch) {
@@ -52,19 +74,37 @@ function saveState(patch) {
   const active = patch.active ?? cur.active;
   const workspace = patch.workspace ?? cur.workspace;
   const searchKeys = patch.searchKeys ?? cur.searchKeys;
-  writeJson(CONFIG, { providers: providers.map((p) => ({ ...p, apiKey: "" })), active });
-  const creds = { providers: {}, searchKeys: searchKeys || {} };
-  for (const p of providers) if (p.apiKey) creds.providers[p.name] = p.apiKey;
-  writeJson(CREDS, creds);
+  writeJson(CONFIG, { providers: providers.map((p) => ({ ...p, secret: "" })), active });
+  const vault = { providers: {}, searchKeys: searchKeys || {} };
+  for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
+  vaultSave(vault);
   writeJson(SETTINGS, { workspace, active });
   return loadState();
 }
 if (!fs.existsSync(CONFIG)) saveState({});
 
+// ---------- 密码锁 ----------
+const sessionTokens = new Set();
+const FREE_PATHS = new Set(["/api/health", "/api/lock-status", "/api/unlock", "/api/lock-set", "/api/lock-change"]);
+
+function lockHash(pw, salt) {
+  return crypto.scryptSync(String(pw), salt, 32).toString("hex");
+}
+function lockVerify(pw) {
+  const info = readJson(LOCK, null);
+  if (!info) return false;
+  return crypto.timingSafeEqual(Buffer.from(lockHash(pw, info.salt)), Buffer.from(info.hash));
+}
+function cookieOf(req) {
+  const m = /(?:^|;\s*)ua_tok=([a-f0-9]{64})/.exec(req.headers.cookie || "");
+  return m ? m[1] : null;
+}
+const unlocked = (req) => sessionTokens.has(cookieOf(req));
+
 function maskState(st) {
   return {
     ...st,
-    providers: st.providers.map((p) => ({ ...p, apiKey: p.apiKey ? "•••已保存" : "" })),
+    providers: st.providers.map((p) => ({ ...p, secret: p.secret ? "•••已保存" : "" })),
   };
 }
 
@@ -93,7 +133,7 @@ async function handleChat(req, res, body) {
   const sessionId = body.sessionId || sessions.create("s");
   const mode = MODES.includes(body.mode) ? body.mode : "confirm";
   const provider = st.providers.find((p) => p.name === (body.provider || st.active)) || st.providers[0];
-  if (!provider) return sendJson(res, 400, { error: "没有可用的模型 provider，请先在设置里配置" });
+  if (!provider) return sendJson(res, 400, { error: "没有可用的模型通道，请先在设置里配置" });
   if (!settingsReady(st)) return sendJson(res, 400, { error: "请先在设置里选择工作区目录（agent 只能在工作区和 U 盘目录内操作）", needWorkspace: true });
 
   const msg = body.message || {};
@@ -189,8 +229,51 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://127.0.0.1");
   try {
+    // 密码锁：白名单之外的功能接口必须先解锁
+    if (u.pathname.startsWith("/api/") && !FREE_PATHS.has(u.pathname) && !unlocked(req)) {
+      return sendJson(res, 401, { error: "请先输入密码解锁", locked: true });
+    }
+    if (req.method === "GET" && u.pathname === "/api/lock-status") {
+      return sendJson(res, 200, { setup: !fs.existsSync(LOCK) });
+    }
+    if (req.method === "POST" && u.pathname === "/api/lock-set") {
+      const b = await readBody(req);
+      if (fs.existsSync(LOCK)) return sendJson(res, 409, { error: "已设置过密码，请走解锁或修改流程" });
+      const pw = String(b.password || "");
+      if (pw.length < 4) return sendJson(res, 400, { error: "密码至少 4 位" });
+      const salt = crypto.randomBytes(16).toString("hex");
+      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now() });
+      return sendJson(res, 200, { ok: true });
+    }
+    if (req.method === "POST" && u.pathname === "/api/unlock") {
+      const b = await readBody(req);
+      if (!lockVerify(b.password)) {
+        await new Promise((r) => setTimeout(r, 600)); // 防暴力试
+        return sendJson(res, 403, { error: "密码不对" });
+      }
+      const tok = crypto.randomBytes(32).toString("hex");
+      sessionTokens.add(tok);
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "set-cookie": `ua_tok=${tok}; Path=/; HttpOnly; SameSite=Strict`,
+      });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.method === "POST" && u.pathname === "/api/lock-change") {
+      const b = await readBody(req);
+      if (!unlocked(req)) return sendJson(res, 401, { error: "请先解锁" });
+      if (!lockVerify(b.old)) {
+        await new Promise((r) => setTimeout(r, 600));
+        return sendJson(res, 403, { error: "旧密码不对" });
+      }
+      const pw = String(b.next || "");
+      if (pw.length < 4) return sendJson(res, 400, { error: "新密码至少 4 位" });
+      const salt = crypto.randomBytes(16).toString("hex");
+      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now() });
+      return sendJson(res, 200, { ok: true });
+    }
     if (req.method === "GET" && u.pathname === "/api/health") {
-      return sendJson(res, 200, { ok: true, name: "u-agent", version: "0.2.0", tools: registry.list().length });
+      return sendJson(res, 200, { ok: true, name: "u-agent", version: "0.2.1", tools: registry.list().length });
     }
     if (req.method === "POST" && u.pathname === "/api/chat") return await handleChat(req, res, await readBody(req));
     if (req.method === "POST" && u.pathname === "/api/confirm") {
@@ -212,7 +295,7 @@ const server = http.createServer(async (req, res) => {
         // key 字段为掩码时保留原值
         patch.providers = b.providers.map((p) => {
           const old = cur.providers.find((o) => o.name === p.name);
-          return { ...p, apiKey: !p.apiKey || p.apiKey === "•••已保存" ? old?.apiKey || "" : p.apiKey };
+          return { ...p, secret: !p.secret || p.secret === "•••已保存" ? old?.secret || "" : p.secret };
         });
       }
       if (b.active !== undefined) patch.active = b.active;

@@ -13,13 +13,13 @@ function endpoint(provider) {
   const base = String(provider.baseURL || "").replace(/\/+$/, "");
   switch (provider.protocol) {
     case "openai-chat":
-      return { url: `${base}/chat/completions`, headers: { Authorization: `Bearer ${provider.apiKey}` } };
+      return { url: `${base}/chat/completions`, headers: { Authorization: `Bearer ${provider.secret}` } };
     case "openai-responses":
-      return { url: `${base}/responses`, headers: { Authorization: `Bearer ${provider.apiKey}` } };
+      return { url: `${base}/responses`, headers: { Authorization: `Bearer ${provider.secret}` } };
     case "anthropic":
       return {
         url: `${base}/v1/messages`,
-        headers: { "x-api-key": provider.apiKey, "anthropic-version": "2023-06-01" },
+        headers: { "x-api-key": provider.secret, "anthropic-version": "2023-06-01" },
       };
     default:
       throw new Error(`未知协议 ${provider.protocol}`);

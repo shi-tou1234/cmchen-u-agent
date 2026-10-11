@@ -145,7 +145,38 @@ K 图片: /api/chat 带 1 张 1x1 png base64（Mock provider）→ 会话 jsonl 
 ```
 
 ## 已知限制（写进 README）
+```
 
-- 目标机需能访问所选模型 API（联网）；离线可用 Mock 体验界面
+## v3 追加规格（2026-10-12 领导追加：密码锁 + 钥匙不可见 + 去除敏感字样）
+
+### 密码锁（每次使用必输）
+
+- 首次打开网页：要求设置密码（输两遍，≥4 位），存 `data\lock.json`（scrypt 加盐哈希，绝不存明文）
+- 之后每次启动服务（每次双击 bat / 每次新开会话网页）都需要输密码解锁；解锁前所有功能接口一律 401
+- 会话令牌：解锁后发 HttpOnly Cookie（内存态，服务重启即失效）；「设置」里可改密码（需输旧密码）
+- 忘记密码：删掉 U 盘 `data\lock.json` 重设（README 说明）
+- 接口白名单（免解锁）：/api/health、/api/lock-status、/api/unlock、/api/lock-set、/api/lock-change；其余 /api/* 必须携带有效会话
+- 验证失败固定延迟 600ms（防暴力试）
+
+### 钥匙保管（用户可见层"不可直接查看"）
+
+- 网页设置里钥匙框一律不回显（已保存显示为空 + 占位提示「已保存——不改请留空」），只有输入新值才更新
+- 落盘从明文 JSON 改为 `data\vault.bin`（AES-256-GCM 加密的数据文件，防记事本直接偷看；属混淆级防护，README 如实说明）
+- 改密码不影响 vault（vault 密钥与应用绑定，与登录密码解耦）
+
+### 命名规范（用户可见层禁用 api 相关字样）
+
+- UI 与提示语：「API key」→「钥匙」；「Provider」→「模型通道」；「baseURL」→「服务地址」
+- 涉及文件：data\credentials.json（明文）废弃 → data\vault.bin；data\lock.json（密码锁）
+- 代码内部字段统一用 secret（此前 apiKey 字样一并清除），用户可见文案用「钥匙」
+
+### v3 追加验收
+
+```
+L 密码锁: 未解锁访问 /api/settings → 401；lock-set 设密码 → 解锁错密码被拒（600ms 延迟）→ 对密码解锁拿到 Cookie → 功能接口 200；服务重启后旧 Cookie 失效
+M 钥匙不可见: 保存含钥匙的通道后，/api/settings 回显不含钥匙原文；data/vault.bin 内容（AES-GCM）不含钥匙明文；config.json 同样不含
+N 字样扫描: public/index.html 与 README.md 中不出现「API key」「apikey」等用户可见字样（代码内部字段除外）
+
+- 目标机需能访问所选模型服务（联网）；离线可用 Mock 体验界面
 - API key 明文存 U 盘（data/credentials.json），U 盘别外借；加密不在本期范围
 - shell 超时 30s、输出 200KB 上限；长任务拆步骤

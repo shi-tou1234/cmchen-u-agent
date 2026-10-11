@@ -39,9 +39,22 @@ async function startServer() {
 const wsDir = tmpDir();
 const EXAMPLE_PROVIDERS = JSON.parse(fs.readFileSync(path.join(REPO, "config.example.json"), "utf8")).providers;
 const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const TEST_PW = "test-pw-1234";
+let COOKIE = "";
+
+function jfetch(p, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (COOKIE) headers.cookie = COOKIE;
+  return fetch(BASE + p, { ...opts, headers });
+}
+
+async function jjson(p, opts = {}) {
+  const r = await jfetch(p, opts);
+  return { status: r.status, json: await r.json().catch(() => ({})), res: r };
+}
 
 async function chat(body) {
-  const res = await fetch(`${BASE}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const res = await jfetch("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const text = await res.text();
   const events = [];
   for (const line of text.split("\n")) {
@@ -55,9 +68,24 @@ async function chat(body) {
 }
 
 test.before(async () => {
+  // 干净的锁状态：每次运行重新走 设密码→解锁 流程
+  for (const f of ["lock.json", "vault.bin"]) {
+    try {
+      fs.rmSync(path.join(REPO, "data", f), { force: true });
+    } catch {}
+  }
   await startServer();
-  // 每次运行先复位 provider 状态（Mock 为主），防止历史测试污染
-  await fetch(`${BASE}/api/settings`, {
+  assert.equal((await jjson("/api/lock-status")).json.setup, true, "首次应为待设置状态");
+  const set = await jjson("/api/lock-set", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: TEST_PW }) });
+  assert.equal(set.status, 200, "设密码应成功");
+  const un = await jjson("/api/unlock", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: TEST_PW }) });
+  assert.equal(un.status, 200, "解锁应成功");
+  const sc = un.res.headers.get("set-cookie") || "";
+  const tok = /ua_tok=([a-f0-9]{64})/.exec(sc);
+  COOKIE = tok ? `ua_tok=${tok[1]}` : "";
+  assert.ok(tok, "应下发会话 Cookie");
+  // 复位 provider 状态（Mock 为主），防止历史测试污染
+  await jjson("/api/settings", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, searchKeys: {} }),
@@ -65,10 +93,23 @@ test.before(async () => {
 });
 test.after(() => child?.kill());
 
-test("健康检查：工具已加载", async () => {
+test("健康检查：工具已加载（免解锁）", async () => {
   const j = await (await fetch(`${BASE}/api/health`)).json();
   assert.equal(j.ok, true);
   assert.ok(j.tools >= 19, `工具应有 19 个，实际 ${j.tools}`);
+});
+
+test("验收L：未解锁 401、错密码 403、改密码流程", async () => {
+  const raw = await fetch(`${BASE}/api/settings`); // 故意不带 Cookie
+  assert.equal(raw.status, 401, "未解锁访问功能接口必须 401");
+  const bad = await jjson("/api/unlock", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "totally-wrong" }) });
+  assert.equal(bad.status, 403, "错密码必须被拒");
+  const ch = await jjson("/api/lock-change", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ old: "wrong-old", next: "x" }) });
+  assert.equal(ch.status, 403, "旧密码错不许改");
+  const ok = await jjson("/api/lock-change", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ old: TEST_PW, next: "new-pw-5678" }) });
+  assert.equal(ok.status, 200, "旧密码对可改");
+  const re = await jjson("/api/unlock", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "new-pw-5678" }) });
+  assert.equal(re.status, 200, "新密码可解锁");
 });
 
 test("端到端（验收E）：Mock 建文件 → 文件出现 + 会话 jsonl", async () => {
@@ -124,7 +165,7 @@ test("确认流：confirm 模式高危 → confirm_request → 批准后执行",
 });
 
 test("确认流（批准路径）：先起请求再裁决", async () => {
-  const pending = fetch(`${BASE}/api/chat`, {
+  const pending = jfetch("/api/chat", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cfm2.txt", content: "old" } }]) }, mode: "confirm" }),
@@ -132,7 +173,7 @@ test("确认流（批准路径）：先起请求再裁决", async () => {
   // 建好文件后，再次发起覆盖并立刻轮询确认单批准
   await pending.then((r) => r.text());
   const confirmPromise = (async () => {
-    const res = await fetch(`${BASE}/api/chat`, {
+    const res = await jfetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cfm2.txt", content: "new" }, say: "覆盖" }]) }, mode: "confirm" }),
@@ -160,7 +201,7 @@ test("确认流（批准路径）：先起请求再裁决", async () => {
         if (ev.type === "confirm_request") confirmId = ev.confirmId;
       }
     }
-    await fetch(`${BASE}/api/confirm`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId, approve: true }) });
+    await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId, approve: true }) });
     // 读到流结束为止
     while (true) {
       const { done } = await rd.read();
@@ -173,24 +214,37 @@ test("确认流（批准路径）：先起请求再裁决", async () => {
 });
 
 test("设置：GET 掩码 / POST 持久化 / 工作区校验", async () => {
-  const post = await fetch(`${BASE}/api/settings`, {
+  const post = await jjson("/api/settings", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ providers: [{ name: "T1", protocol: "openai-chat", baseURL: "http://x", model: "m", apiKey: "sk-secret" }] }),
-  }).then((r) => r.json());
-  assert.equal(post.providers[0].apiKey, "•••已保存", "GET 回显应掩码");
-  const creds = fs.readFileSync(path.join(REPO, "data", "credentials.json"), "utf8");
-  assert.match(creds, /sk-secret/, "真 key 落 credentials.json");
+    body: JSON.stringify({ providers: [{ name: "T1", protocol: "openai-chat", baseURL: "http://x", model: "m", secret: "sk-secret" }] }),
+  });
+  assert.equal(post.json.providers[0].secret, "•••已保存", "GET 回显应掩码");
+  const vault = fs.readFileSync(path.join(REPO, "data", "vault.bin"));
+  assert.ok(!vault.toString("utf8").includes("sk-secret"), "vault.bin 里不许有钥匙明文");
   const cfg = fs.readFileSync(path.join(REPO, "config.json"), "utf8");
-  assert.doesNotMatch(cfg, /sk-secret/, "config.json 不落真 key");
-  const bad = await fetch(`${BASE}/api/settings`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ workspace: "C:\\不存在的目录xyz" }) }).then((r) => r.json());
-  assert.ok(bad.error, "不存在的工作区要报错");
+  assert.ok(!cfg.includes("sk-secret"), "config.json 不落真钥匙");
+  assert.ok(!fs.existsSync(path.join(REPO, "data", "credentials.json")), "旧明文钥匙文件应已废弃");
+  const bad = await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ workspace: "C:\\不存在的目录xyz" }) });
+  assert.ok(bad.json.error, "不存在的工作区要报错");
   // 恢复 provider 现场，避免污染同套件其它测试与后续运行
-  await fetch(`${BASE}/api/settings`, {
+  await jjson("/api/settings", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir }),
   });
+});
+
+test("验收M：设置回显不含钥匙原文", async () => {
+  const st = await jjson("/api/settings");
+  assert.ok(st.json.providers.every((p) => p.secret === "" || p.secret === "•••已保存"), "钥匙只能以掩码出现");
+});
+
+test("验收N：用户可见文件无 api key 字样", () => {
+  for (const f of ["public/index.html", "README.md"]) {
+    const txt = fs.readFileSync(path.join(REPO, f), "utf8").toLowerCase();
+    assert.ok(!/api[-_ ]?key/.test(txt), `${f} 不应含 api key 字样`);
+  }
 });
 
 test("子任务经服务器跑通（subagent_event 出现在 SSE）", async () => {
