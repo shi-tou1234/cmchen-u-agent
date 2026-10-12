@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="ua-version" content="0.9.5">
 <title>u-agent · 随身 AI</title>
 <link rel="stylesheet" href="/css/app.css">
 </head>
@@ -73,7 +74,7 @@
 
 <!-- ── 密码锁 ───────────────────────────────────────────── -->
 <div class="gate" id="lock">
-  <form class="gate-card" id="lockForm" autocomplete="off">
+  <form class="gate-card" id="lockForm" autocomplete="off" onsubmit="return false">
     <div class="gate-brand"><svg class="ic"><use href="#i-bolt"/></svg><span>u-agent</span></div>
     <h1 id="lkTitle">输入密码解锁</h1>
     <p class="gate-sub" id="lkSub">所有配置与会话都留在这只 U 盘里，换台电脑不用重配</p>
@@ -643,7 +644,20 @@
   </div>
 </div>
 
+<div class="boot-warn" id="bootWarn" hidden></div>
+
 <div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script>
+  // 看门狗（普通脚本，不依赖 ES module）：界面脚本没跑起来就说清怎么办，别让人对着刷新的密码框发懵
+  setTimeout(function () {
+    if (document.documentElement.dataset.uaReady === "1") return;
+    var w = document.getElementById("bootWarn");
+    if (!w) return;
+    w.hidden = false;
+    w.textContent = "⚠ 界面脚本没有加载成功 —— 多半是浏览器缓存了旧脚本。按 Ctrl+F5 强制刷新一次；还不行就关掉那个黑色控制台窗口，重新双击 启动U-Agent.bat。";
+  }, 4000);
+</script>
 
 <script type="module" src="/js/app.js"></script>
 </body>
