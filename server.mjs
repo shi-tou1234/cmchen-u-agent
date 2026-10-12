@@ -1,6 +1,7 @@
 // u-agent 本地服务：静态页 + API（SSE 聊天 / 确认 / 设置 / 会话 / 密码锁）。零 npm 依赖。
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,7 +11,9 @@ import { streamChat } from "./core/providers.mjs";
 import { buildHistory, budgetOf, compactPrompt } from "./core/context.mjs";
 import { Sessions } from "./core/sessions.mjs";
 import { ConfirmGate } from "./core/confirm.mjs";
-import { MODES } from "./core/modes.mjs";
+import { Checkpoints, SNAP_PATHS } from "./core/checkpoints.mjs";
+import { resolveInside } from "./core/sandbox.mjs";
+import { MODES, DEFAULT_AUTO_APPROVE } from "./core/modes.mjs";
 import { readJson, writeJson, genId, truncate } from "./core/util.mjs";
 
 const UA_HOME = process.env.UA_HOME || path.dirname(fileURLToPath(import.meta.url));
@@ -20,8 +23,11 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
+const VERSION = "0.8.0";
+const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
+const checkpoints = new Checkpoints(path.join(DATA, "checkpoints")); // 改动前快照，供「撤销本轮改动」
 const confirmGate = new ConfirmGate();
 const registry = new Registry(path.join(UA_HOME, "tools"));
 await registry.load();
@@ -68,6 +74,8 @@ function loadState() {
     active: base.active || settings.active || providers[0]?.name,
     workspace: settings.workspace || "",
     searchKeys: vault.searchKeys || {},
+    autoApprove: { ...DEFAULT_AUTO_APPROVE, ...(settings.autoApprove || {}), actions: { ...DEFAULT_AUTO_APPROVE.actions, ...((settings.autoApprove || {}).actions || {}) } },
+    assist: settings.assist || "", // 轻量通道：起名/压缩这类杂活用，留空=跟随当前通道
   };
 }
 function saveState(patch) {
@@ -76,18 +84,39 @@ function saveState(patch) {
   const active = patch.active ?? cur.active;
   const workspace = patch.workspace ?? cur.workspace;
   const searchKeys = patch.searchKeys ?? cur.searchKeys;
+  const autoApprove = patch.autoApprove ?? cur.autoApprove;
+  const assist = patch.assist ?? cur.assist;
   writeJson(CONFIG, { providers: providers.map((p) => ({ ...p, secret: "" })), active });
   const vault = { providers: {}, searchKeys: searchKeys || {} };
   for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
   vaultSave(vault);
-  writeJson(SETTINGS, { workspace, active });
+  writeJson(SETTINGS, { workspace, active, autoApprove, assist });
   return loadState();
 }
 if (!fs.existsSync(CONFIG)) saveState({});
 
 // ---------- 密码锁 ----------
+// 密码存在 U 盘 data\lock.json：跟盘走、不跟机器走——同一只盘插到任何电脑都是同一个密码。
+// 只有「这只盘从来没设过密码」时才允许设置，设过之后任何机器都只能输入、不能重设。
 const sessionTokens = new Set();
 const FREE_PATHS = new Set(["/api/health", "/api/lock-status", "/api/unlock", "/api/lock-set", "/api/lock-change"]);
+
+// 输错冷却：连错 5 次起，冷却 30 秒并逐次翻倍，最多 10 分钟（防拿盘暴力试）
+const lockFail = { n: 0, until: 0 };
+const FAIL_FREE = 4;
+const COOL_BASE = Number(process.env.UA_LOCK_COOLDOWN_BASE) || 30; // 测试可改成 1 秒
+function cooldownLeft() {
+  return Math.max(0, lockFail.until - Date.now());
+}
+function noteFail() {
+  lockFail.n++;
+  if (lockFail.n > FAIL_FREE) {
+    const sec = Math.min(COOL_BASE * 2 ** (lockFail.n - FAIL_FREE - 1), 600);
+    lockFail.until = Date.now() + sec * 1000;
+    return sec;
+  }
+  return 0;
+}
 
 function lockHash(pw, salt) {
   return crypto.scryptSync(String(pw), salt, 32).toString("hex");
@@ -106,7 +135,7 @@ const unlocked = (req) => sessionTokens.has(cookieOf(req));
 function maskState(st) {
   return {
     ...st,
-    providers: st.providers.map((p) => ({ ...p, secret: p.secret ? "•••已保存" : "" })),
+    providers: st.providers.map((p) => ({ ...p, secret: p.secret ? MASK : "" })),
   };
 }
 
@@ -126,6 +155,42 @@ const loadTitles = () => readJson(TITLES, {});
 const saveTitles = (t) => writeJson(TITLES, t);
 
 let agentsCache = { mtime: 0, text: "" };
+// 工作区文件索引（供 @ 提及）：广度受限地走一遍目录树，只返回相对路径。
+// 命中规则：不区分大小写的子串匹配；命中的路径前缀越靠后越靠前排序（贴近用户在打的字）。
+const IDX_SKIP = /^(node_modules|\.git|\.svn|\.hg|dist|build|out|target|coverage|__pycache__|\.venv|venv|\.next|\.nuxt|\.cache|\.idea|\.vscode|vendor|Pods)$/i;
+function listWorkspaceFiles(root, q, limit) {
+  const out = [];
+  let scanned = 0;
+  const MAX_SCAN = 20000;
+  const MAX_DEPTH = 12;
+  const walk = (dir, rel, depth) => {
+    if (scanned > MAX_SCAN || depth > MAX_DEPTH) return;
+    let es = [];
+    try {
+      es = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of es) {
+      if (scanned++ > MAX_SCAN) return;
+      if (IDX_SKIP.test(e.name)) continue;
+      const r = rel ? rel + "/" + e.name : e.name;
+      if (e.isDirectory()) walk(path.join(dir, e.name), r, depth + 1);
+      else if (e.isFile()) out.push(r);
+    }
+  };
+  walk(root, "", 0);
+  const hit = q ? out.filter((f) => f.toLowerCase().includes(q)) : out;
+  // 越短、越靠前（路径尾段命中）越优先，避免一堆深层同名文件挤掉用户想要的那个
+  const score = (f) => {
+    const l = f.toLowerCase();
+    const base = l.slice(l.lastIndexOf("/") + 1);
+    return (base.includes(q) ? 0 : 1) * 1000 + f.length;
+  };
+  hit.sort((a, b) => score(a) - score(b));
+  return hit.slice(0, limit).map((p) => ({ path: p, name: p.slice(p.lastIndexOf("/") + 1) }));
+}
+
 function agentsMdOf(workspace) {
   try {
     const p = path.join(workspace, "AGENTS.md");
@@ -152,7 +217,103 @@ function sseHead(res) {
 }
 const sse = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-const LOG_TYPES = new Set(["user", "assistant_message", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan"]);
+const LOG_TYPES = new Set(["user", "assistant_message", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan", "change", "change_revert"]);
+
+/* ---------- 检查点快照的路径解析与容量收拾 ---------- */
+// 哪些工具动了哪些路径 → 交给 checkpoints 拍快照；只快照工作区/U盘目录内的路径
+function snapPathsOf(name, args, st) {
+  const pick = SNAP_PATHS[name];
+  if (!pick) return [];
+  const out = [];
+  for (const raw of pick(args) || []) {
+    if (!raw) continue;
+    let abs;
+    try {
+      abs = resolveInside([st.workspace, UA_HOME], raw, st.workspace);
+    } catch {
+      continue; // 越界的路径工具本身也会被拒，不拍
+    }
+    const rel = path.relative(st.workspace, abs);
+    out.push({ path: abs, rel: rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel.split(path.sep).join("/") : abs });
+  }
+  return out;
+}
+
+let cpPruneAt = 0;
+function pruneCheckpointsSoon() {
+  if (Date.now() - cpPruneAt < 5 * 60000) return; // 最多每 5 分钟收拾一次，别每次改动都扫盘
+  cpPruneAt = Date.now();
+  try {
+    checkpoints.pruneGlobal();
+  } catch {}
+}
+
+/* ---------- 轻量通道与杂活（起标题 / 压缩摘要） ---------- */
+// 轻量通道：起标题、压缩这类杂活丢给便宜模型跑，省下主通道的额度与注意力。
+// 没配就跟随当前在用通道；离线演示（mock）不参与——它只会鹦鹉学舌。
+const isReadyProvider = (p) => p && (p.protocol === "mock" || (p.baseURL && p.model && p.secret));
+function pickAssist(st, fallback) {
+  const a = st.providers.find((p) => p.name === st.assist);
+  if (isReadyProvider(a) && a.protocol !== "mock") return a;
+  if (fallback && fallback.protocol !== "mock") return fallback;
+  return null;
+}
+
+async function askOnce(provider, prompt, timeoutMs = 30000) {
+  let out = "";
+  for await (const ev of streamChat(provider, [{ role: "user", text: prompt }], [], AbortSignal.timeout(timeoutMs))) {
+    if (ev.type === "text") out += ev.delta;
+    else if (ev.type === "error") throw new Error(ev.message);
+  }
+  return out.trim();
+}
+
+// 模型爱加引号、爱写「标题：」、爱多句——都清掉，只留一行短标题
+function cleanTitle(raw) {
+  let t = String(raw || "").trim().split("\n").find((l) => l.trim()) || "";
+  t = t.replace(/^\s*(标题|title)\s*[:：]\s*/i, "").replace(/^["'“”「《]+|["'“”」》]+$/g, "").trim();
+  t = t.replace(/[。.!！?？]+$/, "").trim();
+  if (t.length > 20) t = t.slice(0, 20);
+  return t;
+}
+
+const TITLE_PROMPT = (userText, reply) =>
+  [
+    "给下面这段对话起一个会话标题，用来在侧栏列表里一眼认出它讲的是什么。",
+    "要求：中文，≤14 个字，说清主题即可；不要引号、不要「标题：」前缀、不要句号；只输出标题本身。",
+    "",
+    `用户：${String(userText || "").slice(0, 600)}`,
+    reply ? `助手：${String(reply).slice(0, 600)}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+// 一轮跑完后台起标题：不阻塞这轮回复，好了之后前端下次刷新会话列表就能看到
+const titleTried = new Set();
+async function autoTitle(sessionId, userText, reply, provider, st) {
+  if (!/^s-/.test(sessionId) || !userText) return null;
+  if (titleTried.has(sessionId)) return null; // 每个会话只试一次，失败也不反复烧钱
+  if (loadTitles()[sessionId]) return null; // 已经有标题了（人工改的，或之前自动起的）
+  const p = pickAssist(st, provider);
+  if (!p) return null; // 离线演示没有可用模型，不起标题
+  titleTried.add(sessionId);
+  try {
+    const t = cleanTitle(await askOnce(p, TITLE_PROMPT(userText, reply), 25000));
+    if (!t) {
+      titleTried.delete(sessionId);
+      return null;
+    }
+    const titles = loadTitles();
+    if (!titles[sessionId]) {
+      titles[sessionId] = t;
+      saveTitles(titles);
+    }
+    return t;
+  } catch {
+    titleTried.delete(sessionId);
+    return null;
+  }
+}
 
 async function handleChat(req, res, body) {
   const st = loadState();
@@ -176,7 +337,9 @@ async function handleChat(req, res, body) {
   const abort = new AbortController();
   running.set(sessionId, { abort, mode });
   // 多轮上下文：从会话日志重建历史（含 compact 摘要替换），再拼上本条消息
-  const history = buildHistory(sessions.read(sessionId));
+  const pastEvents = sessions.read(sessionId);
+  const history = buildHistory(pastEvents);
+  const turnSeq = pastEvents.filter((e) => e.type === "user").length + 1; // 第几轮：写进快照清单，回滚时看得懂
   const messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
   const budget = budgetOf(messages);
   sessions.append(sessionId, { type: "mode", mode });
@@ -189,25 +352,42 @@ async function handleChat(req, res, body) {
     uaHome: UA_HOME,
     workspace: st.workspace,
     mode,
-    settings: { searchKeys: st.searchKeys },
+    settings: { searchKeys: st.searchKeys, autoApprove: st.autoApprove },
     provider,
     registry,
     signal: abort.signal,
     subDepth: 0,
     state: {},
+    autoCount: 0, // 本轮连续自动放行的次数（上限到了就回来问）
     memory: readMemory(),
     agentsMd: agentsMdOf(st.workspace),
     confirm: (info) => {
       const id = genId("cfm");
       const p = new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(false), Number(process.env.UA_CONFIRM_TIMEOUT_MS) || 120000);
+        const timer = setTimeout(() => resolve({ ok: false, note: "", timeout: true }), Number(process.env.UA_CONFIRM_TIMEOUT_MS) || 120000);
         confirmGate.pending.set(id, { resolve, info: { ...info, id, ts: new Date().toISOString() }, timer });
       });
-      return { id, done: p.then((ok) => (sessions.append(sessionId, { type: "confirm_result", confirmId: id, approved: ok }), ok)) };
+      // 网页可以给这句确认附一句话：批准时是补充要求，拒绝时是理由，都会转给模型
+      return { id, done: p.then((v) => (sessions.append(sessionId, { type: "confirm_result", confirmId: id, approved: v.ok, note: v.note || "" }), v)) };
+    },
+    // 改动前拍快照：返回的 finish() 由主循环在工具跑完后调用，记下「改完长什么样」
+    snapshot: (tc) => {
+      const paths = snapPathsOf(tc.name, tc.args, st);
+      if (!paths.length) return null;
+      pruneCheckpointsSoon();
+      const { id } = checkpoints.begin(sessionId, { tool: tc.name, toolCallId: tc.toolCallId, turn: turnSeq, paths });
+      return {
+        id,
+        finish: async () => {
+          checkpoints.finish(sessionId, id);
+          return id;
+        },
+      };
     },
   };
 
   let usageTotal = { input: 0, output: 0 };
+  let replyText = ""; // 本轮最后一段助手正文，起标题时当素材
   try {
     for await (const ev of runAgent({ provider, messages, registry, ctx })) {
       if (ev.type === "usage") {
@@ -216,7 +396,12 @@ async function handleChat(req, res, body) {
         sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output });
         continue;
       }
+      if (ev.type === "assistant_message") replyText = ev.text || replyText;
       if (LOG_TYPES.has(ev.type)) sessions.append(sessionId, ev);
+      // 子 agent 改的文件也算这一轮的改动，但它是包在 subagent_event 里的，得拆出来记
+      else if (ev.type === "subagent_event" && ev.event?.type === "change") {
+        sessions.append(sessionId, { ...ev.event, sub: ev.name });
+      }
       sse(res, ev);
     }
   } catch (e) {
@@ -224,9 +409,15 @@ async function handleChat(req, res, body) {
     sse(res, { type: "error", message: e.message });
   } finally {
     running.delete(sessionId);
+    // 一轮跑完上下文又长了：把最新的预算推回去，前端那根用量条才是活的
+    try {
+      sse(res, { type: "budget", budget: budgetOf(buildHistory(sessions.read(sessionId))) });
+    } catch {}
     sse(res, { type: "stream_end", sessionId });
     res.end();
   }
+  // 流已关，起标题在后台跑：不拖慢这轮回复，写进 titles.json 后前端下次刷会话列表就能看到
+  autoTitle(sessionId, text, replyText, provider, st).catch(() => {});
 }
 
 function sendJson(res, code, obj) {
@@ -266,23 +457,39 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 401, { error: "请先输入密码解锁", locked: true });
     }
     if (req.method === "GET" && u.pathname === "/api/lock-status") {
-      return sendJson(res, 200, { setup: !fs.existsSync(LOCK) });
+      const info = readJson(LOCK, null);
+      return sendJson(res, 200, {
+        setup: !info,
+        // 解锁页据此提示「这只盘已经设过密码」（设过的人就是盘的主人）
+        setAt: info?.ts || 0,
+        setOn: info?.host || "",
+        cooldown: Math.ceil(cooldownLeft() / 1000),
+      });
     }
     if (req.method === "POST" && u.pathname === "/api/lock-set") {
       const b = await readBody(req);
-      if (fs.existsSync(LOCK)) return sendJson(res, 409, { error: "已设置过密码，请走解锁或修改流程" });
+      if (fs.existsSync(LOCK)) return sendJson(res, 409, { error: "这只盘已经设过密码了，请输入原密码解锁。忘记密码只能删掉 U 盘 data\\lock.json 重设（钥匙不受影响）。" });
       const pw = String(b.password || "");
       if (pw.length < 4) return sendJson(res, 400, { error: "密码至少 4 位" });
       const salt = crypto.randomBytes(16).toString("hex");
-      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now() });
+      let host = "";
+      try { host = os.hostname(); } catch {}
+      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now(), host });
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === "POST" && u.pathname === "/api/unlock") {
       const b = await readBody(req);
-      if (!lockVerify(b.password)) {
-        await new Promise((r) => setTimeout(r, 600)); // 防暴力试
-        return sendJson(res, 403, { error: "密码不对" });
+      const wait = cooldownLeft();
+      if (wait > 0) {
+        return sendJson(res, 429, { error: `错得太多了，请 ${Math.ceil(wait / 1000)} 秒后再试`, cooldown: Math.ceil(wait / 1000) });
       }
+      if (!lockVerify(b.password)) {
+        await new Promise((r) => setTimeout(r, 600)); // 每次失败都有固定延迟
+        const sec = noteFail();
+        return sendJson(res, 403, { error: sec ? `密码不对（已连错 ${lockFail.n} 次，冷却 ${sec} 秒）` : "密码不对", cooldown: sec });
+      }
+      lockFail.n = 0;
+      lockFail.until = 0;
       const tok = crypto.randomBytes(32).toString("hex");
       sessionTokens.add(tok);
       res.writeHead(200, {
@@ -301,16 +508,18 @@ const server = http.createServer(async (req, res) => {
       const pw = String(b.next || "");
       if (pw.length < 4) return sendJson(res, 400, { error: "新密码至少 4 位" });
       const salt = crypto.randomBytes(16).toString("hex");
-      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now() });
+      let host = "";
+      try { host = os.hostname(); } catch {}
+      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now(), host });
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === "GET" && u.pathname === "/api/health") {
-      return sendJson(res, 200, { ok: true, name: "u-agent", version: "0.2.1", tools: registry.list().length });
+      return sendJson(res, 200, { ok: true, name: "u-agent", version: VERSION, tools: registry.list().length });
     }
     if (req.method === "POST" && u.pathname === "/api/chat") return await handleChat(req, res, await readBody(req));
     if (req.method === "POST" && u.pathname === "/api/confirm") {
       const b = await readBody(req);
-      const ok = confirmGate.resolve(b.confirmId, !!b.approve);
+      const ok = confirmGate.resolve(b.confirmId, !!b.approve, b.note);
       return sendJson(res, 200, { ok });
     }
     if (req.method === "POST" && u.pathname === "/api/abort") {
@@ -327,7 +536,7 @@ const server = http.createServer(async (req, res) => {
         // key 字段为掩码时保留原值
         patch.providers = b.providers.map((p) => {
           const old = cur.providers.find((o) => o.name === p.name);
-          return { ...p, secret: !p.secret || p.secret === "•••已保存" ? old?.secret || "" : p.secret };
+          return { ...p, secret: !p.secret || p.secret === MASK ? old?.secret || "" : p.secret };
         });
       }
       if (b.active !== undefined) patch.active = b.active;
@@ -336,6 +545,8 @@ const server = http.createServer(async (req, res) => {
         if (!fs.existsSync(patch.workspace)) return sendJson(res, 400, { error: `工作区目录不存在：${patch.workspace}` });
       }
       if (b.searchKeys !== undefined) patch.searchKeys = b.searchKeys;
+      if (b.autoApprove !== undefined) patch.autoApprove = b.autoApprove;
+      if (b.assist !== undefined) patch.assist = String(b.assist || "");
       const st = saveState(patch);
       return sendJson(res, 200, maskState(st));
     }
@@ -366,6 +577,146 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(MEMORY, t, "utf8");
       return sendJson(res, 200, { ok: true, chars: t.length });
     }
+    // 本机信息与 U 盘位置（给设置页「这台电脑 / 关于」用）
+    if (req.method === "GET" && u.pathname === "/api/info") {
+      return sendJson(res, 200, {
+        hostname: os.hostname(),
+        user: (() => { try { return os.userInfo().username; } catch { return ""; } })(),
+        platform: `${os.platform()} ${os.arch()}`,
+        release: os.release(),
+        node: process.version,
+        cpus: os.cpus().length,
+        memGB: +(os.totalmem() / 1073741824).toFixed(1),
+        uaHome: UA_HOME,
+        dataDir: DATA,
+        tools: registry.list().length,
+        version: VERSION,
+      });
+    }
+
+    // 目录浏览：给设置页挑工作区用（只列目录，不给文件内容）
+    if (req.method === "GET" && u.pathname === "/api/browse") {
+      const raw = String(u.searchParams.get("path") || "").trim();
+      const pick = (dirs, parent) => sendJson(res, 200, { path: raw, parent, dirs });
+      const SKIP = /^(\.|__|\$RECYCLE|System Volume Information)/i;
+      if (!raw) {
+        // 顶层：列出可用盘符
+        const dirs = [];
+        for (let c = 65; c <= 90; c++) {
+          const root = String.fromCharCode(c) + ":\\";
+          try { fs.readdirSync(root); dirs.push({ name: `${String.fromCharCode(c)}:`, path: root }); } catch { /* 空盘/无权限 */ }
+        }
+        return pick(dirs, null);
+      }
+      const p = path.resolve(raw);
+      if (!fs.existsSync(p) || !fs.statSync(p).isDirectory()) return sendJson(res, 400, { error: `目录不存在：${p}` });
+      try {
+        const dirs = fs
+          .readdirSync(p, { withFileTypes: true })
+          .filter((d) => d.isDirectory() && !SKIP.test(d.name))
+          .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+          .map((d) => ({ name: d.name, path: path.join(p, d.name) }));
+        return pick(dirs, path.dirname(p) === p ? null : path.dirname(p));
+      } catch (e) {
+        return sendJson(res, 400, { error: `读不了这个目录：${e.message}` });
+      }
+    }
+
+    // 工作区文件索引：给「@ 提及文件」用。只吐相对路径，不读内容
+    if (req.method === "GET" && u.pathname === "/api/files") {
+      const st = loadState();
+      if (!settingsReady(st)) return sendJson(res, 400, { error: "还没设置工作区" });
+      const q = String(u.searchParams.get("q") || "").trim().toLowerCase();
+      const limit = Math.min(80, Math.max(1, Number(u.searchParams.get("limit")) || 30));
+      try {
+        return sendJson(res, 200, { files: listWorkspaceFiles(st.workspace, q, limit), root: st.workspace });
+      } catch (e) {
+        return sendJson(res, 400, { error: `读不了工作区：${e.message}` });
+      }
+    }
+
+    // 读一个文本文件的内容：给「@ 提及文件」用——选中的文件当场带上内容，省一轮工具调用
+    if (req.method === "GET" && u.pathname === "/api/file-text") {
+      const st = loadState();
+      if (!settingsReady(st)) return sendJson(res, 400, { error: "还没设置工作区" });
+      const rel = String(u.searchParams.get("path") || "").trim();
+      if (!rel) return sendJson(res, 400, { error: "缺少文件路径" });
+      let abs;
+      try {
+        abs = resolveInside([st.workspace, UA_HOME], rel, st.workspace);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      let stt;
+      try {
+        stt = fs.statSync(abs);
+      } catch {
+        return sendJson(res, 404, { error: "文件不存在" });
+      }
+      if (!stt.isFile()) return sendJson(res, 400, { error: "这不是文件" });
+      const MAXTEXT = 65536;
+      const buf = fs.readFileSync(abs).subarray(0, MAXTEXT);
+      if (buf.includes(0)) return sendJson(res, 400, { error: "不是文本文件" }); // 含 0 字节，按二进制处理
+      return sendJson(res, 200, { path: rel, text: buf.toString("utf8"), truncated: stt.size > MAXTEXT, bytes: stt.size });
+    }
+
+    // 通道连通测试：用一条极短的请求验证地址/协议/钥匙是否可用
+    if (req.method === "POST" && u.pathname === "/api/test-provider") {
+      const b = await readBody(req);
+      const p = b.provider || {};
+      if (!p.name) return sendJson(res, 400, { error: "缺少名称" });
+      if (p.protocol === "mock") return sendJson(res, 200, { ok: true, note: "离线演示通道，不需要联网" });
+      const cur = loadState();
+      const secret = !p.secret || p.secret === MASK ? cur.providers.find((o) => o.name === p.name)?.secret || "" : p.secret;
+      const provider = { ...p, secret };
+      const ctrl = AbortSignal.timeout(Number(process.env.UA_TEST_TIMEOUT_MS) || 25000);
+      try {
+        let sample = "";
+        for await (const ev of streamChat(provider, [{ role: "user", text: "hi" }], [], ctrl)) {
+          if (ev.type === "text") { sample += ev.delta; if (sample.length > 24) break; }
+          else if (ev.type === "error") throw new Error(ev.message);
+          else if (ev.type === "end") break;
+        }
+        return sendJson(res, 200, { ok: true, sample: sample.trim().slice(0, 60) });
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message || "连不上" });
+      }
+    }
+
+    // 从厂商服务实时拉取模型清单（OpenCode/Cherry Studio 同款做法：预设只给地址，模型名让用户挑）
+    if (req.method === "POST" && u.pathname === "/api/list-models") {
+      const b = await readBody(req);
+      const p = b.provider || {};
+      if (p.protocol === "mock") return sendJson(res, 200, { models: [{ id: "mock-1" }], note: "离线演示通道" });
+      const base = String(p.baseURL || "").replace(/\/+$/, "");
+      if (!base) return sendJson(res, 400, { error: "先填服务地址再拉取" });
+      if (/[{<]/.test(base)) return sendJson(res, 400, { error: "服务地址里还有占位符，先换成真实地址" });
+      const cur = loadState();
+      const secret = !p.secret || p.secret === MASK ? cur.providers.find((o) => o.name === p.name)?.secret || "" : p.secret;
+      const headers =
+        p.protocol === "anthropic"
+          ? { ...(secret ? { "x-api-key": secret } : {}), "anthropic-version": "2023-06-01" }
+          : { ...(secret ? { Authorization: `Bearer ${secret}` } : {}) };
+      const url = p.protocol === "anthropic" ? `${base}/v1/models` : `${base}/models`;
+      try {
+        const r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+        const text = await r.text();
+        if (!r.ok) return sendJson(res, 400, { error: `拉取失败（${r.status}）：${text.slice(0, 160)}` });
+        let ids = [];
+        try {
+          const j = JSON.parse(text);
+          ids = (j.data || j.models || []).map((m) => m.id || m.name || m.model).filter(Boolean);
+        } catch {
+          return sendJson(res, 400, { error: "返回不是模型清单 JSON" });
+        }
+        ids = [...new Set(ids)].sort();
+        if (!ids.length) return sendJson(res, 400, { error: "这家服务没返回可用模型" });
+        return sendJson(res, 200, { models: ids.map((id) => ({ id })), count: ids.length });
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message || "连不上这家服务" });
+      }
+    }
+
     if (req.method === "POST" && u.pathname === "/api/compact") {
       const b = await readBody(req);
       const st = loadState();
@@ -376,7 +727,7 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
-      const provider = st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0];
+      const provider = pickAssist(st, st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]);
       if (!provider) return sendJson(res, 400, { error: "没有可用的模型通道" });
       const msgs = buildHistory(events);
       const keepTail = Math.max(0, Math.min(6, msgs.length - 2));
@@ -384,7 +735,7 @@ const server = http.createServer(async (req, res) => {
       const before = budgetOf(msgs);
       let summary = "";
       try {
-        for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail) }], [], AbortSignal.timeout(90000))) {
+        for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail, b.instruction) }], [], AbortSignal.timeout(90000))) {
           if (ev.type === "text") summary += ev.delta;
           else if (ev.type === "error") throw new Error(ev.message);
         }
@@ -397,6 +748,42 @@ const server = http.createServer(async (req, res) => {
       const after = budgetOf(buildHistory(sessions.read(sid)));
       return sendJson(res, 200, { ok: true, summary, before, after });
     }
+    /* ---------- 检查点 / 一键回滚 ---------- */
+    // 清单：带 sessionId 看这个会话的检查点，不带就看整盘的占用
+    if (req.method === "GET" && u.pathname === "/api/checkpoints") {
+      const sid = u.searchParams.get("sessionId") || "";
+      if (!sid) return sendJson(res, 200, { stats: checkpoints.stats() });
+      try {
+        return sendJson(res, 200, { items: checkpoints.list(sid) });
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+    }
+    // 撤销：把 ids 里这些检查点涉及的改动倒着放回去
+    if (req.method === "POST" && u.pathname === "/api/rollback") {
+      const b = await readBody(req);
+      const sid = String(b.sessionId || "");
+      if (!sid) return sendJson(res, 400, { error: "缺少会话 id" });
+      if (running.has(sid)) return sendJson(res, 409, { error: "这一轮还在跑，等它停下来再撤销" });
+      let out;
+      try {
+        out = checkpoints.rollback(sid, b.ids || [], { force: !!b.force });
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      if (!out.ok) {
+        const msg = out.needForce ? `有 ${out.conflicts.length} 个文件在本轮改动之后又被改过` : out.error || "撤销没成功";
+        return sendJson(res, out.needForce ? 409 : 400, { ...out, error: msg });
+      }
+      sessions.append(sid, { type: "change_revert", ids: out.reverted, restored: out.restored, removed: out.removed, failed: out.failed, force: !!b.force });
+      return sendJson(res, 200, out);
+    }
+    if (req.method === "DELETE" && u.pathname === "/api/checkpoints") {
+      const sid = u.searchParams.get("sessionId") || "";
+      if (sid) checkpoints.drop(sid);
+      else checkpoints.dropAll();
+      return sendJson(res, 200, { ok: true, stats: checkpoints.stats() });
+    }
     if (req.method === "DELETE" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
       try {
@@ -404,17 +791,22 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
+      checkpoints.drop(id); // 会话没了，它的检查点也没有意义
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === "GET" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
       let events = [];
+      let budget = { chars: 0, tokens: 0, over: false };
       try {
-        events = sessions.read(id).filter((e) => LOG_TYPES.has(e.type) || e.type === "user");
+        const all = sessions.read(id);
+        events = all.filter((e) => LOG_TYPES.has(e.type) || e.type === "user");
+        // 切回旧会话时，用量条要立刻反映这个会话已有的体量
+        budget = budgetOf(buildHistory(all));
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
-      return sendJson(res, 200, { id, events });
+      return sendJson(res, 200, { id, events, budget });
     }
     if (req.method === "GET") {
       let p = u.pathname === "/" ? "/index.html" : u.pathname;

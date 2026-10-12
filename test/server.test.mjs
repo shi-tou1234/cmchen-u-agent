@@ -25,7 +25,7 @@ async function startServer() {
   let p = PORT;
   while (!(await freePort(p))) p++;
   child = spawn(process.execPath, [path.join(REPO, "server.mjs")], {
-    env: { ...process.env, UA_HOME: REPO, UA_PORT: String(p), UA_CONFIRM_TIMEOUT_MS: "1500" },
+    env: { ...process.env, UA_HOME: REPO, UA_PORT: String(p), UA_CONFIRM_TIMEOUT_MS: "1500", UA_LOCK_COOLDOWN_BASE: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stderr.on("data", (d) => process.stderr.write("[server] " + d));
@@ -258,9 +258,123 @@ test("验收M：设置回显不含钥匙原文", async () => {
 });
 
 test("验收N：用户可见文件无 api key 字样", () => {
-  for (const f of ["public/index.html", "README.md"]) {
+  const files = ["public/index.html", "public/css/app.css", ...fs.readdirSync(path.join(REPO, "public/js")).map((f) => "public/js/" + f), "README.md"];
+  for (const f of files) {
     const txt = fs.readFileSync(path.join(REPO, f), "utf8").toLowerCase();
     assert.ok(!/api[-_ ]?key/.test(txt), `${f} 不应含 api key 字样`);
+  }
+});
+
+test("v5 网页依赖：静态资源全部可取", async () => {
+  for (const p of ["/", "/css/app.css", "/js/app.js", "/js/chat.js", "/js/settings.js", "/js/api.js", "/js/ui.js", "/js/state.js", "/js/theme.js"]) {
+    const r = await jfetch(p);
+    assert.equal(r.status, 200, `${p} 应可取到`);
+    const type = r.headers.get("content-type") || "";
+    if (p.endsWith(".js")) assert.match(type, /javascript/, `${p} 需返回脚本类型，否则浏览器拒绝执行模块`);
+    if (p.endsWith(".css")) assert.match(type, /css/, `${p} 需返回样式类型`);
+  }
+});
+
+test("v5 新增：本机信息与目录浏览", async () => {
+  const info = await jjson("/api/info");
+  assert.equal(info.status, 200);
+  assert.ok(info.json.hostname && info.json.version, "应返回本机信息");
+  assert.equal(info.json.uaHome, REPO, "U 盘目录应是仓库根");
+  assert.equal((await fetch(`${BASE}/api/browse?path=`)).status, 401, "未解锁不得浏览目录");
+
+  const root = await jjson("/api/browse?path=");
+  assert.equal(root.status, 200);
+  assert.ok(Array.isArray(root.json.dirs) && root.json.dirs.length > 0, "顶层应能列出盘符");
+  const parent = await jjson("/api/browse?path=" + encodeURIComponent(path.dirname(REPO)));
+  assert.equal(parent.status, 200);
+  assert.ok(parent.json.dirs.some((d) => d.path === REPO), "上一级应能看到 u-agent 目录本身");
+  assert.ok(!parent.json.dirs.some((d) => /^\$RECYCLE|System Volume/i.test(d.path)), "系统目录要过滤掉");
+  const bad = await jjson("/api/browse?path=" + encodeURIComponent("Z:\\不存在xyz-987"));
+  assert.equal(bad.status, 400, "不存在的目录要报错");
+});
+
+test("v5 新增：通道连通测试", async () => {
+  const noAuth = await fetch(`${BASE}/api/test-provider`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(noAuth.status, 401, "未解锁不得测试通道");
+  const post = (provider) => jjson("/api/test-provider", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider }) });
+
+  const mock = await post({ name: "Mock", protocol: "mock" });
+  assert.equal(mock.status, 200, "离线演示通道应直接通过");
+  assert.equal(mock.json.ok, true);
+
+  const real = await post({ name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" });
+  assert.equal(real.status, 200, "假上游应能连通");
+  assert.match(real.json.sample || "", /记住/, "应回一段样例输出");
+
+  const dead = await post({ name: "X", protocol: "openai-chat", baseURL: "http://127.0.0.1:1/v1", model: "m", secret: "k" });
+  assert.equal(dead.status, 400, "连不上必须报错");
+  assert.ok(dead.json.error, "要给出失败原因");
+});
+
+test("v6 新增：从厂商拉取模型清单", async () => {
+  const noAuth = await fetch(`${BASE}/api/list-models`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(noAuth.status, 401, "未解锁不得拉取模型");
+  const post = (provider) => jjson("/api/list-models", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider }) });
+
+  const mock = await post({ name: "Mock", protocol: "mock" });
+  assert.equal(mock.status, 200);
+  assert.ok(mock.json.models?.length, "离线通道也要给出模型名");
+
+  const placeholder = await post({ name: "X", protocol: "openai-chat", baseURL: "https://{资源名}.example.com/v1", secret: "k" });
+  assert.equal(placeholder.status, 400, "地址里还有占位符要拦下");
+  assert.match(placeholder.json.error, /占位符/);
+
+  const dead = await post({ name: "X", protocol: "openai-chat", baseURL: "http://127.0.0.1:1/v1", secret: "k" });
+  assert.equal(dead.status, 400);
+  assert.ok(dead.json.error, "拉不到要给出原因");
+});
+
+test("v6：密码连错会冷却，且密码跟盘不跟机器", async () => {
+  const st = await jjson("/api/lock-status");
+  assert.equal(st.json.setup, false, "这只盘已设过密码：换机器也只认这一个");
+  assert.ok(st.json.setAt > 0, "要能告诉前端密码是什么时候设的");
+
+  const tryPw = (pw) => fetch(`${BASE}/api/unlock`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: pw }) });
+  let last;
+  for (let i = 0; i < 5; i++) last = await tryPw("wrong-" + i); // 前 4 次只是慢一点，第 5 次开始计入冷却
+  const cooled = await last.json();
+  assert.ok(cooled.cooldown > 0, "第 5 次错就该开始冷却");
+  const blocked = await tryPw("wrong-again");
+  assert.equal(blocked.status, 429, `冷却期间再试应被挡住，实际 ${blocked.status}`);
+  const body = await blocked.json();
+  assert.ok(body.cooldown > 0, "要返回冷却秒数");
+  await new Promise((r) => setTimeout(r, (body.cooldown + 0.6) * 1000));
+  const back = await jjson("/api/unlock", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "new-pw-5678" }) });
+  assert.equal(back.status, 200, "冷却结束后正确密码应能解锁");
+});
+
+test("v7 新增：自动放行开关可存可取，且真的能免掉确认弹窗", async () => {
+  const post = (body) => jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    const saved = await post({ autoApprove: { enabled: true, actions: { editFiles: true }, maxRequests: 5 } });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json.autoApprove.actions.editFiles, true, "勾上的开关要存住");
+    assert.equal(saved.json.autoApprove.actions.deleteFiles, false, "没传的开关要回落到默认值");
+    assert.equal(saved.json.autoApprove.actions.readFiles, true, "默认放行读文件");
+    assert.equal(saved.json.autoApprove.maxRequests, 5);
+    assert.equal((await jjson("/api/settings")).json.autoApprove.maxRequests, 5, "要落盘，不只是回显");
+
+    // 生效：confirm 模式下覆盖已有文件本应弹确认，勾了「改文件」后应直接执行
+    await post({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+    await chat({ sessionId: "s-aa-test", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "aa.txt", content: "v1" } }]) }, mode: "confirm" });
+    const r = await chat({
+      sessionId: "s-aa-test",
+      message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "aa.txt", content: "v2" }, say: "覆盖" }]) },
+      mode: "confirm",
+    });
+    const tc = r.events.find((e) => e.type === "tool_call");
+    assert.equal(tc.gate, "run", "自动放行应把 confirm 改成 run");
+    assert.equal(tc.auto, true, "要标记出这是自动放行的，事后能追溯");
+    assert.ok(!r.events.some((e) => e.type === "confirm_request"), "不该再弹确认");
+    assert.equal(fs.readFileSync(path.join(wsDir, "aa.txt"), "utf8"), "v2");
+  } finally {
+    // 复位，免得影响同套件其它依赖「覆盖要确认」的用例
+    await post({ autoApprove: { enabled: true, actions: { readFiles: true }, maxRequests: 20 } }).catch(() => {});
   }
 });
 
@@ -401,4 +515,363 @@ test("用量事件透传（upstream 回传 usage）", async () => {
   const u = events.find((e) => e.type === "usage");
   assert.ok(u, "应有 usage 事件");
   assert.ok(u.output >= 5);
+});
+
+test("v7 新增：每轮结束推送最新上下文预算（用量条靠它才活得起来）", async () => {
+  await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir }) });
+  const sid = "s-budget-test";
+  const first = await chat({ sessionId: sid, message: { text: "第一句话" }, mode: "confirm", provider: "Mock" });
+  const b1 = first.events.filter((e) => e.type === "budget").at(-1)?.budget;
+  assert.ok(b1, "一轮跑完要推 budget 事件");
+  assert.ok(b1.chars > 0, "要有非零的上下文体量");
+
+  await chat({ sessionId: sid, message: { text: "第二句话，长一点，让上下文明显变大一些，这样才好断言它确实在增长" }, mode: "confirm", provider: "Mock" });
+  const b2 = (await chat({ sessionId: sid, message: { text: "第三句话" }, mode: "confirm", provider: "Mock" })).events.filter((e) => e.type === "budget").at(-1)?.budget;
+  assert.ok(b2.chars > b1.chars, `上下文应随轮次增长：${b1.chars} → ${b2.chars}`);
+
+  // 切回旧会话时也要能直接拿到体量
+  const readBack = await jjson("/api/session?id=" + encodeURIComponent(sid));
+  assert.ok(readBack.json.budget?.chars > 0, "读会话要带上预算，切回来用量条才对");
+  assert.ok(readBack.json.budget.chars >= b1.chars);
+});
+
+/* ===== v7 第二批：@ 提及文件 / 本轮改动总览 / 会话标题 ===== */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const TITLES_FILE = path.join(REPO, "data", "titles.json");
+const readTitles = () => (fs.existsSync(TITLES_FILE) ? JSON.parse(fs.readFileSync(TITLES_FILE, "utf8")) : {});
+const postSettings = (body) => jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+async function waitFor(fn, ms = 6000) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = fn();
+    if (v) return v;
+    if (Date.now() - t0 > ms) return null;
+    await sleep(120);
+  }
+}
+
+test("v7 新增：@ 提及用的工作区文件索引", async () => {
+  assert.equal((await fetch(`${BASE}/api/files?q=`)).status, 401, "未解锁不得列工作区文件");
+
+  fs.mkdirSync(path.join(wsDir, "src", "js"), { recursive: true });
+  fs.mkdirSync(path.join(wsDir, "node_modules", "left-pad"), { recursive: true });
+  fs.writeFileSync(path.join(wsDir, "src", "js", "chat.js"), "x");
+  fs.writeFileSync(path.join(wsDir, "src", "js", "settings.js"), "x");
+  fs.writeFileSync(path.join(wsDir, "node_modules", "left-pad", "index.js"), "x");
+  fs.writeFileSync(path.join(wsDir, "README.md"), "x");
+
+  const all = await jjson("/api/files?q=&limit=200");
+  assert.equal(all.status, 200);
+  const paths = all.json.files.map((f) => f.path);
+  assert.ok(paths.includes("README.md"), "根目录文件应能列出");
+  assert.ok(paths.includes("src/js/chat.js"), "要能走进子目录");
+  assert.ok(!paths.some((p) => p.includes("node_modules")), "node_modules 这类目录不该进索引");
+  assert.ok(all.json.files.every((f) => f.name === f.path.slice(f.path.lastIndexOf("/") + 1)), "name 要是路径尾段");
+
+  const q = await jjson("/api/files?q=chat");
+  assert.ok(q.json.files.some((f) => f.path === "src/js/chat.js"), "子串匹配要命中");
+  assert.ok(q.json.files.every((f) => f.path.toLowerCase().includes("chat")), "不匹配的不该出现");
+  assert.equal(q.json.files[0].path, "src/js/chat.js", "文件名命中的应排前面");
+
+  const none = await jjson("/api/files?q=绝对不存在的名字zzz");
+  assert.equal(none.json.files.length, 0);
+});
+
+test("v7 新增：本轮改动总览——change 事件带路径/增删行数，并落进会话日志", async () => {
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+  const sid = "s-change-test";
+  fs.rmSync(path.join(wsDir, "chg.txt"), { force: true });
+  const run = (script) => chat({ sessionId: sid, message: { text: "MOCKSCRIPT:" + JSON.stringify(script) }, mode: "full" });
+
+  // 新建：kind=create，没有可对比的旧内容
+  let r = await run([{ tool: "fs_write", args: { path: "chg.txt", content: "第一行\n第二行" } }]);
+  let ch = r.events.filter((e) => e.type === "change");
+  assert.equal(ch.length, 1, "一次写操作只记一条改动");
+  assert.equal(ch[0].kind, "create");
+  assert.equal(ch[0].rel, "chg.txt", "要记相对工作区的路径，日志挪到别的盘也看得懂");
+  assert.equal(ch[0].created, true);
+
+  // 覆盖：kind=edit，带 +/- 行数与可展开的 diff 行
+  r = await run([{ tool: "fs_write", args: { path: "chg.txt", content: "第一行\n第二行改过了\n第三行" } }]);
+  ch = r.events.filter((e) => e.type === "change");
+  assert.equal(ch[0].kind, "edit", "覆盖已有文件要记成修改而不是新建");
+  assert.ok(ch[0].add >= 1 && ch[0].del >= 1, `应统计出增删行数，实际 +${ch[0].add} −${ch[0].del}`);
+  assert.ok(Array.isArray(ch[0].lines) && ch[0].lines.length, "要带 diff 行，前端才能展开看");
+  assert.ok(ch[0].lines.some((l) => l.op === "+" && String(l.text).includes("第三行")));
+
+  // 局部替换 / 删除 / 移动 / 建目录 都要记
+  r = await run([{ tool: "fs_edit", args: { path: "chg.txt", old: "第三行", new: "第三行改了" } }]);
+  assert.equal(r.events.filter((e) => e.type === "change")[0].kind, "edit");
+  r = await run([{ tool: "fs_mkdir", args: { path: "sub/dir" } }]);
+  assert.equal(r.events.filter((e) => e.type === "change")[0].kind, "mkdir");
+  r = await run([{ tool: "fs_delete", args: { path: "chg.txt" } }]);
+  assert.equal(r.events.filter((e) => e.type === "change")[0].kind, "delete");
+
+  // 落盘 + 回放
+  const logFile = fs.readdirSync(path.join(REPO, "data", "sessions")).find((f) => f.startsWith(sid));
+  assert.match(fs.readFileSync(path.join(REPO, "data", "sessions", logFile), "utf8"), /"type":"change"/, "改动要进会话日志");
+  const back = await jjson("/api/session?id=" + encodeURIComponent(sid));
+  assert.ok(back.json.events.some((e) => e.type === "change"), "回放旧会话时改动卡也要在");
+
+  // 被拒 / 出错的操作不该留下改动记录，否则总览会骗人
+  const denied = await chat({ sessionId: sid, message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "nope.txt", content: "x" } }]) }, mode: "readonly" });
+  assert.ok(!denied.events.some((e) => e.type === "change"), "被拒的操作不算改动");
+  assert.ok(!fs.existsSync(path.join(wsDir, "nope.txt")));
+});
+
+test("v7 新增：会话标题自动生成（走轻量通道；离线演示不参与）", async () => {
+  fs.rmSync(TITLES_FILE, { force: true });
+
+  // 主通道是离线演示，且没配轻量通道 → 不该起标题
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "" });
+  const sidMock = "s-title-mock";
+  await chat({ sessionId: sidMock, message: { text: "帮我看看这个项目的结构" }, mode: "confirm", provider: "Mock" });
+  await sleep(1400);
+  assert.ok(!readTitles()[sidMock], "离线演示不该起标题（没人能问）");
+
+  // 配上轻量通道 Up → 首轮结束后后台起标题
+  await postSettings({
+    providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }],
+    active: "Up",
+    workspace: wsDir,
+    assist: "Up",
+  });
+  const sid = "s-title-up";
+  await chat({ sessionId: sid, message: { text: "帮我看看这个项目的目录结构，顺便总结一下它在做什么" }, mode: "confirm", provider: "Up" });
+  const got = await waitFor(() => readTitles()[sid], 8000);
+  assert.ok(got, "首轮结束后应自动起出标题并落盘");
+  assert.ok(got.length <= 20, `标题要短，实际「${got}」`);
+  assert.ok(!/^["'「《]|["'」》]$/.test(got), "标题不该带引号");
+  assert.ok(UP.requests.some((r) => JSON.stringify(r.body || r).includes("起一个会话标题")), "标题请求应发出去");
+
+  // 侧栏接口要能读到它
+  const list = await (await jfetch("/api/sessions")).json();
+  assert.equal(list.find((s) => s.id === sid)?.title, got);
+
+  // 已经有标题就不再重复起（省额度），人工改过的更不许被覆盖
+  await chat({ sessionId: sid, message: { text: "再说一句" }, mode: "confirm", provider: "Up" });
+  await sleep(1200);
+  assert.equal(readTitles()[sid], got, "已有标题不该被再次生成的结果覆盖");
+
+  await jjson("/api/session-rename", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: sid, title: "我自己起的名字" }) });
+  await chat({ sessionId: sid, message: { text: "又一句" }, mode: "confirm", provider: "Up" });
+  await sleep(1200);
+  assert.equal(readTitles()[sid], "我自己起的名字", "人工标题不该被自动标题盖掉");
+});
+
+test("v7 新增：轻量通道存得住，并用来干压缩这类的杂活", async () => {
+  const st = await postSettings({ assist: "Up" });
+  assert.equal(st.json.assist, "Up", "轻量通道要存住");
+  assert.equal((await jjson("/api/settings")).json.assist, "Up", "要落盘");
+
+  // 压缩时即便请求里指定了主通道，也应由轻量通道接手
+  const sid = "s-assist-test";
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Mock", workspace: wsDir, assist: "Up" });
+  for (const t of ["第一件事：查版本号", "第二件事：查天气", "第三件事：算个数"]) {
+    await chat({ sessionId: sid, message: { text: t }, mode: "confirm", provider: "Mock" });
+  }
+  const before = UP.requests.length;
+  const c = await jjson("/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Mock" }) });
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  const used = UP.requests.slice(before).map((r) => JSON.stringify(r.body || r)).join("\n");
+  assert.match(used, /压缩/, "压缩请求应走轻量通道（主通道是离线演示，接不了）");
+
+  // 复位，免得影响其它用例
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "" });
+});
+
+/* ===== v0.8 追加：检查点 / 一键回滚 / @ 提及读文件 ===== */
+const CP_ROOT = path.join(REPO, "data", "checkpoints");
+const sessionLog = (sid) => {
+  const f = fs.readdirSync(path.join(REPO, "data", "sessions")).find((x) => x.startsWith(sid));
+  return f ? fs.readFileSync(path.join(REPO, "data", "sessions", f), "utf8") : "";
+};
+
+test("v8 新增：改文件前自动留检查点，撤销后回到改动前的内容", async () => {
+  const f = path.join(wsDir, "cp1.txt");
+  fs.writeFileSync(f, "原始内容", "utf8");
+  const sid = "s-cp-write";
+  const r = await chat({
+    sessionId: sid,
+    mode: "full",
+    message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cp1.txt", content: "改过的内容" } }]) },
+  });
+  const ch = r.events.find((e) => e.type === "change");
+  assert.ok(ch, "应有 change 事件");
+  assert.ok(ch.cp, "change 事件要带上检查点 id，网页才给撤销");
+  assert.equal(fs.readFileSync(f, "utf8"), "改过的内容");
+
+  const rb = await jjson("/api/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, ids: [ch.cp] }) });
+  assert.equal(rb.status, 200, JSON.stringify(rb.json));
+  assert.equal(fs.readFileSync(f, "utf8"), "原始内容", "撤销后应回到改动前");
+  assert.match(sessionLog(sid), /"type":"change_revert"/, "撤销要留在会话日志里");
+
+  const lst = await jjson("/api/checkpoints?sessionId=" + sid);
+  assert.equal(lst.json.items.find((i) => i.id === ch.cp).reverted, true, "清单里要标出这份已撤销");
+});
+
+test("v8 新增：新建的文件撤销时删掉；删掉的文件撤销时恢复", async () => {
+  const nf = path.join(wsDir, "cp-new.txt");
+  if (fs.existsSync(nf)) fs.rmSync(nf);
+  const a = await chat({ sessionId: "s-cp-new", mode: "full", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cp-new.txt", content: "新建" } }]) } });
+  assert.ok(fs.existsSync(nf));
+  const rbA = await jjson("/api/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: "s-cp-new", ids: [a.events.find((e) => e.type === "change").cp] }) });
+  assert.equal(rbA.status, 200);
+  assert.equal(fs.existsSync(nf), false, "撤销新建 = 把它删掉");
+  assert.equal(rbA.json.removed.length, 1);
+
+  const df = path.join(wsDir, "cp-del.txt");
+  fs.writeFileSync(df, "别删我", "utf8");
+  const b = await chat({ sessionId: "s-cp-del", mode: "full", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_delete", args: { path: "cp-del.txt" } }]) } });
+  assert.equal(fs.existsSync(df), false, "先确认真的删了");
+  const rbB = await jjson("/api/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: "s-cp-del", ids: [b.events.find((e) => e.type === "change").cp] }) });
+  assert.equal(rbB.status, 200);
+  assert.equal(fs.readFileSync(df, "utf8"), "别删我", "撤销删除 = 原样恢复");
+});
+
+test("v8 新增：撤销会撞车时先拒一次，强制才覆盖", async () => {
+  const f = path.join(wsDir, "cp2.txt");
+  fs.writeFileSync(f, "v1", "utf8");
+  const sid = "s-cp-conflict";
+  const r = await chat({ sessionId: sid, mode: "full", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cp2.txt", content: "v2" } }]) } });
+  const cpId = r.events.find((e) => e.type === "change").cp;
+  fs.writeFileSync(f, "v3 用户后来自己改的", "utf8");
+
+  const blocked = await jjson("/api/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, ids: [cpId] }) });
+  assert.equal(blocked.status, 409, "文件在改动之后又被改过 → 先拒");
+  assert.equal(blocked.json.needForce, true);
+  assert.equal(blocked.json.conflicts.length, 1);
+  assert.equal(fs.readFileSync(f, "utf8"), "v3 用户后来自己改的", "没批准不许动");
+
+  const forced = await jjson("/api/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, ids: [cpId], force: true }) });
+  assert.equal(forced.status, 200);
+  assert.equal(fs.readFileSync(f, "utf8"), "v1", "强制撤销回到改动前");
+});
+
+test("v8 新增：撤销接口受密码锁保护，非法路径与越界读取被拒", async () => {
+  const raw = await fetch(`${BASE}/api/rollback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: "s-x", ids: ["cp_x"] }) });
+  assert.equal(raw.status, 401, "未解锁不许撤销");
+  const rawCp = await fetch(`${BASE}/api/checkpoints`);
+  assert.equal(rawCp.status, 401, "未解锁不许看检查点");
+
+  const bad = await jjson("/api/file-text?path=" + encodeURIComponent("../../Windows/win.ini"));
+  assert.equal(bad.status, 400, "工作区外的路径要拒绝");
+  assert.match(bad.json.error, /越界|拒绝/);
+});
+
+test("v8 新增：@ 提及用的读文件接口能取内容、超大小截断、二进制拒读", async () => {
+  const f = path.join(wsDir, "mention.txt");
+  fs.writeFileSync(f, "这是给 @ 提及用的内容", "utf8");
+  const ok = await jjson("/api/file-text?path=mention.txt");
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.text, "这是给 @ 提及用的内容");
+  assert.equal(ok.json.truncated, false);
+
+  const big = path.join(wsDir, "mention-big.txt");
+  fs.writeFileSync(big, "x".repeat(70000), "utf8");
+  const cut = await jjson("/api/file-text?path=mention-big.txt");
+  assert.equal(cut.json.truncated, true, "超过 64KB 要截断并告知");
+  assert.ok(cut.json.text.length <= 65536);
+
+  const bin = path.join(wsDir, "mention.bin");
+  fs.writeFileSync(bin, Buffer.from([65, 66, 0, 67]));
+  const nope = await jjson("/api/file-text?path=mention.bin");
+  assert.equal(nope.status, 400, "含 0 字节的二进制不附内容");
+
+  const gone = await jjson("/api/file-text?path=not-here.txt");
+  assert.equal(gone.status, 404);
+});
+
+test("v8 新增：删会话连带清掉它的检查点", async () => {
+  const f = path.join(wsDir, "cp3.txt");
+  fs.writeFileSync(f, "a", "utf8");
+  const sid = "s-cp-drop";
+  const r = await chat({ sessionId: sid, mode: "full", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cp3.txt", content: "b" } }]) } });
+  assert.ok(fs.existsSync(path.join(CP_ROOT, sid)), "检查点目录应随会话建立");
+  const del = await jfetch("/api/session?id=" + encodeURIComponent(sid), { method: "DELETE" });
+  assert.equal(del.status, 200);
+  assert.equal(fs.existsSync(path.join(CP_ROOT, sid)), false, "会话删了，检查点没有意义，应一起清掉");
+});
+
+test("v8 新增：整盘占用与一键清空", async () => {
+  const st = await jjson("/api/checkpoints");
+  assert.equal(st.status, 200);
+  assert.ok(typeof st.json.stats.bytes === "number", "要报占用体积");
+  assert.ok(st.json.stats.items > 0, "前面几轮改动应留下检查点");
+  const cleared = await jfetch("/api/checkpoints", { method: "DELETE" });
+  assert.equal(cleared.status, 200);
+  const after = await jjson("/api/checkpoints");
+  assert.equal(after.json.stats.items, 0, "清空后不该再有检查点");
+});
+
+test("v8 新增：确认时可附一句话——拒绝讲理由、批准提要求，都会转给模型", async () => {
+  const f = path.join(wsDir, "note.txt");
+  await chat({ sessionId: "s-note", mode: "confirm", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "note.txt", content: "v1" } }]) } });
+
+  const runWithConfirm = async (note, approve) => {
+    const res = await jfetch("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "s-note", mode: "confirm", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "note.txt", content: "v2" }, say: "覆盖" }]) } }),
+    });
+    const rd = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let confirmId = null;
+    let text = "";
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      text += buf.slice(0, 0); // 占位：文本在下面统一累计
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 2);
+        text += line;
+        const m = /^data: (.*)$/.exec(line);
+        if (!m) continue;
+        let ev;
+        try { ev = JSON.parse(m[1]); } catch { continue; }
+        if (ev.type === "confirm_request" && !confirmId) {
+          confirmId = ev.confirmId;
+          await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId, approve, note }) });
+        }
+      }
+    }
+    return text;
+  };
+
+  // ① 拒绝并讲理由：模型看到理由，文件不许变
+  const rejected = await runWithConfirm("我还没准备好这次改动", false);
+  assert.match(rejected, /我还没准备好这次改动/, "拒绝的理由要转给模型");
+  assert.equal(fs.readFileSync(f, "utf8"), "v1", "拒绝了就不许动文件");
+  assert.match(sessionLog("s-note"), /"type":"confirm_result".*我还没准备好这次改动/, "理由要落进会话日志");
+
+  // ② 批准并提要求：照常执行，附带的要求也交给模型
+  const approved = await runWithConfirm("顺序别弄乱了", true);
+  assert.match(approved, /顺序别弄乱了/, "批准时的要求要转给模型");
+  assert.equal(fs.readFileSync(f, "utf8"), "v2", "批准了就该执行");
+});
+
+test("v8 新增：/compact 可以点名保住什么", async () => {
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Mock", workspace: wsDir, assist: "Up" });
+  const sid = "s-compact-instr";
+  for (const t of ["先记一下：接口路径是 /v1/orders", "再看一下：错误码 401 代表没钥匙", "最后：把结果整理一下"]) {
+    await chat({ sessionId: sid, message: { text: t }, mode: "confirm", provider: "Mock" });
+  }
+  const before = UP.requests.length;
+  const c = await jjson("/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Up", instruction: "务必保住接口路径和错误码" }) });
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  const sent = UP.requests.slice(before).map((r) => JSON.stringify(r.body || r)).join("\n");
+  assert.match(sent, /务必保住接口路径和错误码/, "用户点名要保住的内容要写进压缩提示");
+
+  // 不带指示语时不出现这一行，避免旧行为变化
+  const before2 = UP.requests.length;
+  await jjson("/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Up" }) });
+  const sent2 = UP.requests.slice(before2).map((r) => JSON.stringify(r.body || r)).join("\n");
+  assert.ok(!/用户额外叮嘱/.test(sent2), "没传指示语就不该有那一行");
+
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "" });
 });

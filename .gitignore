@@ -3,6 +3,7 @@ runtime/
 data/
 app/
 node_modules/
+.workbuddy/
 config.json
 *.log
 PROGRESS.md

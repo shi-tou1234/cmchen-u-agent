@@ -65,8 +65,8 @@ export function budgetOf(messages) {
   return { chars: Math.round(chars), tokens: Math.ceil(chars / CHARS_PER_TOKEN), over: chars > BUDGET_CHARS };
 }
 
-// 生成给模型看的压缩请求（保留最近 keepTail 条消息不动）
-export function compactPrompt(messages, keepTail = 6) {
+// 生成给模型看的压缩请求（保留最近 keepTail 条消息不动；instruction = 用户点名要保住什么）
+export function compactPrompt(messages, keepTail = 6, instruction = "") {
   const older = messages.slice(0, Math.max(0, messages.length - keepTail));
   const dump = older
     .map((m) => {
@@ -75,12 +75,11 @@ export function compactPrompt(messages, keepTail = 6) {
       return `${who}${calls}：${(m.text || "").slice(0, 1200)}`;
     })
     .join("\n");
-  return [
+  const head = [
     "请把下面这段对话历史压缩成一份简明摘要，供后续对话延续使用。",
     "要求：保留用户的目标与偏好、已完成的操作及结果、重要文件路径、未完成的待办；删除寒暄与冗余细节；中文，≤500 字，用要点列表。只输出摘要正文。",
-    "",
-    "== 对话历史开始 ==",
-    dump.slice(0, 60000),
-    "== 对话历史结束 ==",
-  ].join("\n");
+  ];
+  // /compact 后面可以带一句话：用户想保住哪部分，压缩时优先保住
+  if (instruction) head.push(`用户额外叮嘱：${String(instruction).slice(0, 500)}`);
+  return [...head, "", "== 对话历史开始 ==", dump.slice(0, 60000), "== 对话历史结束 ==", ""].join("\n");
 }
