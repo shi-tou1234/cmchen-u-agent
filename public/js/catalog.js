@@ -9,6 +9,33 @@ export const GROUPS = [
   { id: "local", name: "本机 / 离线", desc: "模型跑在这台电脑上，不用联网" },
 ];
 
+// 有的网关（OpenCode Zen / Go 就是）按模型分协议：同一个地址下，Claude 系走 Anthropic、
+// GPT/Grok 系走 Responses、其余走 OpenAI 兼容。选中模型自动切协议，省得用户一个个试。
+const GW_ANTHROPIC = /^(claude-(fable|opus|sonnet|haiku)|qwen3\.[567]-(plus|max)|qwen3\.8-flash)/i;
+const GW_RESPONSES = /^(gpt-|grok-|muse-spark-1\.[23]|o[1-9])/i;
+const GW_GOOGLE = /^gemini-/i;
+const GW_SPECIAL = /^jev-/i; // 走网关的专用接口（/systemone）
+
+/** 模型名 → 该用哪个协议；protocol 为空表示本 agent 接不了这个模型（note 里说明换什么） */
+export function protocolForModel(modelId) {
+  const m = String(modelId || "").trim();
+  if (!m) return null;
+  if (GW_SPECIAL.test(m)) return { protocol: "", note: "这个模型走网关的专用接口，u-agent 接不了，换一个" };
+  if (GW_GOOGLE.test(m)) return { protocol: "", note: "Gemini 系在网关上走 Google 专用接口，u-agent 接不了 —— 换 Claude / GPT / GLM 系" };
+  if (GW_ANTHROPIC.test(m)) return { protocol: "anthropic" };
+  if (GW_RESPONSES.test(m)) return { protocol: "openai-responses" };
+  return { protocol: "openai-chat" };
+}
+
+/** 地址纠偏：用户常把整条接口地址粘进来（文档里就是那么列的），这里只留到 /v1 那一层 */
+export function normalizeBaseURL(raw) {
+  return String(raw || "")
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/(chat\/completions|responses|completions|messages|models)$/i, "")
+    .replace(/\/+$/, "");
+}
+
 // short = 卡片上的字母标记，color = 品牌色（仅用于标识，不引外部图片）
 export const CATALOG = [
   // ---------- 国内 ----------
@@ -111,6 +138,20 @@ export const CATALOG = [
     models: ["openai/gpt-5.2", "anthropic/claude-sonnet-4.5", "google/gemini-3-pro"],
     keyUrl: "https://openrouter.ai/",
     note: "一把钥匙用几百个模型；模型名要带厂商前缀，建议先点「拉取模型列表」",
+  },
+  {
+    id: "oczen", name: "OpenCode Zen", short: "OZ", color: "#0f766e", group: "agg",
+    protocol: "openai-chat", baseURL: "https://opencode.ai/zen/v1",
+    models: ["glm-5.3", "kimi-k2.7-code", "deepseek-v4-pro", "big-pickle", "claude-sonnet-5-5", "gpt-5.6-sol"],
+    keyUrl: "https://opencode.ai/docs/zen/", protocolPerModel: true,
+    note: "官方精选网关（按量充值）。地址 https://opencode.ai/zen/v1；它按模型分协议——选中模型会自动切协议（Claude 系 Anthropic、GPT/Grok 系 Responses、GLM/Kimi/DeepSeek 系 OpenAI 兼容）",
+  },
+  {
+    id: "ocgo", name: "OpenCode Go", short: "OG", color: "#b45309", group: "agg",
+    protocol: "openai-chat", baseURL: "https://opencode.ai/zen/go/v1",
+    models: ["glm-5.3", "kimi-k3", "deepseek-v4-pro", "claude-haiku-5-5", "grok-4.7", "gpt-5.6-luna"],
+    keyUrl: "https://opencode.ai/docs/go/", protocolPerModel: true,
+    note: "Go 订阅（$10/月起）专用地址 —— 比 Zen 多一层 /go：https://opencode.ai/zen/go/v1。订阅钥匙拿到 Zen 地址上用会报「钥匙无效」，反之亦然；按模型分协议，选中模型会自动切",
   },
   {
     id: "siliconflow", name: "硅基流动", short: "SF", color: "#2f6bff", group: "agg",

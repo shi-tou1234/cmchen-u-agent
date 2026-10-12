@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Registry } from "./core/tools.mjs";
 import { runAgent } from "./core/agent-loop.mjs";
-import { streamChat } from "./core/providers.mjs";
+import { streamChat, normalizeBase, buildHeaders } from "./core/providers.mjs";
 import { buildHistory, budgetOf, compactPrompt } from "./core/context.mjs";
 import { Sessions } from "./core/sessions.mjs";
 import { ConfirmGate } from "./core/confirm.mjs";
@@ -23,7 +23,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.8.1";
+const VERSION = "0.8.2";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -298,7 +298,7 @@ async function autoTitle(sessionId, userText, reply, provider, st) {
   if (!p) return null; // 离线演示没有可用模型，不起标题
   titleTried.add(sessionId);
   try {
-    const t = cleanTitle(await askOnce(p, TITLE_PROMPT(userText, reply), 25000));
+    const t = cleanTitle(await askOnce({ ...p, baseURL: normalizeBase(p.baseURL), sessionId, userAgent: `u-agent/${VERSION}` }, TITLE_PROMPT(userText, reply), 25000));
     if (!t) {
       titleTried.delete(sessionId);
       return null;
@@ -319,8 +319,11 @@ async function handleChat(req, res, body) {
   const st = loadState();
   const sessionId = body.sessionId || sessions.create("s");
   const mode = MODES.includes(body.mode) ? body.mode : "confirm";
-  const provider = st.providers.find((p) => p.name === (body.provider || st.active)) || st.providers[0];
-  if (!provider) return sendJson(res, 400, { error: "没有可用的模型通道，请先在设置里配置" });
+  const picked = st.providers.find((p) => p.name === (body.provider || st.active)) || st.providers[0];
+  if (!picked) return sendJson(res, 400, { error: "没有可用的模型通道，请先在设置里配置" });
+  // 网关（如 OpenCode Go）按会话做路由与缓存：把这次会话的 id 当会话标识带上；
+  // 顺手自报家门（u-agent/x.y.z），别让网关只看到默认的 HTTP 库名
+  const provider = { ...picked, baseURL: normalizeBase(picked.baseURL), sessionId, userAgent: `u-agent/${VERSION}` };
   if (!settingsReady(st)) return sendJson(res, 400, { error: "请先在设置里选择工作区目录（agent 只能在工作区和 U 盘目录内操作）", needWorkspace: true });
 
   const msg = body.message || {};
@@ -666,10 +669,13 @@ const server = http.createServer(async (req, res) => {
       const p = b.provider || {};
       if (!p.name) return sendJson(res, 400, { error: "缺少名称" });
       if (p.protocol === "mock") return sendJson(res, 200, { ok: true, note: "离线演示通道，不需要联网" });
+      if (!normalizeBase(p.baseURL)) return sendJson(res, 400, { error: "先填服务地址再测试" });
       const cur = loadState();
       const secret = !p.secret || p.secret === MASK ? cur.providers.find((o) => o.name === p.name)?.secret || "" : p.secret;
-      const provider = { ...p, secret };
+      // 网关（如 OpenCode Go）要求带会话标识：测试也带上，免得「测试失败但真跑能用」
+      const provider = { ...p, baseURL: normalizeBase(p.baseURL), secret, sessionId: "u-agent-connect-test", userAgent: `u-agent/${VERSION}` };
       const ctrl = AbortSignal.timeout(Number(process.env.UA_TEST_TIMEOUT_MS) || 25000);
+      const corrected = provider.baseURL !== String(p.baseURL || "").trim().replace(/\/+$/, "");
       try {
         let sample = "";
         for await (const ev of streamChat(provider, [{ role: "user", text: "hi" }], [], ctrl)) {
@@ -677,44 +683,74 @@ const server = http.createServer(async (req, res) => {
           else if (ev.type === "error") throw new Error(ev.message);
           else if (ev.type === "end") break;
         }
-        return sendJson(res, 200, { ok: true, sample: sample.trim().slice(0, 60) });
+        return sendJson(res, 200, {
+          ok: true,
+          sample: sample.trim().slice(0, 60),
+          note: corrected ? `服务地址已自动纠正为 ${provider.baseURL}` : "",
+        });
       } catch (e) {
-        return sendJson(res, 400, { error: e.message || "连不上" });
+        const hint = corrected ? `\n（顺带一提：你的服务地址被纠成 ${provider.baseURL} 再用一次试试）` : "";
+        return sendJson(res, 400, { error: (e.message || "连不上") + hint });
       }
     }
 
     // 从厂商服务实时拉取模型清单（OpenCode/Cherry Studio 同款做法：预设只给地址，模型名让用户挑）
+    // v0.8.2：地址先纠偏（用户常把整条接口地址粘进来），失败时把「试过哪些地址、各自什么结果」原样列出来
     if (req.method === "POST" && u.pathname === "/api/list-models") {
       const b = await readBody(req);
       const p = b.provider || {};
       if (p.protocol === "mock") return sendJson(res, 200, { models: [{ id: "mock-1" }], note: "离线演示通道" });
-      const base = String(p.baseURL || "").replace(/\/+$/, "");
+      const base = normalizeBase(p.baseURL);
       if (!base) return sendJson(res, 400, { error: "先填服务地址再拉取" });
       if (/[{<]/.test(base)) return sendJson(res, 400, { error: "服务地址里还有占位符，先换成真实地址" });
       const cur = loadState();
       const secret = !p.secret || p.secret === MASK ? cur.providers.find((o) => o.name === p.name)?.secret || "" : p.secret;
-      const headers =
-        p.protocol === "anthropic"
-          ? { ...(secret ? { "x-api-key": secret } : {}), "anthropic-version": "2023-06-01" }
-          : { ...(secret ? { Authorization: `Bearer ${secret}` } : {}) };
-      const url = p.protocol === "anthropic" ? `${base}/v1/models` : `${base}/models`;
-      try {
-        const r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
-        const text = await r.text();
-        if (!r.ok) return sendJson(res, 400, { error: `拉取失败（${r.status}）：${text.slice(0, 160)}` });
-        let ids = [];
+      const provider = { ...p, baseURL: base, secret, userAgent: `u-agent/${VERSION}`, sessionId: "u-agent-model-list" };
+
+      // 候选路径：多数服务是 {base}/models；anthropic 的官方形式是 {base}/v1/models；
+      // 用户只填了域名（没带 /v1）时两种都试一遍
+      const hasV1 = /\/v1$/i.test(base);
+      const urls = [];
+      if (p.protocol === "anthropic") urls.push(hasV1 ? `${base}/models` : `${base}/v1/models`);
+      else urls.push(`${base}/models`);
+      if (!hasV1 && p.protocol === "anthropic") urls.push(`${base}/models`);
+      if (!hasV1 && p.protocol !== "anthropic") urls.push(`${base}/v1/models`);
+
+      const tried = [];
+      for (const url of urls) {
         try {
-          const j = JSON.parse(text);
-          ids = (j.data || j.models || []).map((m) => m.id || m.name || m.model).filter(Boolean);
-        } catch {
-          return sendJson(res, 400, { error: "返回不是模型清单 JSON" });
+          const r = await fetch(url, { headers: buildHeaders(provider, url), signal: AbortSignal.timeout(15000) });
+          const text = await r.text();
+          if (!r.ok) {
+            tried.push(`${url} → HTTP ${r.status} ${truncate(text.trim(), 120)}`);
+            continue;
+          }
+          if (/^\s*</.test(text)) {
+            return sendJson(res, 400, {
+              error: `这个地址返回的是网页、不是模型清单：${url}\n多半把「服务地址」填成了官网或控制台地址——要填接口地址（一般以 /v1 结尾）`,
+            });
+          }
+          let ids = [];
+          try {
+            const j = JSON.parse(text);
+            const arr = Array.isArray(j) ? j : j.data || j.models || [];
+            ids = (Array.isArray(arr) ? arr : []).map((m) => (typeof m === "string" ? m : m.id || m.name || m.model)).filter(Boolean);
+          } catch {
+            return sendJson(res, 400, { error: `这个地址返回的不是模型清单 JSON：${url}` });
+          }
+          ids = [...new Set(ids)].sort();
+          if (!ids.length) {
+            tried.push(`${url} → 清单是空的`);
+            continue;
+          }
+          return sendJson(res, 200, { models: ids.map((id) => ({ id })), count: ids.length, base, note: base !== String(p.baseURL || "").replace(/\/+$/, "") ? `已把服务地址纠成：${base}` : "" });
+        } catch (e) {
+          tried.push(`${url} → ${e.name === "TimeoutError" ? "请求超时（15 秒）" : e.message}`);
         }
-        ids = [...new Set(ids)].sort();
-        if (!ids.length) return sendJson(res, 400, { error: "这家服务没返回可用模型" });
-        return sendJson(res, 200, { models: ids.map((id) => ({ id })), count: ids.length });
-      } catch (e) {
-        return sendJson(res, 400, { error: e.message || "连不上这家服务" });
       }
+      return sendJson(res, 400, {
+        error: `拉不到模型清单。试过这些地址：\n${tried.join("\n")}\n地址、协议、网络（域名解析/代理）三者任一不对都会这样；点「测试连接」能看到更具体的报错`,
+      });
     }
 
     /* ---------- 只回退对话（不动文件） ---------- */
@@ -750,8 +786,9 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
-      const provider = pickAssist(st, st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]);
-      if (!provider) return sendJson(res, 400, { error: "没有可用的模型通道" });
+      const picked = pickAssist(st, st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]);
+      if (!picked) return sendJson(res, 400, { error: "没有可用的模型通道" });
+      const provider = { ...picked, baseURL: normalizeBase(picked.baseURL), sessionId: sid, userAgent: `u-agent/${VERSION}` };
       const msgs = buildHistory(events);
       const keepTail = Math.max(0, Math.min(6, msgs.length - 2));
       if (msgs.length < 4 || msgs.length - keepTail < 2) return sendJson(res, 400, { error: "对话还太短，无需压缩" });

@@ -150,3 +150,50 @@ test("Mock：MOCKSCRIPT 剧本按工具步数续播", async () => {
   assert.equal(r3.at(-1).stopReason, "stop");
   assert.ok(r3.some((e) => e.type === "text"));
 });
+
+/* ===== v0.8.2：网关适配（OpenCode Zen / Go 这类按模型分协议、要会话头的网关） ===== */
+import { normalizeBase, buildHeaders, endpoint, friendlyUpstreamError } from "../core/providers.mjs";
+
+test("地址纠偏：把整条接口地址粘进来也能用", () => {
+  assert.equal(normalizeBase("https://opencode.ai/zen/go/v1/chat/completions"), "https://opencode.ai/zen/go/v1");
+  assert.equal(normalizeBase("https://opencode.ai/zen/v1/"), "https://opencode.ai/zen/v1");
+  assert.equal(normalizeBase("https://api.deepseek.com"), "https://api.deepseek.com");
+  assert.equal(normalizeBase("https://api.anthropic.com/v1/messages"), "https://api.anthropic.com/v1");
+  assert.equal(normalizeBase("http://127.0.0.1:11434/v1/models"), "http://127.0.0.1:11434/v1");
+  assert.equal(normalizeBase("https://openrouter.ai/api/v1/responses"), "https://openrouter.ai/api/v1");
+});
+
+test("路径拼装：地址里已经有 /v1 时不再叠一层（否则 /v1/v1/messages 会被网关掐断）", () => {
+  assert.equal(endpoint({ protocol: "anthropic", baseURL: "https://api.anthropic.com" }).url, "https://api.anthropic.com/v1/messages");
+  assert.equal(endpoint({ protocol: "anthropic", baseURL: "https://opencode.ai/zen/go/v1" }).url, "https://opencode.ai/zen/go/v1/messages");
+  assert.equal(endpoint({ protocol: "anthropic", baseURL: "https://opencode.ai/zen/go/v1/messages" }).url, "https://opencode.ai/zen/go/v1/messages");
+  assert.equal(endpoint({ protocol: "openai-chat", baseURL: "https://opencode.ai/zen/go/v1/chat/completions" }).url, "https://opencode.ai/zen/go/v1/chat/completions");
+  assert.equal(endpoint({ protocol: "openai-responses", baseURL: "https://opencode.ai/zen/go/v1" }).url, "https://opencode.ai/zen/go/v1/responses");
+  assert.throws(() => endpoint({ protocol: "nope", baseURL: "https://x" }), /未知协议/);
+});
+
+test("请求头：网关要的会话标识只发给网关，别家一个多余的头发都不加", () => {
+  const zen = buildHeaders({ protocol: "openai-chat", secret: "sk-x", sessionId: "s-1", userAgent: "u-agent/1.0" }, "https://opencode.ai/zen/go/v1/chat/completions");
+  assert.equal(zen["x-opencode-session"], "s-1", "opencode.ai 要带会话标识");
+  assert.equal(zen.Authorization, "Bearer sk-x");
+  assert.equal(zen["user-agent"], "u-agent/1.0", "要自报家门，别用默认的 HTTP 库名");
+  const ds = buildHeaders({ protocol: "openai-chat", secret: "sk-y", sessionId: "s-1" }, "https://api.deepseek.com/chat/completions");
+  assert.equal(ds["x-opencode-session"], undefined, "别家不该收到这个头");
+  const local = buildHeaders({ protocol: "openai-chat", secret: "" }, "http://127.0.0.1:11434/v1/chat/completions");
+  assert.equal(local.Authorization, undefined, "没钥匙（本地 Ollama）不发鉴权头");
+  const an = buildHeaders({ protocol: "anthropic", secret: "sk-z" }, "https://api.anthropic.com/v1/messages");
+  assert.equal(an["x-api-key"], "sk-z");
+  assert.equal(an["anthropic-version"], "2023-06-01");
+  // 预设标记也认：用户把地址换成镜像/自建中转时照样带会话头
+  const viaPreset = buildHeaders({ protocol: "openai-chat", secret: "k", sessionId: "s-2", preset: "ocgo" }, "http://127.0.0.1:9999/v1/chat/completions");
+  assert.equal(viaPreset["x-opencode-session"], "s-2");
+});
+
+test("上游报错翻成人话（含「Go 订阅别用 Zen 地址」的提示）", () => {
+  assert.match(friendlyUpstreamError(400, '{"type":"error","error":{"type":"MissingSessionID"}}', {}), /会话标识/);
+  const bad = friendlyUpstreamError(401, '{"error":{"message":"Upstream request failed: Invalid credential"}}', { baseURL: "https://opencode.ai/zen/v1" });
+  assert.match(bad, /钥匙无效/);
+  assert.match(bad, /zen\/go\/v1/, "拿 Go 钥匙打 Zen 地址时要指出来");
+  assert.match(friendlyUpstreamError(404, "model not found", {}), /不认这个模型|分协议/);
+  assert.match(friendlyUpstreamError(500, "boom", {}), /HTTP 500/);
+});
