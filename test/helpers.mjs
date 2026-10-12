@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Registry } from "../core/tools.mjs";
 
@@ -10,6 +11,22 @@ export const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 
 export function tmpDir(prefix = "uagent-t-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+// 直接 spawn（不经 cmd shell，绕开本机偶发的 "spawnSync cmd.exe EBUSY"），
+// 且对"进程没起来"的 EBUSY/EPERM 自动重试；失败时抛错（语义同 execSync）。
+const SPAWN_RETRYABLE_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
+export function runSyncRetry(file, args, { cwd, stdio = "pipe", input, retries = 3 } = {}) {
+  for (let i = 0; ; i++) {
+    const r = spawnSync(file, args, { cwd, input, stdio, encoding: "utf8", windowsHide: true });
+    if (!r.error && r.status === 0) return r;
+    if (i < retries - 1 && r.error && SPAWN_RETRYABLE_CODES.has(r.error.code)) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150 * (i + 1));
+      continue;
+    }
+    if (r.error) throw r.error;
+    throw new Error(`${file} ${args.join(" ")} 退出码 ${r.status}: ${(r.stderr || "").toString().trim()}`);
+  }
 }
 
 export async function freshRegistry() {
