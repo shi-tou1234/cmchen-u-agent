@@ -29,6 +29,9 @@ export default {
   name: "fs_search",
   description: "在工作区搜索文件（按文件名通配符和/或文本内容）",
   risk: "low",
+
+  parallel: true, // 只读：可与同批其它只读工具并行（不声明就独占）
+  // 见 core/agent-loop.mjs 的调度：只读同批并发，其余单独成片
   params: {
     type: "object",
     properties: {

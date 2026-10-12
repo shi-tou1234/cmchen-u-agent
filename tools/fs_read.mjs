@@ -6,6 +6,9 @@ export default {
   name: "fs_read",
   description: "读取文本文件内容（默认最多 200KB）",
   risk: "low",
+
+  parallel: true, // 只读：可与同批其它只读工具并行（不声明就独占）
+  // 见 core/agent-loop.mjs 的调度：只读同批并发，其余单独成片
   params: {
     type: "object",
     properties: {

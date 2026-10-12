@@ -53,7 +53,7 @@ export const api = {
   renameSession: (id, title) => post("/api/session-rename", { id, title }),
   dropSession: (id) => req("/api/session?id=" + encodeURIComponent(id), { method: "DELETE" }),
 
-  confirm: (confirmId, approve, note) => post("/api/confirm", { confirmId, approve, note: note || "" }),
+  confirm: (confirmId, approve, note, rememberPrefix) => post("/api/confirm", { confirmId, approve, note: note || "", rememberPrefix: rememberPrefix || "" }),
   abort: (sessionId) => post("/api/abort", { sessionId }),
   compact: (sessionId, provider, instruction) => post("/api/compact", { sessionId, provider, instruction: instruction || "" }),
   modelInfo: (provider) => post("/api/model-info", { provider }),

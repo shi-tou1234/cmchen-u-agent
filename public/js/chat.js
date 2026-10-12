@@ -2,7 +2,7 @@
 import { api } from "./api.js";
 import { S, setMode, MODES, MODE_HINT, ACTION_META } from "./state.js";
 import { $, $$, el, esc, icon, md, toast, kb } from "./ui.js";
-import { renderModelBtn } from "./picker.js";
+import { renderModelBtn, cycleMode } from "./picker.js";
 import { ping, askPermission } from "./notify.js";
 
 const T_ICON = {
@@ -20,6 +20,29 @@ const streamEl = () => $("#msgs");
 const colEl = () => $("#msgCol");
 let nearBottom = true;
 
+/* ---- 运行中排队的消息（回车排队 → 这一轮跑完自动发） ---- */
+const sendQueue = [];
+export function renderQueue() {
+  const box = $("#queueList");
+  if (!box) return;
+  box.hidden = !sendQueue.length;
+  box.innerHTML = sendQueue
+    .map((t, i) => `<span class="q-chip" data-i="${i}" title="点一下放回输入框改改"><b>排队 ${i + 1}</b>${esc(t.slice(0, 40))}<button class="x" title="取消这条">✕</button></span>`)
+    .join("");
+  box.querySelectorAll(".q-chip").forEach((chip) => {
+    chip.querySelector(".x").onclick = (e) => {
+      e.stopPropagation();
+      sendQueue.splice(Number(chip.dataset.i), 1);
+      renderQueue();
+    };
+    chip.onclick = () => {
+      const t = sendQueue.splice(Number(chip.dataset.i), 1)[0];
+      renderQueue();
+      setInput(t || ""); // 放回输入框，改完再发
+    };
+  });
+}
+
 function atBottom() {
   const s = streamEl();
   return s.scrollHeight - s.scrollTop - s.clientHeight < 110;
@@ -33,7 +56,18 @@ function scrollEnd(force) {
 const scale = (chars) => (chars >= 1000 ? (chars / 1000).toFixed(1) + "k 字" : chars + " 字");
 /* ================= 发送 / SSE ================= */
 export async function sendMessage(text) {
-  if (S.sending) return;
+  if (S.sending) {
+    // 正在跑的时候回车 = 排队（对标 MiniMax Code 的 Enter 排队 / Alt+Enter 引导）：
+    // 不用干等，也不用打断它——这一轮跑完自动接着发
+    const q = String(text ?? "").trim();
+    if (q) {
+      sendQueue.push(q);
+      renderQueue();
+      clearComposer();
+      toast("已排队，这一轮跑完自动发出（点排队条上的 ✕ 可取消）", "ok");
+    }
+    return;
+  }
   const clean = String(text ?? "").trim();
   askPermission(); // 用户手势里顺手要一次通知权限，拒绝了不影响任何功能
 
@@ -139,6 +173,12 @@ export async function sendMessage(text) {
     S.sending = false;
     setSendUI();
     S.onSessionTouched && S.onSessionTouched();
+    // 排队里的下一条：这一轮已经结束，接着发出去
+    if (sendQueue.length) {
+      const next = sendQueue.shift();
+      renderQueue();
+      setTimeout(() => sendMessage(next), 250);
+    }
     // 会话标题是这轮结束后在后台起的，稍等一下再刷一次侧栏，让它冒出来
     if (needTitle) setTimeout(() => S.onSessionTouched && S.onSessionTouched(), 2600);
     const list = colEl().querySelectorAll(".msg.assistant");
@@ -161,6 +201,14 @@ function handleEvent(ev, c) {
       break;
     case "usage": S.tokens = { input: ev.input, output: ev.output }; break;
     case "budget": if (ev.budget) S.budget = ev.budget; if (ev.context) S.context = ev.context; break;
+    case "compact": {
+      // 自动压缩（服务端在发问之前做的）：说一声并刷新用量条
+      if (ev.auto) {
+        if (ev.after) S.budget = ev.after;
+        toast("上下文快满了，已自动压缩：" + kTok(ev.before?.tokens || 0) + " → " + kTok(ev.after?.tokens || 0) + " tokens", "ok");
+      }
+      break;
+    }
     case "plan": renderPlan(ev.items); break;
     case "assistant_delta": {
       // 开始出正文了：把这一轮的思考块收起来，并让下一轮可以再开一块（mutate，不能整个替换，否则共享状态断了）
@@ -481,6 +529,7 @@ function addTool(ev) {
       <span class="t-name">${esc(ev.name)}</span>
       <span class="t-sum">${esc(summaryOf(ev))}</span>
       <span class="t-res"></span>
+      ${ev.doom ? `<span class="badge wait">重复第 ${ev.doom} 次</span>` : ""}
       <span class="badge ${cls}">${label}</span>
       ${icon("chevron-down", "ic ic-sm chev")}
     </summary><div class="t-body">
@@ -730,7 +779,7 @@ export function renderUsage() {
   wrap.title = tokens
     ? `本轮上下文约 ${tokens.toLocaleString()} tokens，可用预算 ${limit.toLocaleString()}（模型窗口 ${win.toLocaleString()}${
         S.context?.source ? " · " + S.context.source : ""
-      }）${pct >= 90 ? " —— 建议点「压缩」" : ""}`
+      }）${Number(S.autoCompactAt) > 0 ? `；到 ${Math.round(Number(S.autoCompactAt) * 100)}% 会自动压缩` : "；自动压缩已关闭"}${pct >= 90 ? " —— 也可以现在就点「压缩」" : ""}`
     : "还没有对话内容";
 
   const bar = $("#ctxText");
@@ -802,8 +851,8 @@ export function setSendUI() {
   renderRunChip();
   btn.classList.toggle("busy", S.sending);
   btn.innerHTML = S.sending ? icon("stop") : icon("send");
-  btn.title = S.sending ? "停止" : "发送（Enter）";
-  $("#compHint").textContent = S.sending ? "正在跑，点右侧按钮可随时中断" : MODE_HINT[S.mode] || "";
+  btn.title = S.sending ? "停下当前这轮（想把话排着队说，直接按回车）" : "发送（Enter）";
+  $("#compHint").textContent = S.sending ? "正在跑：回车 = 排队接着说，点右侧按钮 = 停下" : MODE_HINT[S.mode] || "";
   $("#modeBtn").dataset.mode = S.mode;
 }
 
@@ -822,7 +871,18 @@ function queueConfirm(ev) {
 function showConfirm() {
   const ev = queue[0];
   if (!ev) return;
-  $("#cfmMeta").textContent = `${ev.name} · 风险等级 ${ev.risk || "high"}`;
+  $("#cfmMeta").textContent = `${ev.name} · 风险等级 ${ev.risk || "high"}` + (ev.reason ? " · " + ev.reason : "");
+  // 「为什么问你」要说清楚（例如同一个调用重复第 3 次）
+  const why = $("#cfmWhy");
+  why.hidden = !ev.reason;
+  why.textContent = ev.reason ? "⚠ " + ev.reason : "";
+  // 「本会话不再问这类命令」：按钮上写清放行范围（对标 Codex 的 don't ask again for commands that start with …）
+  const always = $("#cfmAlways");
+  always.hidden = !ev.prefix;
+  if (ev.prefix) {
+    always.textContent = "本会话不再问「" + ev.prefix + " …」";
+    always.onclick = () => resolveConfirm(true, true);
+  }
   const pv = ev.preview;
   const box = $("#cfmBody");
   if (pv && pv.kind === "diff" && pv.lines && pv.lines.length) {
@@ -837,11 +897,11 @@ function showConfirm() {
   $("#cfmNote").value = ""; // 上一单的附言不许带到下一单
   $("#cfmRoot").hidden = false;
 }
-async function resolveConfirm(approve) {
+async function resolveConfirm(approve, remember) {
   const ev = queue.shift();
   const note = $("#cfmNote").value.trim().slice(0, 300);
   $("#cfmRoot").hidden = true;
-  if (ev) await api.confirm(ev.confirmId, approve, note).catch(() => {});
+  if (ev) await api.confirm(ev.confirmId, approve, note, remember && ev.prefix ? ev.prefix : "").catch(() => {});
   if (queue.length) setTimeout(showConfirm, 260);
 }
 

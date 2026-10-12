@@ -118,6 +118,11 @@ export function renderModeBtn() {
   markActive($("#modeList"), modeIdx);
 }
 
+export function cycleMode(dir = 1) {
+  const i = MODES.findIndex((m) => m.id === S.mode);
+  pickMode((i + dir + MODES.length) % MODES.length);
+}
+
 function pickMode(i) {
   const m = MODES[i];
   if (!m) return;

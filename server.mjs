@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Registry } from "./core/tools.mjs";
 import { runAgent } from "./core/agent-loop.mjs";
 import { streamChat, normalizeBase, buildHeaders, describeFetchError } from "./core/providers.mjs";
-import { buildHistory, budgetOf, compactPrompt } from "./core/context.mjs";
+import { buildHistory, budgetOf, compactPrompt, rewindRanges, isDropped } from "./core/context.mjs";
 import { Sessions } from "./core/sessions.mjs";
 import { ConfirmGate } from "./core/confirm.mjs";
 import { Checkpoints, SNAP_PATHS } from "./core/checkpoints.mjs";
@@ -24,7 +24,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.9.0";
+const VERSION = "0.9.2";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -77,6 +77,7 @@ function loadState() {
     searchKeys: vault.searchKeys || {},
     autoApprove: { ...DEFAULT_AUTO_APPROVE, ...(settings.autoApprove || {}), actions: { ...DEFAULT_AUTO_APPROVE.actions, ...((settings.autoApprove || {}).actions || {}) } },
     assist: settings.assist || "", // 轻量通道：起名/压缩这类杂活用，留空=跟随当前通道
+    autoCompactAt: settings.autoCompactAt === 0 ? 0 : Number(settings.autoCompactAt) > 0 ? Number(settings.autoCompactAt) : 0.8, // 上下文涨到这个比例就自动压缩（0=关）
   };
 }
 function saveState(patch) {
@@ -87,11 +88,12 @@ function saveState(patch) {
   const searchKeys = patch.searchKeys ?? cur.searchKeys;
   const autoApprove = patch.autoApprove ?? cur.autoApprove;
   const assist = patch.assist ?? cur.assist;
+  const autoCompactAt = patch.autoCompactAt ?? cur.autoCompactAt;
   writeJson(CONFIG, { providers: providers.map((p) => ({ ...p, secret: "" })), active });
   const vault = { providers: {}, searchKeys: searchKeys || {} };
   for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
   vaultSave(vault);
-  writeJson(SETTINGS, { workspace, active, autoApprove, assist });
+  writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt });
   return loadState();
 }
 if (!fs.existsSync(CONFIG)) saveState({});
@@ -142,8 +144,35 @@ function maskState(st) {
 
 // ---------- 会话运行态 ----------
 const running = new Map(); // sessionId → {abort: AbortController, mode}
+// 用户在弹窗里点过「本会话不再问这类命令」的前缀（内存态，服务重启即失效）
+const sessionCmdAllow = new Map(); // sessionId → Set<prefix>
+const sessionLoopGuard = new Map(); // sessionId → {lastSig, count}：防死循环的连续重复计数（跨轮保持）
 
 const MEMORY = path.join(DATA, "memory.md");
+const SPILL_DIR = path.join(DATA, "spill"); // 超长工具输出落盘的地方（给模型留一条可恢复的路径）
+
+// 超长工具结果：掐头去尾 + 全文落盘 + 告诉模型怎么读回来（对标 dsh 的 spill 策略，比纯截断友好）
+const SPILL_LIMIT = 40000;
+const SPILL_HEAD = 9000;
+const SPILL_TAIL = 3000;
+function spillResult(sessionId, id, name, text) {
+  if (typeof text !== "string" || text.length <= SPILL_LIMIT) return text;
+  const safe = (s) => String(s || "").replace(/[^\w.-]/g, "_");
+  const dir = path.join(SPILL_DIR, safe(sessionId));
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${safe(id || genId("t"))}-${safe(name || "tool")}.txt`);
+    fs.writeFileSync(file, text, "utf8");
+    const omitted = text.length - SPILL_HEAD - SPILL_TAIL;
+    return (
+      `${text.slice(0, SPILL_HEAD)}\n\n` +
+      `【中间省略 ${omitted} 字符；完整输出已存到 ${file}，需要时用 fs_read 带 offset/limit 分段读，或用 fs_search 在这个文件里搜】\n\n` +
+      text.slice(-SPILL_TAIL)
+    );
+  } catch {
+    return truncate(text, SPILL_LIMIT);
+  }
+}
 const TITLES = path.join(DATA, "titles.json");
 const readMemory = () => {
   try {
@@ -284,6 +313,43 @@ async function askOnce(provider, prompt, timeoutMs = 30000) {
   return out.trim();
 }
 
+// 把「旧轮次摘要成一条 compact 事件」抽出来：手动 /api/compact 与自动压缩共用同一套
+async function compactSession(sessionId, provider, { keepTailMax = 6, instruction = "", auto = false } = {}) {
+  const events = sessions.read(sessionId);
+  const msgs = buildHistory(events);
+  const keepTail = Math.max(0, Math.min(keepTailMax, msgs.length - 2));
+  if (msgs.length < 4 || msgs.length - keepTail < 2) throw new Error("对话还太短，无需压缩");
+  const before = budgetOf(msgs);
+  let summary = "";
+  for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail, instruction) }], [], AbortSignal.timeout(90000))) {
+    if (ev.type === "text") summary += ev.delta;
+    else if (ev.type === "error") throw new Error(ev.message);
+  }
+  summary = summary.trim();
+  if (!summary) throw new Error("模型没有返回摘要");
+  sessions.append(sessionId, { type: "compact", summary, atIndex: events.length, keepTail, ...(auto ? { auto: true } : {}) });
+  return { summary, before, keepTail };
+}
+
+// 上下文涨到阈值（默认 80%）就自动压缩一遍再问模型——别等模型报超限，也别让人盯着用量条手动点
+async function autoCompactIfNeeded(sessionId, provider, st, limits) {
+  const threshold = Number(st.autoCompactAt);
+  if (!(threshold > 0)) return null; // 0 = 关
+  const events = sessions.read(sessionId);
+  const msgs = buildHistory(events);
+  if (msgs.length < 6) return null; // 太短没必要压
+  const b = budgetOf(msgs, limits);
+  if (b.tokens < b.limitTokens * threshold) return null;
+  const p = pickAssist(st, provider);
+  if (!p) return null; // 没有可用模型（离线演示）就不硬压，留给手动
+  try {
+    const r = await compactSession(sessionId, { ...p, baseURL: normalizeBase(p.baseURL), sessionId, userAgent: `u-agent/${VERSION}` }, { auto: true });
+    return { summary: r.summary, before: r.before, after: budgetOf(buildHistory(sessions.read(sessionId)), limits) };
+  } catch {
+    return null; // 自动压缩失败就当没发生，绝不能挡住这一轮
+  }
+}
+
 // 模型爱加引号、爱写「标题：」、爱多句——都清掉，只留一行短标题
 function cleanTitle(raw) {
   let t = String(raw || "").trim().split("\n").find((l) => l.trim()) || "";
@@ -355,19 +421,37 @@ async function handleChat(req, res, body) {
 
   const abort = new AbortController();
   running.set(sessionId, { abort, mode });
-  // 多轮上下文：从会话日志重建历史（含 compact 摘要替换），再拼上本条消息
-  const pastEvents = sessions.read(sessionId);
-  const history = buildHistory(pastEvents);
+  // 多轮上下文：从会话日志重建历史（含 compact 摘要替换与回退裁剪），再拼上本条消息
+  let pastEvents = sessions.read(sessionId);
+  let history = buildHistory(pastEvents);
   const turnSeq = pastEvents.filter((e) => e.type === "user").length + 1; // 第几轮：写进快照清单，回滚时看得懂
-  const messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
+  let messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
   const limits = limitsOf(provider); // 这个模型真实能吃多少：按窗口算，不再用写死的字数
-  const budget = budgetOf(messages, limits);
+  let budget = budgetOf(messages, limits);
   const context = contextInfoOf(provider);
+  // 计划跨轮存活：把日志里最后一条没被回退掉的计划塞回状态（对标「任务跨压缩存活」）
+  const dropped = rewindRanges(pastEvents);
+  let lastPlan = null;
+  for (let i = pastEvents.length - 1; i >= 0; i--) {
+    if (pastEvents[i].type === "plan" && pastEvents[i].items?.length && !isDropped(dropped, i)) { lastPlan = pastEvents[i].items; break; }
+  }
   sessions.append(sessionId, { type: "mode", mode });
   sessions.append(sessionId, { type: "user", text, images });
 
   sseHead(res);
   sse(res, { type: "session", sessionId, provider: provider.name, mode, budget, context });
+
+  // 上下文涨到阈值（默认 80%）就自动压缩一遍再问模型——别等模型报超限，也别让人手动盯着用量条
+  try {
+    const auto = await autoCompactIfNeeded(sessionId, provider, st, limits);
+    if (auto) {
+      sse(res, { type: "compact", auto: true, before: auto.before, after: auto.after, summary: auto.summary });
+      pastEvents = sessions.read(sessionId);
+      history = buildHistory(pastEvents);
+      messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
+      budget = budgetOf(messages, limits);
+    }
+  } catch {}
 
   const ctx = {
     uaHome: UA_HOME,
@@ -378,10 +462,15 @@ async function handleChat(req, res, body) {
     registry,
     signal: abort.signal,
     subDepth: 0,
-    state: {},
+    state: lastPlan ? { plan: lastPlan } : {},
     autoCount: 0, // 本轮连续自动放行的次数（上限到了就回来问）
     memory: readMemory(),
     agentsMd: agentsMdOf(st.workspace),
+    sessionId,
+    cmdPrefixes: [...(sessionCmdAllow.get(sessionId) || [])],
+    loopGuard: (() => { const g = sessionLoopGuard.get(sessionId) || { lastSig: "", count: 0 }; sessionLoopGuard.set(sessionId, g); return g; })(),
+    // 超长工具输出：落盘 + 掐头去尾 + 给模型一条读回来的路
+    spill: (text, tc) => spillResult(sessionId, tc?.id, tc?.name, text),
     confirm: (info) => {
       const id = genId("cfm");
       const p = new Promise((resolve) => {
@@ -540,6 +629,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/chat") return await handleChat(req, res, await readBody(req));
     if (req.method === "POST" && u.pathname === "/api/confirm") {
       const b = await readBody(req);
+      if (b.approve && b.rememberPrefix) {
+        // 「本会话不再问这类命令」：记下前缀（作用域＝这个会话，服务重启即失效）
+        const info = confirmGate.pending.get(b.confirmId)?.info;
+        const sid = info?.sessionId;
+        const pre = String(b.rememberPrefix).trim().slice(0, 80);
+        if (sid && pre) {
+          const set = sessionCmdAllow.get(sid) || new Set();
+          set.add(pre);
+          sessionCmdAllow.set(sid, set);
+        }
+      }
       const ok = confirmGate.resolve(b.confirmId, !!b.approve, b.note);
       return sendJson(res, 200, { ok });
     }
@@ -568,6 +668,7 @@ const server = http.createServer(async (req, res) => {
       if (b.searchKeys !== undefined) patch.searchKeys = b.searchKeys;
       if (b.autoApprove !== undefined) patch.autoApprove = b.autoApprove;
       if (b.assist !== undefined) patch.assist = String(b.assist || "");
+      if (b.autoCompactAt !== undefined) patch.autoCompactAt = Math.max(0, Math.min(0.95, Number(b.autoCompactAt) || 0));
       const st = saveState(patch);
       return sendJson(res, 200, maskState(st));
     }
@@ -809,34 +910,23 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const st = loadState();
       const sid = String(b.sessionId || "");
-      let events = [];
       try {
-        events = sessions.read(sid);
+        sessions.read(sid);
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
       const picked = pickAssist(st, st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]);
       if (!picked) return sendJson(res, 400, { error: "没有可用的模型通道" });
       const provider = { ...picked, baseURL: normalizeBase(picked.baseURL), sessionId: sid, userAgent: `u-agent/${VERSION}` };
-      const msgs = buildHistory(events);
-      const keepTail = Math.max(0, Math.min(6, msgs.length - 2));
-      if (msgs.length < 4 || msgs.length - keepTail < 2) return sendJson(res, 400, { error: "对话还太短，无需压缩" });
       const limits = limitsOf(provider);
-      const before = budgetOf(msgs, limits);
-      let summary = "";
       try {
-        for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail, b.instruction) }], [], AbortSignal.timeout(90000))) {
-          if (ev.type === "text") summary += ev.delta;
-          else if (ev.type === "error") throw new Error(ev.message);
-        }
+        const r = await compactSession(sid, provider, { keepTailMax: 6, instruction: b.instruction });
+        const after = budgetOf(buildHistory(sessions.read(sid)), limits);
+        return sendJson(res, 200, { ok: true, summary: r.summary, before: r.before, after });
       } catch (e) {
-        return sendJson(res, 500, { error: "压缩失败：" + e.message });
+        const short = /太短/.test(e.message);
+        return sendJson(res, short ? 400 : 500, { error: short ? e.message : "压缩失败：" + e.message });
       }
-      summary = summary.trim();
-      if (!summary) return sendJson(res, 500, { error: "压缩失败：模型没有返回摘要" });
-      sessions.append(sid, { type: "compact", summary, atIndex: events.length, keepTail });
-      const after = budgetOf(buildHistory(sessions.read(sid)), limits);
-      return sendJson(res, 200, { ok: true, summary, before, after });
     }
     /* ---------- 检查点 / 一键回滚 ---------- */
     // 清单：带 sessionId 看这个会话的检查点，不带就看整盘的占用

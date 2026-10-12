@@ -107,14 +107,27 @@ export function describeFetchError(err, url) {
   return `连不上 ${url}${hint}原始错误：${cause || msg}`;
 }
 
-// 统一的 POST：网络层失败一律换成上面那句人话
-async function postStream(url, headers, body, signal) {
+// 统一的 POST：网络抖一下自动重试，重试不成再换成上面那句人话
+// （对标 Codex 的 responses_retry：指数退避 + 有上限；只重试「没拿到响应」与 429/5xx，鉴权类错误不重试）
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+async function postStream(url, headers, body, signal, attempt = 0) {
+  let res;
   try {
-    return await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+    res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
   } catch (e) {
     if (e?.name === "AbortError") throw e; // 用户主动停止，不改写
+    if (attempt < 2) {
+      await new Promise((r) => setTimeout(r, 600 * (attempt + 1) * (attempt + 1)));
+      return postStream(url, headers, body, signal, attempt + 1);
+    }
     throw new Error(describeFetchError(e, url));
   }
+  if (RETRYABLE.has(res.status) && attempt < 2) {
+    try { await res.text(); } catch {}
+    await new Promise((r) => setTimeout(r, 600 * (attempt + 1) * (attempt + 1)));
+    return postStream(url, headers, body, signal, attempt + 1);
+  }
+  return res;
 }
 
 // 上游报错翻译成人话（含状态码，便于排查）
@@ -500,8 +513,12 @@ async function* streamMock(provider, messages, tools, signal) {
   const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
   const lastUser = messages[lastUserIdx];
   const script = mockScript(lastUser?.text || "");
-  // 只数「最后一条用户消息之后」的工具步，避免把历史旧轮次的工具算进剧本进度
-  const toolCount = messages.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length;
+  // 剧本进度按「这轮已经回了几步」算：一步 = 一条带工具调用的 assistant 消息。
+  // 不能只数 tool 消息——一步里可能并行调多个工具，会把后面几步一起跳掉；
+  // 但手工拼出来的历史（测试里那种只有 tool 消息的）也要兼容：没有 assistant 就退回数 tool。
+  const afterUser = messages.slice(lastUserIdx + 1);
+  const asstSteps = afterUser.filter((m) => m.role === "assistant").length;
+  const toolCount = asstSteps > 0 ? asstSteps : afterUser.filter((m) => m.role === "tool").length;
   const rest = script.slice(toolCount);
   // 剧本里写 think:"…" 就先吐一段思考过程，方便离线演示与测试
   if (rest.length && rest[0].think) {
@@ -509,6 +526,20 @@ async function* streamMock(provider, messages, tools, signal) {
       yield { type: "reasoning", delta: ch };
       await new Promise((r) => setTimeout(r, 1));
     }
+  }
+  // 一轮里并行调多个工具：{ tools: [{tool, args}, …], say? }（模拟真实模型一次给多个 tool_calls）
+  if (rest.length && Array.isArray(rest[0].tools) && rest[0].tools.length) {
+    const step = rest[0];
+    if (step.say) yield { type: "text", delta: step.say };
+    const tcs = [];
+    for (const one of step.tools) {
+      const id = `mock_${tcs.length}_${Math.random().toString(36).slice(2, 6)}`;
+      yield { type: "tool_start", id, name: one.tool };
+      yield { type: "tool_delta", id, delta: JSON.stringify(one.args || {}) };
+      tcs.push({ id, name: one.tool, args: one.args || {} });
+    }
+    yield { type: "end", stopReason: "tool_calls", toolCalls: tcs };
+    return;
   }
   if (rest.length && rest[0].tool) {
     const step = rest[0];

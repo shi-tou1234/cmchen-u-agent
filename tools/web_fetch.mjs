@@ -18,6 +18,9 @@ export default {
   name: "web_fetch",
   description: "抓取网页/接口内容转纯文本（15 秒超时，截断 200KB）",
   risk: "low",
+
+  parallel: true, // 只读：可与同批其它只读工具并行（不声明就独占）
+  // 见 core/agent-loop.mjs 的调度：只读同批并发，其余单独成片
   params: {
     type: "object",
     properties: { url: { type: "string", description: "http(s):// 开头的地址" } },
