@@ -197,3 +197,18 @@ test("上游报错翻成人话（含「Go 订阅别用 Zen 地址」的提示）
   assert.match(friendlyUpstreamError(404, "model not found", {}), /不认这个模型|分协议/);
   assert.match(friendlyUpstreamError(500, "boom", {}), /HTTP 500/);
 });
+
+test("网络层失败也要说人话（不能只甩一句 fetch failed）", async () => {
+  const { describeFetchError } = await import("../core/providers.mjs");
+  assert.match(describeFetchError({ name: "TypeError", message: "fetch failed", cause: { code: "ENOTFOUND" } }, "https://x.invalid/v1/chat/completions"), /域名解析不了/);
+  assert.match(describeFetchError({ name: "TypeError", message: "fetch failed", cause: { code: "ECONNREFUSED" } }, "http://127.0.0.1:11434/v1/chat/completions"), /端口没在听/);
+  assert.match(describeFetchError({ name: "TypeError", message: "fetch failed", cause: { code: "ECONNRESET" } }, "https://opencode.ai/zen/v1/chat/completions"), /连上又被掐断/);
+  assert.match(describeFetchError({ name: "TimeoutError", message: "The operation was aborted due to timeout" }, "https://a/v1"), /超时/);
+  assert.match(describeFetchError({ message: "fetch failed" }, "https://a/v1"), /连不上 https:\/\/a\/v1/);
+  // 真实网络层：打一个没人监听的端口，报错必须是上面那种句子
+  const provider = { protocol: "openai-chat", baseURL: "http://127.0.0.1:1/v1", model: "m", secret: "k" };
+  const e = await collect(streamChat(provider, [{ role: "user", text: "hi" }], [])).catch((err) => err);
+  assert.ok(e instanceof Error, "应抛出错误");
+  assert.match(e.message, /连不上/);
+  assert.ok(!/^fetch failed$/.test(e.message), "不许只留 fetch failed");
+});

@@ -979,15 +979,32 @@ test("v8.2 新增：OpenCode Go 式网关——地址自动纠偏、会话标识
     assert.match([...sids][0], /s-gogate/, "会话标识直接用会话 id");
 
     // 钥匙不对时给人话 + 指路（拿 Go 钥匙打 Zen 地址的经典坑）
+    // 钥匙不对 → 说人话（不甩原文）。「拿 Go 钥匙打 Zen 地址」那条指路由 providers.test.mjs 纯函数用例覆盖，
+    // 这里不打真实网络：测试必须离线可跑，否则换个网络环境就假失败
     const wrong = await jjson("/api/test-provider", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ provider: { ...provider, secret: "sk-nope", baseURL: "https://opencode.ai/zen/v1" } }),
+      body: JSON.stringify({ provider: { ...provider, secret: "sk-nope" } }),
     });
     assert.equal(wrong.status, 400);
     assert.match(wrong.json.error, /钥匙无效/);
+    assert.match(wrong.json.error, /HTTP 401/);
   } finally {
     gw.close();
   }
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+});
+
+test("v8.2 新增：连不上时对话里也给人话报错（不是 fetch failed）", async () => {
+  const dead = { name: "DeadGate", protocol: "openai-chat", baseURL: "http://127.0.0.1:1/v1", model: "m", secret: "k" };
+  const t = await jjson("/api/test-provider", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: dead }) });
+  assert.equal(t.status, 400);
+  assert.match(t.json.error, /连不上|端口没在听/);
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, dead], active: "DeadGate", workspace: wsDir });
+  const r = await chat({ sessionId: "s-dead", mode: "confirm", provider: "DeadGate", message: { text: "你好" } });
+  const err = r.events.find((e) => e.type === "error");
+  assert.ok(err, "应给出错误事件");
+  assert.match(err.message, /连不上/);
+  assert.ok(!/^fetch failed$/.test(err.message), "不许只甩一句 fetch failed");
   await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
 });
