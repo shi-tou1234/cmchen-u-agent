@@ -25,10 +25,11 @@ G:\agent\                     ← 仓库根 = U 盘目录 (github.com/shi-tou123
 ├── core\providers.mjs        ← 三协议适配器 + Mock provider
 ├── core\tools.mjs            ← 工具注册表：扫描 tools/*.mjs 自动加载（一切皆插件）
 ├── core\sandbox.mjs          ← 路径白名单解析与拒绝
-├── core\confirm.mjs          ← 高危操作 pending 表：创建→等网页确认→放行/取消（带超时60s）
+├── core\confirm.mjs          ← 高危操作 pending 表：创建→等网页确认→放行/取消（带超时60s，可附一句话理由）
+├── core\checkpoints.mjs      ← 改动前文件快照 + 冲突检测 + 一键回滚（不依赖 git）
 ├── core\sessions.mjs         ← 会话 JSONL 追加日志（data/sessions/<id>.jsonl）
 ├── tools\                    ← 每个工具一个 .mjs，export {name,description,params,risk,run}
-├── public\index.html         ← 原生 JS 单文件聊天页
+├── public\                   ← 网页（index.html + css + js 模块，原生零依赖）
 ├── test\*.test.mjs           ← node:test 零依赖测试
 ├── config.example.json       ← 提交进 git；config.json（真实 key）git 忽略
 ├── data\                     ← settings.json(工作区等) / credentials.json(key) / sessions\（git 忽略）
@@ -70,9 +71,41 @@ shell_run 限制：cwd 必须在白名单内；命令黑名单正则（format、
 
 sandbox：白名单 = [工作区目录（首启网页里选，存 data/settings.json），U 盘目录自身]。所有 fs_* 与 shell cwd 的路径先 resolve 再判定必须落在白名单内，`..` 逃逸一律拒绝；拒绝时返回结构化错误（agent 能看到并向用户解释）。
 
-## 网页（public/index.html）
+## 网页（public/，2026-10-12 重构）
 
-会话侧栏 + 聊天流（流式打字机）+ 工具卡（名称/参数/结果，可折叠）+ 高危确认弹窗 + 设置抽屉（providers 增删改、key、工作区选择）+ 停止按钮（abort 主循环）。SSE 收 `/api/chat`，POST `/api/confirm`，GET/POST `/api/settings`，GET `/api/sessions`。全部原生 JS，不引任何外部 CDN（目标机可能无外网到 CDN）。
+**单一职责拆分**（原 855 行单文件，改为 11 个文件，仍零依赖、零 CDN）：
+
+```
+public\index.html      骨架：语义标签 + SVG 图标精灵（无样式、无逻辑）
+public\css\app.css     设计令牌（明暗两套）+ 组件样式 + 响应式
+public\js\ui.js        DOM/转义/Markdown 行式解析/Toast/图标
+public\js\api.js       后端接口封装（统一 401 未解锁回调）
+public\js\state.js     运行态单一数据源 S + 模式表 + 放行动作表
+public\js\catalog.js   模型厂商预设库（22 家，四组）
+public\js\picker.js    顶栏两个弹出选择器：模型通道、权限模式（+ 状态条模式芯片）
+public\js\chat.js      消息流渲染、SSE、工具卡/计划卡、本轮改动卡（含撤销）、高危确认（可附言）、斜杠命令、附件、用量条、导出
+public\js\settings.js  设置面板：分类导航 + 分区卡 + 通道卡 + 目录选择 + 添加通道向导 + 自动放行 + 提醒 + 检查点占用
+public\js\app.js       启动流程、密码锁、会话侧栏、主题、快捷键
+public\js\notify.js    注意力提醒：页面切走时才发系统通知 / 标题闪烁
+public\js\theme.js     浅色/深色/跟随系统（存浏览器本地，不写 U 盘数据）
+```
+
+界面结构：会话侧栏（新会话/搜索/会话列表/设置入口）+ 顶栏（模型通道、权限模式、主题）+ 消息流（用户气泡右对齐、助手正文含 Markdown/代码块/可折叠工具卡/计划卡/本轮改动卡可一键撤销）+ 输入区（上方一条状态条：权限模式 / 自动放行摘要 / 上下文进度条 / 压缩按钮；内部：附件条、斜杠命令与 @ 提及面板、用量与模式提示）+ 全屏设置面板（左分类导航：通用/模型/权限/记忆/联网/安全/关于；右分区卡；底部「未保存改动」提示条）。
+
+**换机即插即用不受拆分影响**（验收 F/G）：静态资源按扩展名回正确 MIME（.js=text/javascript，否则浏览器拒绝执行 ES module）；页面内引用一律站内相对路径 `/css/...`、`/js/...`，无 CDN、无 npm、无编译产物；9 个静态文件全部在 `public\` 内，FAT32 免符号链接；运行时只读盘内 `runtime\node\node.exe`，数据只写盘内 `data\` 与 `config.json`。浏览器基线：Chrome/Edge 90+（ES module + 可选链；代码里已避开 `.at()` 这类更新 API）。
+
+交互约定（参考 Cherry Studio / Open WebUI / bedrock-engineer 等同类产品）：
+
+- 设置=「左侧分类导航 + 右侧分区卡」，不再一长条堆叠；同类设置收进同一张卡（标题 + 一句说明 + 控件）
+- 能用开关/单选卡就不用下拉（权限五档改为带说明的单选卡）
+- 每个都有「测试连接」按钮（`POST /api/test-provider`），配错了当场知道
+- 显式保存 + 脏标记提示条（不静默改配置），非法输入（重名通道、空列表）在保存前拦下
+- 工作区用可视化目录选择器（`GET /api/browse`）而不是手写路径
+- 状态条常驻在输入框上方：当前权限、自动放行摘要、上下文占用一眼可见，且都能点（点模式换模式，点压缩就地压缩）
+- 模式卡按两列排布、自动放行清单压成单行——设置页不必翻很久才能改完想改的
+- UI 文本用系统无衬线字体（中文可读），只有代码用等宽；8px 间距体系 + 焦点环 + 三态（hover/focus/disabled）
+
+后端为网页新增：`GET /api/info`（本机与 U 盘信息）、`GET /api/browse?path=`（只列目录名，不返回文件内容；根列举盘符，过滤 `$RECYCLE`/`System Volume Information`）、`POST /api/test-provider`（用一条极短请求验证地址/协议/钥匙，25s 超时，失败返回上游错误原文）。三者均在密码锁保护范围内（非白名单需解锁）。
 
 ## setup 规格
 
@@ -142,6 +175,165 @@ shell 黑名单（format/shutdown/reg delete/vssadmin/cipher /w/盘根递归删�
 J 模式门禁: readonly 模式下 /api/chat 请求 fs_write → SSE 收到 deny 事件且文件未创建；
         auto 模式下 fs_delete → 拒绝事件；full 模式 → 直接执行；confirm 模式 → confirm_request 且 /api/confirm approve 后执行
 K 图片: /api/chat 带 1 张 1x1 png base64（Mock provider）→ 会话 jsonl 里 user 事件含 images 且长度>0，对话正常完成
+```
+
+## v6 追加规格（2026-10-12 领导追加：模型预设库 + 选择器重做 + 密码锁加固）
+
+### 模型预设库（对标 OpenCode 的 models.dev 目录思路）
+
+OpenCode 的做法：75+ 厂商全在预设目录里，用户只做两件事——`/connect` 粘钥匙、`/models` 挑模型；协议/地址/模型清单由预设带。本期按同样思路落地（零依赖、不联网也成立，所以预设写在 `public/js/catalog.js`，不引远端目录）：
+
+- `CATALOG`：22 家厂商，分四组（国内 / 国外 / 聚合中转 / 本机离线），每条含 `{协议, 服务地址, 候选模型, 拿钥匙的页面, 备注}`；覆盖 智谱 GLM、DeepSeek、Kimi、通义千问、MiniMax、火山方舟、腾讯混元、百度千帆、讯飞星火、OpenAI、Anthropic、Gemini、xAI、Mistral、Groq、Cohere、Azure、OpenRouter、硅基流动、Together、Fireworks、Ollama、LM Studio、vLLM、离线演示
+- 三协议照旧：绝大多数厂商走 `openai-chat`，OpenAI 走 `openai-responses`，Anthropic 走 `anthropic`
+- 模型名不必背：`POST /api/list-models` 现场用钥匙向厂商拉 `/models`（anthropic 走 `/v1/models`），拉回来点一下就选上；地址里还留 `{}` 占位符的直接拦下
+- 只填钥匙即可：向导里协议/地址已预填，折叠在「高级」里，需要时才改
+
+### 顶栏选择器重做（原生 select → 弹出面板）
+
+- 模型：`厂商标记 + 通道名 · 模型 + 状态点`，点开是「搜索框 + 通道列表（厂商标记、模型、钥匙是否已填）+ 当前项打勾 + 管理通道入口」，占位里带「管理通道…」跳设置
+- 权限：五档改成「图标 + 名称 + 两句说明」的卡片列表，当前项打勾；模式色进按钮（完全权限红、自动审批黄、只读/计划绿）
+- 两个面板都支持 ↑↓ 移动、Enter 选定、Esc 关闭；搜索过滤后键盘选中项与过滤结果一致
+- 斜杠命令 `/model`、`/mode` 改为直接改状态并广播事件，不再依赖 DOM select
+
+### 添加通道向导
+
+设置 → 模型 → 添加通道：**① 挑厂商**（带搜索、按组排布的品牌卡片，附「自己填服务地址」兜底）→ **② 填钥匙 + 选模型**（预填地址、模型快选标签、拉取模型列表、测试连接、高级折叠）→ 添加。刚配好且可用的通道自动切为在用。
+
+### 密码锁加固（领导问「那不就谁都能用了吗」）
+
+澄清并固化语义：**密码存在 U 盘 `data\lock.json`，跟盘走不跟机器走**——同一只盘插到任何电脑都是同一个密码；只有「这只盘从没设过密码」时才允许设置（`/api/lock-set` 在已设过的盘上返回 409 并提示走解锁/改密码）。
+
+- 解锁页显示这只盘的密码设置时间与设置时的机器名，并写明「密码跟着盘走，换电脑还是这一个」；新盘则红字提示「第一个设密码的人就是盘的主人，别把没设过密码的盘外借」
+- 暴力试防护：连错 5 次起进入冷却，`COOL_BASE(默认30s) × 2^(n-5)` 指数退避，上限 10 分钟；冷却期内 `/api/unlock` 一律 429 并回剩余秒数，前端按钮变倒计时
+- 每次失败仍有 600ms 固定延迟；成功即清零计数
+
+### v6 验收
+
+```
+V 预设库: catalog.js 覆盖 ≥20 家厂商，四组齐全；每家都有协议/地址/取钥匙页面
+W 拉取模型: 未解锁 401；地址含占位符 → 400；连不上 → 400 带原因；mock → 200 给模型名
+X 锁语义: /api/lock-status 返回 setup/setAt/setOn/cooldown；已设过密码的盘 lock-set → 409
+Y 冷却: 连错 5 次后第 6 次 → 429 且带 cooldown；冷却结束用正确密码 → 200
+Z 选择器: 静态资源全 200；页面无 JS 报错（无头浏览器实测）
+```
+
+## v7 追加规格（2026-10-12 领导选型：权限细粒度 + 上下文用量条 + @提及 + 改动总览 + 会话标题）
+
+### 权限：五档模式 × 细粒度自动放行（对标 Cline Auto-Approve）
+
+原来的五档只有"问/不问"的粗粒度，日常最烦的是"读文件也要点一下"。本期把 Cline 那套搬过来：**模式定大方向，开关定哪一类动作可以免问**。
+
+- `core/modes.mjs` 新增 `TOOL_CATEGORY`（工具→类别）、`ACTION_OF`（类别→开关名）、`ACTION_META`（七项开关的中文名/说明/风险备注）、`DEFAULT_AUTO_APPROVE`
+- 七项开关：读文件、改文件、删文件、跑安全命令、跑任何命令、联网、派子任务
+- `isSafeCommand(cmd)`：在 shell 黑名单之外再做一层启发式——只读命令（dir/ls/type/cat/git status…）算安全；**含 `>` 重定向的一律不算**（会把内容写进文件）
+- `gateWith(mode, risk, opts) → {g, auto, reason}`：套餐判定为 `confirm` 时才看开关；返回 `auto:true` 表示"这次是自动放行的"，事件里带标记，事后可追溯
+- `maxRequests`：连续自动放行 N 次后回到"问我"（0 = 不限）；用户手动确认过一次即清零计数
+- 优先级：完全权限/只读/计划这三档不受开关影响（本来就全放行或全拦）
+- 前端：设置 → 权限 → 「自动放行」卡（总开关 + 七行单行开关 + 次数上限）；输入区上方状态条常驻显示"自动放行 X 等 N 项"，勾了高危项时变黄
+
+### 上下文用量条 + 压缩
+
+- 输入区上方一条状态条：左边权限模式（可点换）+ 自动放行摘要，右边上下文进度条（`S.budget.chars / BUDGET_CHARS(24k)`）+ 压缩按钮
+- 70% 变黄、90% 变红并把文案换成"该压缩了"、压缩按钮高亮；空会话隐藏进度条并禁用压缩钮
+- **预算必须是活的**：`/api/chat` 每轮跑完补发一次 `{type:"budget"}`（此前只在轮次开始前算，跑完不刷新，等于永远不会涨）；`GET /api/session` 也带上 `budget`，切回旧会话时用量条立刻正确
+- 压缩成功后用返回的 `after` 直接刷新进度条
+
+### v7 验收
+
+```
+a 细粒度: gateWith 覆盖 读/写/删/安全命令/任何命令/联网/子任务 七类；没勾的不放行
+b 重定向: echo hi > a.txt 必须判为"非安全命令"
+c 上限: 连续自动放行达 maxRequests 后回到 confirm，标记 auto:false
+d 追溯: 自动放行的 tool_call 事件带 auto:true，与手动放行可区分
+e 持久化: /api/settings POST 的 autoApprove 存得住、缺省键回落默认值；GET 能取回
+f 生效: confirm 模式下勾了「改文件」→ 覆盖已有文件不再出现 confirm_request
+g 活预算: 每轮结束都推 budget 事件且 chars 随轮次增长；/api/session 带 budget
+h 拒绝提示: 动态风险工具被拦时，提示里是真实档位（high），不能把函数源码打进去
+i @ 索引: 未解锁 401；子串匹配、node_modules 不进索引、文件名命中排前面
+j 改动总览: change 事件带 rel/kind/±行数；覆盖写记成 edit 且带 diff 行；被拒的操作不留记录；落盘可回放
+k 标题: 离线演示不起标题；配上轻量通道后首轮结束自动起标题并落盘；已有标题不覆盖
+l 轻量通道: assist 存得住，压缩与起标题都走它
+```
+
+### @ 提及文件（v8 起：选中即带上内容）
+
+输入框打 `@` 弹出工作区文件搜索，选中后插入 `@相对路径`，**并顺手把文件内容附在消息里**（v7 是只插路径，等 agent 自己去 `fs_read`；v8 改成直接带上，省一轮工具调用）。
+
+- 后端 `GET /api/files?q=&limit=`：广度受限（扫描上限 2 万条、深度 12 层）走一遍工作区，只返回相对路径，不读内容；跳过 `node_modules`/`.git`/`dist`/`venv` 等目录；排序把"文件名命中"排在"路径深处命中"之前，避免深层同名文件挤掉用户想要的那个
+- 后端 `GET /api/file-text?path=`：读工作区/U 盘目录内的文本文件（上限 64KB，超出截断并标注；含 0 字节按二进制拒读；越界路径 400）
+- 识别规则：`@` 必须在行首或空白之后，且 `@` 到光标之间不能有空白——所以 `name@example.com` 不会误触发，打完 `@路径 ` 后面板自然关闭
+- 前端在命令面板里加了第二种模式（`palKind`），文件模式不同于命令模式：插入的是路径而不是执行动作；索引按 `工作区 + 关键字` 缓存，换工作区自然失效
+- 等待结果时先放一条"正在搜索工作区…"的占位项并标 `disabled`，避免这 100 多毫秒里按 Enter 把半截 `@` 直接发出去
+- 系统提示词加一条：用户消息里的 `@相对路径` 表示他明确指向这个文件，动手前先 `fs_read` 读清楚
+- 读不了 / 太大 / 二进制：静默回落到"只插路径"，不打断输入
+
+### 本轮改动总览
+
+每轮结束在消息流尾部出一张卡：改了哪几个文件、各是新增/修改/删除、`+增 −删` 行数，带 diff 的可展开看。
+
+- `core/agent-loop.mjs` 新增 `CHANGE_KINDS`（fs_write/fs_edit/fs_delete/fs_move/fs_mkdir/git_commit）与 `buildChange()`，发 `{type:"change"}` 事件
+- **关键点：preview 必须在工具跑之前算**——跑完再问 preview 拿到的已经是改动后的内容了。所以 agent-loop 把 preview 提前到门禁之后、执行之前，确认弹窗与改动总览共用同一次 preview（不重复读文件）
+- fs_write 既能新建也能覆盖：按 preview 结论定稿 `kind`（`create` / `edit`），而不是一律记成写入
+- 被拒 / 出错的工具**不产生** change 事件，否则这张卡会骗人
+- 落盘：`change` 进 `LOG_TYPES`，回放旧会话时改动卡还在；子 agent 改的文件从 `subagent_event` 里拆出来，也记进主会话
+- 存进日志的 diff 行上限 120 行，别把 jsonl 撑爆
+
+### 会话标题自动生成 + 轻量通道
+
+- 首轮回复结束后**后台**起标题：不阻塞这轮回复，写进 `data/titles.json`，前端在回复结束后再刷一次侧栏让它冒出来。每个会话只试一次，失败也不反复烧钱
+- 标题清洗：去掉引号、「标题：」前缀、句号，截到 20 字以内
+- 已有标题（人工改过或此前自动起的）一律不覆盖
+- **轻量通道**：设置 → 模型 → 「轻量通道」，把起标题、压缩摘要这类杂活丢给便宜模型（比如本机 Ollama），省下主通道额度。留空则跟随当前在用通道
+- 离线演示（mock）不参与这两件事——它只会鹦鹉学舌，起不出标题
+- `pickAssist(st, fallback)` 统一决定杂活用哪条通道；`/api/compact` 也改走它
+
+## v8 追加规格（2026-10-12 领导追加：继续对标成熟 agent —— 检查点/一键回滚 + 一批交互细节）
+
+**调研**（GitHub 源码级，详见 PROGRESS）：Cline 的影子 git 检查点（每个工具调用后提交一次，还原三选项）、Claude Code `/rewind`（每轮一个检查点、保留 100 个、明确不追踪 shell 命令副作用）、Cursor（只还原文件）、Gemini `/restore`（还原后把原工具调用重新摆回待确认位）、JetBrains/VS Code Local History（文件级快照 + 配额保留）。**共性**：粒度都是"每个工具调用/每轮"、全都有配额、全都不追踪命令副作用、**Cline 与 Gemini 硬依赖本机 git** —— 便携场景（目标机可能没 git）用不了，所以自研文件级快照。
+
+### 检查点 / 一键回滚（不依赖 git）
+
+- 新增 `core/checkpoints.mjs`：改动类工具执行**之前**，把要动的路径原样复制进 `data/checkpoints/<会话>/<cpId>/`，并往 `<会话>/manifest.jsonl` 追加一条记录；回滚 = 按时间倒序把这些现场放回去
+- 与业界方案的差别（也是本项目的取舍）：**只备份被碰过的文件**，不扫全仓库、不需要忽略规则清单 —— 从根上绕开 node_modules / 大二进制 / 软链接这些坑
+- 快照上限：单文件 4MB、一个目录 400 个条目 / 16MB；拍不了的（超大、非普通文件）如实记 `skipped`，回滚时报"没撤成功 + 原因"，绝不假装成功
+- **冲突检测**：工具跑完立刻记下改动后的内容指纹（`afterSha`）；回滚前比对，文件在改动之后又被改过 → 先拒一次（409 + `needForce` + 冲突清单），网页把按钮变成「仍要撤销」，再点一次才强制覆盖。一批一起撤时，同一文件只看最后一次记录的指纹（前面那些本来就是被后面盖掉的中间态）
+- 回滚语义：新建的删掉、删除的恢复、移动的移回、目录连里面的文件一起还原（目录只删空的 —— 里面添了新东西就留着并如实报告）；一行 `change_revert` 进会话日志，回放旧会话时那张卡仍显示"已撤销"
+- **撤销范围要说实话**：命令（shell_run）、git 提交造成的改动没有快照，卡片上如实标注（对标 Claude Code 的 "No code restore"）
+- 容量：每个会话最多留 40 个检查点（更老的连备份一起清）、整盘 200MB（超了从最老的会话开始清，最多每 5 分钟收拾一次）；删会话连带删检查点；设置 → 安全 显示占用 + 一键清空
+- 前端：`{type:"change"}` 事件带 `cp`（检查点 id），「本轮改动」卡右上角因此有「撤销本轮」——**两段确认**（第一下只是问，6 秒不点自动收回），撤销后卡片降透明度并写清结果
+- 测试：`test/checkpoints.test.mjs` 13 例 + 服务端 6 例
+
+### 确认弹窗可以附一句话（对标 Claude Code 的 permission prompt 评论）
+
+- 批准就写清要求、拒绝就写明理由，这句话**原样转给模型**（拒绝时进 tool_result 文本，批准时附在工具结果之后），比一个干巴巴的"拒绝"有用得多
+- `ConfirmGate.resolve(id, ok, note)`：裁决结果从布尔改成 `{ok, note}`，理由最长 500 字（别把上下文塞爆）；主循环对布尔与对象两种返回值都认，老调用方不用改
+- 弹窗加「补一句话（可选）」输入框，每单清空，不许把上一单的话带过去
+
+### 提醒（对标 Crush / OpenCode 的 attention 机制）
+
+- `public/js/notify.js`：**只在页面被切走时打扰** —— 系统通知 + 标题闪烁，事件分开：需要批准 / 这一轮跑完 / 出错
+- 通知权限只在用户手势里要（发送消息、点「试发一条」），拒绝了不影响任何功能；开关存浏览器本地（跟这台电脑走，不写 U 盘数据）
+- 页面在前台时完全不打扰
+
+### 输入框细节（对标 Claude Code / Codex / OpenCode 的小交互）
+
+- ↑ 调出上一条输入（空输入框时），↓ 往回走；存最近 50 条，斜杠命令不入历史
+- 粘贴时清掉不可见字符（零宽、方向控制符、word joiner 等），命中就明确提示"粘贴内容里有 N 个不可见字符，已清掉"—— 防提示词走私/伪装字符
+- `/compact 保住接口细节`：压缩请求里带上用户点名的要求（`compactPrompt(msgs, keepTail, instruction)`）
+- `/export`：把这次会话导出成 Markdown（用户/助手正文、工具调用、每轮改动、撤销记录、摘要）
+
+### v8 验收
+
+```
+m 快照与撤销: 覆盖写 → change 事件带 cp → POST /api/rollback → 文件回到改动前；change_revert 进会话日志；清单里标 reverted
+n 新建/删除: 撤销新建 = 文件消失；撤销删除 = 原样恢复
+o 冲突: 改动之后又被改过 → 409 needForce + conflicts；force:true 才覆盖
+p 锁与越界: 未解锁调 rollback/checkpoints 一律 401；/api/file-text 越界路径 400
+q 提及带内容: /api/file-text 返回文本、超 64KB 截断、含 0 字节拒读、不存在 404
+r 清理: 删会话连带删检查点；DELETE /api/checkpoints 清空整盘
+s 附言: 拒绝时理由进 tool_result 与 confirm_result；批准时附在工具结果之后
+t 压缩指示语: /api/compact 的 instruction 进压缩提示；不带时不出现那一行
+u 界面实测（无头 Edge）：撤销两段确认、改动卡已撤销态、回放保持、检查点占用卡、@ 提及附内容、↑ 历史、粘贴清洗、/export，零 JS 报错
 ```
 
 ## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）

@@ -1,10 +1,45 @@
 // agent 主循环：prompt → 模型流 → tool_calls → 模式门禁/确认 → 执行 → 回填 → 循环
 import { streamChat } from "./providers.mjs";
-import { gate, MODE_LABEL, MODE_PROMPT } from "./modes.mjs";
+import { gateWith, MODE_LABEL, MODE_PROMPT } from "./modes.mjs";
 import { truncate } from "./util.mjs";
+import path from "node:path";
 
 const MAX_STEPS = 30;
 const MAX_SUB_STEPS = 15;
+
+// 会改动工作区的工具 → 改动类别。「本轮改动总览」靠这张表汇总
+const CHANGE_KINDS = {
+  fs_write: "create", fs_edit: "edit", fs_delete: "delete",
+  fs_move: "move", fs_mkdir: "mkdir", git_commit: "commit",
+};
+const CHANGE_LOG_LINES = 120; // 存进会话日志的 diff 行上限，别把 jsonl 撑爆
+
+// 由 preview 结果（或工具参数）推出「这次改了什么」。
+// 必须趁工具还没跑就调用：跑完再问 preview 拿到的已经是改动后的内容了
+function buildChange(name, args, ctx, preview) {
+  const kind = CHANGE_KINDS[name];
+  if (!kind) return null;
+  const c = { tool: name, kind };
+  if (preview) {
+    if (preview.path) c.path = preview.path;
+    if (preview.note) c.note = String(preview.note).slice(0, 300);
+    if (preview.stat) { c.add = preview.stat.add || 0; c.del = preview.stat.del || 0; }
+    if (preview.lines?.length) c.lines = preview.lines.slice(0, CHANGE_LOG_LINES);
+    if (kind === "create") c.created = preview.kind === "info" && /新建文件/.test(preview.note || "");
+  }
+  // fs_write 既能新建也能覆盖，按 preview 的结论定稿
+  if (kind === "create" && c.created === false) c.kind = "edit";
+  if (!c.path) c.path = args?.path || args?.dst || args?.src || null;
+  if (kind === "move" && args?.src) c.from = args.src;
+  if (kind === "commit" && args?.message) c.note = String(args.message).slice(0, 120);
+  if (c.path && ctx.workspace) {
+    // 存相对工作区的路径，会话日志挪到别的盘也还看得懂
+    const rel = path.relative(ctx.workspace, c.path);
+    if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) c.rel = rel.split(path.sep).join("/");
+  }
+  c.rel = c.rel || c.path || "(未知)";
+  return c;
+}
 
 export function systemPrompt({ workspace, uaHome, mode, platform, memory, agentsMd, state }) {
   const lines = [
@@ -17,6 +52,7 @@ export function systemPrompt({ workspace, uaHome, mode, platform, memory, agents
     "- shell 只在必要时用；绝不执行破坏系统的命令（格式化、关机、删系统目录等会被无条件拦截）。",
     "- 子任务多且相互独立时，用 spawn_subagent 并行拆解。",
     "- 任务超过 3 个步骤时，先用 update_plan 建立计划，每完成一步更新状态。",
+    "- 用户消息里的 `@相对路径` 表示他明确指向工作区里的这个文件；动手前先用 fs_read 把它读清楚，不要凭猜测改。",
     `- 回答用用户的语言（默认中文），当前权限模式：${MODE_LABEL[mode] || mode}。`,
   ];
   if (MODE_PROMPT[mode]) lines.push(MODE_PROMPT[mode]);
@@ -76,31 +112,56 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           continue;
         }
         const risk = typeof tool.risk === "function" ? tool.risk(tc.args, ctx) : tool.risk;
-        const g = gate(ctx.mode, risk);
-        yield { type: "tool_call", id: tc.id, name: tc.name, args: tc.args, risk, gate: g };
+        // 细粒度门禁：套餐判定要确认时，再看自动放行开关（含连续放行上限）
+        const decided = gateWith(ctx.mode, risk, {
+          toolName: tc.name,
+          command: tc.args?.command,
+          autoApprove: ctx.settings?.autoApprove,
+          autoCount: ctx.autoCount || 0,
+        });
+        const g = decided.g;
+        if (decided.auto) ctx.autoCount = (ctx.autoCount || 0) + 1;
+        yield { type: "tool_call", id: tc.id, name: tc.name, args: tc.args, risk, gate: g, auto: !!decided.auto };
+
+        // 改动类工具（或要弹确认的）：先算好预览——确认弹窗与本轮改动总览都用它
+        let preview;
+        if (g !== "deny" && (CHANGE_KINDS[tc.name] || g === "confirm") && typeof tool.preview === "function") {
+          try {
+            preview = await tool.preview(tc.args || {}, ctx);
+          } catch {
+            preview = undefined;
+          }
+        }
+        const chg = g === "deny" ? null : buildChange(tc.name, tc.args, ctx, preview);
+
         let resultText;
         if (g === "deny") {
-          resultText = `已拒绝（当前为${MODE_LABEL[ctx.mode]}）：工具 ${tc.name} 的风险等级是 ${tool.risk}，此模式不允许。请向用户说明并让其切换权限模式。`;
+          // 注意：tool.risk 可能是函数（动态风险），得用上面已经算好的 risk 值
+          resultText = `已拒绝（当前为${MODE_LABEL[ctx.mode]}）：工具 ${tc.name} 的风险等级是 ${risk}，此模式不允许。请向用户说明并让其切换权限模式。`;
           yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: resultText };
         } else {
           let approved = true;
+          let verdictNote = "";
           if (g === "confirm") {
-            let preview;
-            try {
-              preview = typeof tool.preview === "function" ? await tool.preview(tc.args || {}, ctx) : undefined;
-            } catch {
-              preview = undefined;
-            }
             const { id: confirmId, done: decided } = ctx.confirm({ tool: tc.name, args: tc.args, risk, preview });
             yield { type: "confirm_request", confirmId, id: tc.id, name: tc.name, args: tc.args, risk, preview };
-            approved = await decided;
-            yield { type: "confirm_result", confirmId, approved };
+            const v = await decided; // 老式 confirm 返回布尔，新式返回 {ok, note}
+            const isObj = v !== null && typeof v === "object";
+            approved = isObj ? !!v.ok : !!v;
+            verdictNote = isObj ? String(v.note || "") : "";
+            if (approved) ctx.autoCount = 0; // 用户亲自确认过，重新计连续自动次数
+            yield { type: "confirm_result", confirmId, approved, note: verdictNote };
           }
           if (!approved) {
-            resultText = "用户拒绝或超时未确认该操作。";
+            resultText = verdictNote ? `用户拒绝了该操作，并说：${verdictNote}` : "用户拒绝或超时未确认该操作。";
             yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: resultText };
           } else {
             const t0 = Date.now();
+            // 改动类工具：动手之前先拍一张检查点（回滚靠它），拍完才允许工具跑
+            let cp = null;
+            if (chg && typeof ctx.snapshot === "function") {
+              try { cp = await ctx.snapshot({ name: tc.name, args: tc.args || {}, toolCallId: tc.id }); } catch { cp = null; }
+            }
             // 子事件桥：工具（如 spawn_subagent）通过 ctx.emit 发出的事件泵进主流
             const q = [];
             let doneTool = false;
@@ -117,7 +178,19 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
               }
               const out = await toolPromise;
               resultText = typeof out === "string" ? out : JSON.stringify(out);
+              // 批准时附的话一并交给模型，它下一步就会照办
+              if (verdictNote) resultText += `\n（用户批准这一步时补了一句：${verdictNote}）`;
               yield { type: "tool_result", id: tc.id, name: tc.name, ok: true, text: resultText, ms: Date.now() - t0 };
+              // 真的改成功了才记进「本轮改动」——被拒/出错的都不算
+              if (chg) {
+                if (cp) {
+                  try {
+                    const cid = await cp.finish();
+                    if (cid) chg.cp = cid; // 事件带上检查点 id，网页据此提供「撤销本轮改动」
+                  } catch {}
+                }
+                yield { ...chg, type: "change", id: tc.id };
+              }
             } catch (e) {
               resultText = `工具执行出错：${e.message}`;
               while (q.length) yield q.shift();

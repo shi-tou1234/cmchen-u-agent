@@ -27,7 +27,7 @@ export default {
   // 覆盖已有文件时给网页弹窗提供 diff 预览
   async preview(args, ctx) {
     const p = resolveInside([ctx.workspace, ctx.uaHome], args.path, ctx.workspace);
-    if (!fs.existsSync(p)) return { kind: "info", note: `新建文件：${p}` };
+    if (!fs.existsSync(p)) return { kind: "info", note: `新建文件：${p}`, path: p };
     const old = fs.readFileSync(p, "utf8");
     const d = makeDiff(old, args.content ?? "");
     return { ...d, stat: diffStat(d.lines || []), path: p, note: d.note };
