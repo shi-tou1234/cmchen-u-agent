@@ -235,9 +235,69 @@ export function renderWelcome(info) {
 function addUser(text, images) {
   if ($("#welcome")) clearStream();
   const imgs = (images || []).map((i) => `<img class="att-img" src="data:${i.mediaType};base64,${i.data}">`).join("");
-  const node = el(`<div class="msg msg-user"><div class="bubble">${md(text)}${imgs}</div></div>`);
+  const node = el(`<div class="msg msg-user"><div class="bubble">${md(text)}${imgs}</div>
+    <button class="rw-btn" title="从这里重来：后面这段不再进上下文，这条消息放回输入框">${icon("refresh", "ic ic-sm")}从这儿重来</button></div>`);
+  node.__raw = text; // 原样存一份，回退时用它去日志里找对应那条
+  node.querySelector(".rw-btn").onclick = () => rewindTo(node);
   colEl().appendChild(node);
   scrollEnd(true);
+}
+
+/* ---- 只回退对话（不动文件） ---- */
+// 与 core/context.mjs 的 rewindRanges/isDropped 同一套规则：被回退的那段日志还留着，但不再算数
+function rewindRanges(events) {
+  const out = [];
+  (events || []).forEach((ev, i) => {
+    if (ev.type === "rewind" && Number.isInteger(ev.atIndex)) out.push({ atIndex: ev.atIndex, marker: i, dropped: ev.dropped || 0 });
+  });
+  return out;
+}
+const isDropped = (ranges, i) => ranges.some((r) => i > r.atIndex && i < r.marker);
+
+async function rewindTo(node) {
+  if (!S.sessionId) return toast("还没有可以回退的对话", "err");
+  if (S.sending) return toast("等这一轮跑完再回退", "err");
+  const raw = node.__raw || "";
+  const btn = node.querySelector(".rw-btn");
+  if (!node.dataset.armed) {
+    node.dataset.armed = "1";
+    btn.classList.add("armed");
+    btn.textContent = "再点一次：后面这段对话不再进上下文";
+    clearTimeout(node._rwTimer);
+    node._rwTimer = setTimeout(() => {
+      delete node.dataset.armed;
+      btn.classList.remove("armed");
+      btn.innerHTML = icon("refresh", "ic ic-sm") + "从这儿重来";
+    }, 6000);
+    return;
+  }
+  clearTimeout(node._rwTimer);
+  try {
+    const j = await api.session(S.sessionId);
+    const ranges = rewindRanges(j.events);
+    const ord = [...colEl().querySelectorAll(".msg-user")].filter((n) => n.__raw === raw).indexOf(node);
+    let at = -1;
+    let seen = -1;
+    for (let i = 0; i < j.events.length; i++) {
+      const e = j.events[i];
+      if (e.type !== "user" || isDropped(ranges, i)) continue;
+      if ((e.text || "") === raw && ++seen === ord) { at = i; break; }
+    }
+    if (at < 0) return toast("没在日志里找到这条消息（可能已被压缩）", "err");
+    const r = await api.rewind(S.sessionId, at);
+    const fresh = await api.session(S.sessionId);
+    renderHistory(fresh.events);
+    if (fresh.budget) { S.budget = fresh.budget; renderUsage(); }
+    // 放回输入框时只回原话：附件块（【文件 …】）是发送时才拼进去的，不跟着回来
+    setInput(raw.split("\n\n【文件 ")[0] || raw);
+    toast(`已回退 ${r.dropped} 条记录，文件改动不受影响`, "ok");
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+function rewindLine(r) {
+  return `<div class="rewind-line">${icon("refresh", "ic ic-sm")}<span>已回退到这里${r.dropped ? `（丢弃 ${r.dropped} 条记录）` : ""} · 只影响对话，文件改动还在</span></div>`;
 }
 
 function addStream() {
@@ -464,6 +524,7 @@ export function renderHistory(events) {
   clearStream();
   const map = {};
   const cpCards = new Map(); // 检查点 id → 改动卡：回滚过的事件要标回当时那张卡片
+  const ranges = rewindRanges(events); // 被回退掉的那段不再显示
   let pending = []; // 攒连续的 change 事件，攒完统一出一张卡
   const flushChanges = () => {
     if (!pending.length) return;
@@ -471,11 +532,14 @@ export function renderHistory(events) {
     for (const c of pending) if (c.cp) cpCards.set(c.cp, node);
     pending = [];
   };
-  for (const ev of events || []) {
+  for (let i = 0; i < (events || []).length; i++) {
+    const ev = events[i];
     if (ev.type !== "change") flushChanges();
+    if (isDropped(ranges, i)) continue;
     switch (ev.type) {
       case "plan": renderPlan(ev.items); break;
       case "compact": break;
+      case "rewind": colEl().appendChild(el(rewindLine({ dropped: ev.dropped }))); break;
       case "user": addUser(ev.text, ev.images); break;
       case "assistant_message": { const n = addStream(); finishAi(n, ev.text); break; }
       case "tool_call": map[ev.id] = addTool(ev); break;
@@ -800,7 +864,7 @@ export async function showStatus(full) {
     `本轮用量：输入 ${S.tokens.input} / 输出 ${S.tokens.output}`,
     `计划：${S.plan ? S.plan.filter((i) => i.status === "done").length + "/" + S.plan.length : "无"}`,
   ];
-  if (full) lines.push("", "命令：" + CMDS.map((c) => c.cmd).join("  "));
+  if (full) lines.push("", "命令：" + CMDS.map((c) => c.cmd).join("  "), "回退对话：鼠标移到你说过的话上，点「从这儿重来」（只影响上下文，文件改动不受影响）");
   toast(lines.join(String.fromCharCode(10)), "ok");
 }
 

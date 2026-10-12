@@ -23,7 +23,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.8.0";
+const VERSION = "0.8.1";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -217,7 +217,7 @@ function sseHead(res) {
 }
 const sse = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-const LOG_TYPES = new Set(["user", "assistant_message", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan", "change", "change_revert"]);
+const LOG_TYPES = new Set(["user", "assistant_message", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan", "change", "change_revert", "rewind"]);
 
 /* ---------- 检查点快照的路径解析与容量收拾 ---------- */
 // 哪些工具动了哪些路径 → 交给 checkpoints 拍快照；只快照工作区/U盘目录内的路径
@@ -717,6 +717,29 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    /* ---------- 只回退对话（不动文件） ---------- */
+    // 对标 Claude Code /rewind 的「只还原对话」：日志是追加式的，所以不删旧记录，
+    // 而是写一条 rewind 标记，重建上下文与界面回放都跳过被丢的那一段（可审计、可追溯）
+    if (req.method === "POST" && u.pathname === "/api/rewind") {
+      const b = await readBody(req);
+      const sid = String(b.sessionId || "");
+      if (!sid) return sendJson(res, 400, { error: "缺少会话 id" });
+      if (running.has(sid)) return sendJson(res, 409, { error: "这一轮还在跑，等它停下来再回退" });
+      let events = [];
+      try {
+        events = sessions.read(sid);
+      } catch {
+        return sendJson(res, 404, { error: "会话不存在" });
+      }
+      const at = Number(b.atIndex);
+      if (!Number.isInteger(at) || at < 0 || at >= events.length) return sendJson(res, 400, { error: "回退位置不对" });
+      if (events[at].type !== "user") return sendJson(res, 400, { error: "只能从「你发的那条消息」处重来" });
+      const dropped = events.length - at - 1;
+      if (!dropped) return sendJson(res, 400, { error: "这条就是最新的，没什么可回退的" });
+      sessions.append(sid, { type: "rewind", atIndex: at, dropped });
+      const budget = budgetOf(buildHistory(sessions.read(sid)));
+      return sendJson(res, 200, { ok: true, atIndex: at, dropped, budget });
+    }
     if (req.method === "POST" && u.pathname === "/api/compact") {
       const b = await readBody(req);
       const st = loadState();

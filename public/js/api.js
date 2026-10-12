@@ -56,6 +56,7 @@ export const api = {
   confirm: (confirmId, approve, note) => post("/api/confirm", { confirmId, approve, note: note || "" }),
   abort: (sessionId) => post("/api/abort", { sessionId }),
   compact: (sessionId, provider, instruction) => post("/api/compact", { sessionId, provider, instruction: instruction || "" }),
+  rewind: (sessionId, atIndex) => post("/api/rewind", { sessionId, atIndex }),
   testProvider: (provider) => post("/api/test-provider", { provider }),
   listModels: (provider) => post("/api/list-models", { provider }),
 
