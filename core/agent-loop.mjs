@@ -41,7 +41,7 @@ function buildChange(name, args, ctx, preview) {
   return c;
 }
 
-export function systemPrompt({ workspace, uaHome, mode, platform, memory, agentsMd, state }) {
+export function systemPrompt({ workspace, uaHome, mode, platform, memory, agentsMd, state, skillsText, goal }) {
   const lines = [
     "你是 u-agent——一个跑在用户 U 盘里的本地 AI 助手，通过工具帮用户操作这台电脑上的文件、执行命令、联网查资料、操作 git。",
     `今天是 ${new Date().toISOString().slice(0, 10)}。运行平台：${platform}。`,
@@ -61,6 +61,8 @@ export function systemPrompt({ workspace, uaHome, mode, platform, memory, agents
     for (const it of state.plan) lines.push(`- [${it.status === "done" ? "x" : it.status === "doing" ? "…" : " "}] ${it.step}`);
   }
   if (agentsMd) lines.push(`工作区约定文件 AGENTS.md（用户项目自有规则，优先遵守）：\n<agents_md>\n${agentsMd}\n</agents_md>`);
+  if (skillsText) lines.push(skillsText); // 技能清单（正文按需用 skill 工具取，省 token）
+  if (goal) lines.push("本次任务的完成标准（达成之前不要收工）：" + goal);
   if (memory) lines.push(`跨会话记忆（用户此前叮嘱过的事，注意遵守）：\n<memory>\n${memory}\n</memory>`);
   return lines.join("\n");
 }
@@ -127,6 +129,37 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         if (!tool) {
           results[idx] = `错误：没有名为 ${tc.name} 的工具`;
           yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, text: `没有名为 ${tc.name} 的工具` };
+          continue;
+        }
+        // 计划模式里调 update_plan = 把计划交上来请求开工（对标 dsh 的 exit_plan_mode）：
+        // 让用户批准执行，或让他写一句意见回去接着改计划；不批就不动手
+        if (tc.name === "update_plan" && ctx.mode === "plan") {
+          const items = (tc.args?.items || []).slice(0, 20).map((it) => ({
+            step: String(it.step || "").slice(0, 200),
+            status: ["pending", "doing", "done"].includes(it.status) ? it.status : "pending",
+          }));
+          yield { type: "plan", items };
+          if (ctx.state) ctx.state.plan = items;
+          const { id: confirmId, done } = ctx.confirm({
+            tool: "plan_review",
+            args: { 步骤数: items.length },
+            risk: "plan",
+            reason: "计划模式的收尾：批准就开始动手，不批就继续改计划",
+            plan: items,
+          });
+          yield { type: "confirm_request", confirmId, id: tc.id, name: "开始执行这份计划？", args: {}, risk: "plan", plan: items, reason: "批准就开始动手；不批就把意见写下来，让它继续完善计划" };
+          const v = await done;
+          const ok = v && typeof v === "object" ? !!v.ok : !!v;
+          const note = v && typeof v === "object" ? String(v.note || "") : "";
+          const text = ok
+            ? "用户批准了这份计划，现在开始执行（按每步更新计划状态）。"
+            : "用户选择继续完善计划" + (note ? "，他的意见是：" + note : "") + "。请按意见调整计划后再次提交（这次仍不要动手改动文件）。";
+          results[idx] = text;
+          if (ok) {
+            ctx.mode = "confirm"; // 批准之后这一轮改用「谨慎」档动手，逐次高危仍会问
+            yield { type: "mode", mode: "confirm", note: "计划已批准，开始动手" };
+          }
+          yield { type: "tool_result", id: tc.id, name: tc.name, ok: true, text };
           continue;
         }
         const risk = typeof tool.risk === "function" ? tool.risk(tc.args, ctx) : tool.risk;

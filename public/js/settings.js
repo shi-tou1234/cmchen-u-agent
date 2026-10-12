@@ -3,7 +3,7 @@
 import { api } from "./api.js";
 import { S, setMode, MODES, ACTION_META, DEFAULT_AUTO_APPROVE } from "./state.js";
 import { $, $$, el, esc, icon, toast } from "./ui.js";
-import { fillProviders, showThinking, setShowThinking } from "./chat.js";
+import { fillProviders, showThinking, setShowThinking, refreshCustomCommands, doCheck } from "./chat.js";
 import { brandChip } from "./picker.js";
 import { notifyOn, setNotifyOn, askPermission, notifyGranted } from "./notify.js";
 import { CATALOG, GROUPS, providerFromPreset, presetById, matchPreset, protocolForModel, normalizeBaseURL } from "./catalog.js";
@@ -67,6 +67,11 @@ async function loadAll() {
     S.assist = st.assist || "";
     S.autoCompactAt = st.autoCompactAt === undefined ? 0.8 : Number(st.autoCompactAt);
     $("#autoCompactSel").value = String(S.autoCompactAt);
+    S.checks = st.checks || { test: "", lint: "", auto: true };
+    $("#chkTest").value = S.checks.test || "";
+    $("#chkLint").value = S.checks.lint || "";
+    $("#chkAuto").checked = S.checks.auto !== false;
+    $("#chkState").textContent = S.checks.auto !== false ? "自动跑" : "不自动";
     renderProviders();
     renderAutoApprove();
   } catch (e) {
@@ -75,9 +80,25 @@ async function loadAll() {
   api.memory().then((m) => ($("#memBox").value = m.text || "")).catch(() => {});
   api.info().then(renderInfo).catch(() => {});
   api.checkpoints().then((r) => renderCpStats(r.stats)).catch(() => {});
+  refreshCustomCommands().then(renderCustomInfo);
   renderNotifyHelp();
   $("#kTavily").value = "";
   $("#kBrave").value = "";
+}
+
+// 能力扩展：自定义命令与技能放在哪、现在加载到了什么
+function renderCustomInfo() {
+  const box = $("#customInfo");
+  if (!box) return;
+  const cmds = S.customCommands || [];
+  const skills = S.skills || [];
+  const line = (arr, kindLabel) =>
+    arr.length
+      ? arr.map((x) => `<li><b>${esc(kindLabel === "cmd" ? "/" + x.name : x.name)}</b><span class="muted"> · ${esc(x.kind)} · ${esc(x.description || "")}</span></li>`).join("")
+      : `<li class="muted">还没有（放一个 Markdown 文件就有）</li>`;
+  box.innerHTML = `<div class="field-label">自定义命令（${cmds.length}）</div><ul class="dots">${line(cmds, "cmd")}</ul>
+    <div class="field-label mt">技能（${skills.length}）</div><ul class="dots">${line(skills, "skill")}</ul>
+    <p class="field-help mt">命令：工作区 <code>.agent\commands\名字.md</code>（U 盘 <code>.agent\commands</code> 也认）；技能：<code>.agent\skills\名字\SKILL.md</code>（带 name/description 的 frontmatter）。写进去就生效，不用重启。</p>`;
 }
 
 // 检查点占用：安全页显示，随时能清（清掉就失去了「撤销本轮改动」的能力）
@@ -601,6 +622,7 @@ async function save() {
     autoApprove: S.autoApprove,
     assist: $("#assistSel").value || "",
     autoCompactAt: Number($("#autoCompactSel").value) || 0,
+    checks: { test: $("#chkTest").value.trim(), lint: $("#chkLint").value.trim(), auto: $("#chkAuto").checked },
   };
   const btn = $("#saveSet");
   btn.disabled = true;
@@ -616,6 +638,8 @@ async function save() {
     wsHint();
     dirty = false;
     $("#dirtyHint").hidden = true;
+    refreshCustomCommands(); // 工作区可能换了，命令/技能清单跟着刷新
+    renderCustomInfo();
     toast("已保存到 U 盘", "ok");
     onSaved && onSaved(st);
     // 工作区/通道变了，欢迎页那句提示要跟着改
@@ -811,6 +835,13 @@ export function initSettings() {
   $("#kBrave").addEventListener("input", markDirty);
   $("#assistSel").addEventListener("change", markDirty);
   $("#autoCompactSel").addEventListener("change", markDirty);
+  $("#chkTest").addEventListener("input", markDirty);
+  $("#chkLint").addEventListener("input", markDirty);
+  $("#chkAuto").onchange = () => {
+    $("#chkState").textContent = $("#chkAuto").checked ? "自动跑" : "不自动";
+    markDirty();
+  };
+  $("#chkRun").onclick = () => doCheck("");
 
   // 提醒（只存浏览器本地，跟这台电脑走）
   $("#notifyOn").checked = notifyOn();

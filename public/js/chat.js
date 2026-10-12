@@ -2,7 +2,7 @@
 import { api } from "./api.js";
 import { S, setMode, MODES, MODE_HINT, ACTION_META } from "./state.js";
 import { $, $$, el, esc, icon, md, toast, kb } from "./ui.js";
-import { renderModelBtn, cycleMode } from "./picker.js";
+import { renderModelBtn, renderModeBtn, cycleMode } from "./picker.js";
 import { ping, askPermission } from "./notify.js";
 
 const T_ICON = {
@@ -19,6 +19,7 @@ export const T_STATE = {
 const streamEl = () => $("#msgs");
 const colEl = () => $("#msgCol");
 let nearBottom = true;
+let lastRenderedMode = null; // 用来判断模式芯片要不要重画
 
 /* ---- 运行中排队的消息（回车排队 → 这一轮跑完自动发） ---- */
 const sendQueue = [];
@@ -100,6 +101,18 @@ export async function sendMessage(text) {
   if (clean === "/details") {
     clearComposer();
     toggleDetails();
+    return;
+  }
+  if (clean === "/goal" || clean.startsWith("/goal ")) {
+    const arg = clean.slice("/goal".length).trim();
+    clearComposer();
+    doGoal(arg);
+    return;
+  }
+  if (clean === "/check" || clean.startsWith("/check ")) {
+    const only = clean.slice("/check".length).trim();
+    clearComposer();
+    doCheck(only);
     return;
   }
 
@@ -194,6 +207,7 @@ function handleEvent(ev, c) {
   switch (ev.type) {
     case "session":
       S.sessionId = ev.sessionId;
+      renderGoalChip();
       if (ev.budget) { S.budget = ev.budget; }
       if (ev.context) S.context = ev.context; // 这个模型的窗口多大、数据从哪来
       if (ev.provider) S.provider = ev.provider;
@@ -272,6 +286,19 @@ function handleEvent(ev, c) {
     case "tool_call": c.tools.set(ev.id, addTool(ev)); break;
     case "tool_result": { const n = c.tools.get(ev.id); if (n) finishTool(n, ev); break; }
     case "change": S.changes.push(ev); break;
+    case "check": addCheckCard(ev); break;
+    case "mode":
+      if (ev.mode) {
+        setMode(ev.mode);
+        renderModeBtn(); // 权限胶囊/状态条芯片归它（renderModelBtn 是模型通道那个）
+        setSendUI();
+        toast(ev.note || "已切换权限模式", "ok");
+      }
+      break;
+    case "goal_check":
+      noteLine(ev.met ? "完成标准已达成：" + (ev.reason || "") : "完成标准还没达成：" + (ev.reason || ""));
+      break;
+    case "auto_fix": noteLine("自动检查没过，已把输出交给它接着修（第 " + ev.round + " 轮）"); break;
     case "confirm_request": queueConfirm(ev); break;
     case "subagent_event": handleSub(ev, c.subs); break;
     case "error": finishAi(c.getStream()); addError(ev.message); toast(ev.message, "err"); ping("出错了", ev.message); break;
@@ -708,6 +735,38 @@ function markReverted(card, r) {
   scrollEnd();
 }
 
+/* ---- 自动检查卡：改完自己验的结果 ---- */
+function checkCard(c) {
+  const rows = (c.results || [])
+    .map(
+      (r) =>
+        '<details class="chk ' + (r.ok ? "ok" : "bad") + '"><summary>' +
+        (r.ok ? "✓" : "✕") +
+        ' <b>' + esc(r.name) + "</b>" +
+        ' <span class="chk-meta">' + esc(r.command || "") + " · exit=" + r.code + " · " + (r.ms / 1000).toFixed(1) + "s</span>" +
+        '<span class="grow"></span></summary><div class="diff">' +
+        (r.output || "").split("\n").slice(0, 200).map((l) => '<div class="diff-line ctx">' + esc(l) + "</div>").join("") +
+        "</div></details>"
+    )
+    .join("");
+  return (
+    '<div class="checks ' + (c.ok ? "ok" : "bad") + '"><div class="checks-head">' +
+    (c.ok ? "✓ 检查通过" : "✕ 检查没过") +
+    (c.summary ? ' <span class="chk-meta">' + esc(c.summary) + "</span>" : "") +
+    (c.manual ? ' <span class="chk-meta">· 手动跑的</span>' : "") +
+    "</div>" + (rows ? '<div class="checks-body">' + rows + "</div>" : "") + "</div>"
+  );
+}
+function addCheckCard(c) {
+  if (!c) return;
+  colEl().appendChild(el(checkCard(c)));
+  scrollEnd(true);
+}
+function noteLine(text) {
+  colEl().appendChild(el('<div class="note-line">' + esc(text) + "</div>"));
+  scrollEnd(true);
+}
+
 /* ---- 计划卡 ---- */
 export function renderPlan(items) {
   if (!items || !items.length) return;
@@ -747,7 +806,8 @@ export function renderHistory(events) {
       case "compact": break;
       case "reasoning": if (showThinking()) addThinkStatic(ev.text, ev.ms); break;
       case "rewind": colEl().appendChild(el(rewindLine({ dropped: ev.dropped }))); break;
-      case "user": addUser(ev.text, ev.images); break;
+      case "user": ev.auto ? noteLine(ev.text.split("\n")[0] + "（自动）") : addUser(ev.text, ev.images); break;
+      case "check": addCheckCard(ev); break;
       case "assistant_message": { const n = addStream(); finishAi(n, ev.text); break; }
       case "tool_call": map[ev.id] = addTool(ev); break;
       case "tool_result": { const n = map[ev.id]; if (n) finishTool(n, ev); break; }
@@ -792,6 +852,11 @@ export function renderUsage() {
 
   const total = S.tokens.input + S.tokens.output;
   $("#usage").textContent = total ? `本轮 ${total} tokens` : "";
+  // 模式芯片以 S.mode 为准：状态条一刷新就顺带对齐（服务端中途改档、Shift+Tab、/mode 都覆盖到）
+  if (lastRenderedMode !== S.mode) {
+    lastRenderedMode = S.mode;
+    renderModeBtn();
+  }
   renderAutoApproveBar();
 }
 
@@ -846,6 +911,81 @@ function renderRunChip() {
   runTimer = setInterval(tick, 1000);
 }
 
+// 后台任务：状态条上一个芯片，点开看列表、输出尾巴与停止按钮
+let jobsPanelOpen = false;
+export async function refreshJobs() {
+  const chip = $("#sbJobs");
+  if (!chip) return;
+  try {
+    const r = await api.jobs();
+    const running = r.jobs.filter((j) => j.status === "running").length;
+    chip.hidden = !r.jobs.length;
+    chip.textContent = running ? "后台 " + running + " 个在跑" : "后台 " + r.jobs.length + " 个（都结束了）";
+    chip.classList.toggle("on", running > 0);
+    if (jobsPanelOpen) renderJobsPanel(r.jobs);
+  } catch {
+    chip.hidden = true;
+  }
+}
+function renderJobsPanel(jobs) {
+  const box = $("#jobsPanel");
+  if (!box) return;
+  const opened = [...box.querySelectorAll(".job-row")].filter((r) => !r.nextElementSibling.hidden).map((r) => r.dataset.id);
+  box.innerHTML =
+    '<div class="palette-head">后台任务 · 点「输出」看末尾，点「停止」杀掉（连子进程）</div>' +
+    (jobs.length
+      ? jobs
+          .map(
+            (j) =>
+              '<div class="job-row" data-id="' + esc(j.id) + '">' +
+              '<span class="job-dot ' + (j.status === "running" ? "run" : "done") + '"></span>' +
+              '<span class="job-cmd" title="' + esc(j.command) + '">' + esc(j.command) + "</span>" +
+              '<span class="job-meta">' + (j.status === "running" ? "跑着 " + (j.ms / 1000).toFixed(0) + "s" : "exit=" + j.code + " · " + (j.ms / 1000).toFixed(1) + "s") + "</span>" +
+              '<button class="ghost-btn" data-act="joblog">输出</button>' +
+              (j.status === "running" ? '<button class="ghost-btn" data-act="jobstop">停止</button>' : "") +
+              "</div><pre class=\"job-out\" hidden></pre>"
+          )
+          .join("")
+      : '<div class="muted sm" style="padding:8px 12px">还没有后台任务。让 agent 用 shell_bg 跑长命令时会出现。</div>');
+  box.querySelectorAll(".job-row").forEach((row) => {
+    const id = row.dataset.id;
+    const out = row.nextElementSibling;
+    const logBtn = row.querySelector('[data-act="joblog"]');
+    if (logBtn)
+      logBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!out.hidden) { out.hidden = true; return; }
+        await fillJobLog(id, out);
+      };
+    // 4 秒轮询会重建面板：之前展开着的日志要恢复回来，别把用户看的输出冲掉
+    if (opened.includes(id)) fillJobLog(id, out);
+    const stopBtn = row.querySelector('[data-act="jobstop"]');
+    if (stopBtn)
+      stopBtn.onclick = async (e) => {
+        e.stopPropagation();
+        await api.stopJob(id).catch(() => {});
+        toast("已停掉 " + id, "ok");
+        refreshJobs();
+      };
+  });
+}
+async function fillJobLog(id, out) {
+  try {
+    const r = await api.jobLog(id, 6000);
+    out.textContent = r.text || "（还没有输出）";
+  } catch (err) {
+    out.textContent = err.message;
+  }
+  out.hidden = false;
+}
+function toggleJobsPanel() {
+  const box = $("#jobsPanel");
+  if (!box) return;
+  jobsPanelOpen = !jobsPanelOpen;
+  box.hidden = !jobsPanelOpen;
+  if (jobsPanelOpen) refreshJobs();
+}
+
 export function setSendUI() {
   const btn = $("#send");
   renderRunChip();
@@ -883,6 +1023,26 @@ function showConfirm() {
     always.textContent = "本会话不再问「" + ev.prefix + " …」";
     always.onclick = () => resolveConfirm(true, true);
   }
+  // 计划评审（计划模式里交上来的计划）：列步骤，按钮改成「批准执行 / 继续改计划」
+  const yesBtn = $("#cfmYes");
+  const noBtn = $("#cfmNo");
+  if (Array.isArray(ev.plan) && ev.plan.length) {
+    yesBtn.textContent = "批准执行";
+    noBtn.textContent = "继续改计划";
+    $("#cfmBody").innerHTML =
+      '<ol class="plan-list">' +
+      ev.plan.map((it) => '<li class="' + esc(it.status || "pending") + '">' + esc(it.step) + "</li>").join("") +
+      '</ol><p class="field-help">批准后这一轮改用「谨慎」档动手（高危操作照旧问你）；不批就把意见写在下面，让它接着改计划。</p>';
+    if (ev.reason) {
+      const w = $("#cfmWhy");
+      w.hidden = false;
+      w.textContent = ev.reason;
+    }
+    $("#cfmRoot").hidden = false;
+    return;
+  }
+  yesBtn.textContent = "批准执行";
+  noBtn.textContent = "拒绝";
   const pv = ev.preview;
   const box = $("#cfmBody");
   if (pv && pv.kind === "diff" && pv.lines && pv.lines.length) {
@@ -914,11 +1074,34 @@ const CMDS = [
   { cmd: "/export", desc: "把这次会话导出成 Markdown 文件" },
   { cmd: "/thinking", desc: "显示 / 隐藏模型的思考过程" },
   { cmd: "/details", desc: "展开 / 收起所有工具调用的参数与结果" },
+  { cmd: "/skill", desc: "加载一个技能（放在 .agent/skills 里的做事方法）", sub: "skill" },
+  { cmd: "/check", desc: "现在跑一次检查命令（test / lint）" },
+  { cmd: "/goal", desc: "设定完成标准（空格后接内容；/goal clear 清除），没达成它会一直做下去" },
   { cmd: "/init", desc: "让 agent 通读工作区，生成 AGENTS.md" },
   { cmd: "/status", desc: "查看当前状态" },
   { cmd: "/remember", desc: "写入跨会话记忆（空格后接内容）" },
   { cmd: "/help", desc: "显示所有命令" },
 ];
+// 自定义命令与技能都来自 .agent 目录下的 Markdown（跟 U 盘/工作区走），开机拉一次
+export async function refreshCustomCommands() {
+  try {
+    const r = await api.commands();
+    S.customCommands = r.commands || [];
+    S.skills = r.skills || [];
+  } catch {
+    S.customCommands = [];
+    S.skills = [];
+  }
+}
+// 命令面板 = 内置命令 + 自定义命令
+const allCmds = () =>
+  CMDS.concat(
+    (S.customCommands || []).map((c) => ({
+      cmd: "/" + c.name,
+      desc: (c.description || "自定义命令") + (c.kind === "项目" ? " · 项目" : " · U 盘"),
+    }))
+  );
+
 let pal = [], palIdx = 0;
 let palKind = "cmd";   // "cmd" 斜杠命令 | "file" @ 提及文件
 let palAt = 0;         // @ 或 / 在输入框里的起始位置
@@ -973,7 +1156,7 @@ function palUpdate() {
   if (!v.startsWith("/")) return palClose();
   palKind = "cmd";
   const sp = v.indexOf(" ");
-  if (sp < 0) { pal = CMDS.filter((c) => c.cmd.startsWith(v)); palIdx = 0; return palRender(); }
+  if (sp < 0) { pal = allCmds().filter((c) => c.cmd.startsWith(v)); palIdx = 0; return palRender(); }
   const cmd = v.slice(0, sp);
   const rest = v.slice(sp + 1).toLowerCase();
   if (cmd === "/mode") {
@@ -981,6 +1164,11 @@ function palUpdate() {
   } else if (cmd === "/model") {
     pal = S.providers.map((p) => ({ cmd: p.name, show: "/model " + p.name, desc: p.model || "" }))
       .filter((c) => c.cmd.toLowerCase().startsWith(rest));
+  } else if (cmd === "/skill") {
+    pal = (S.skills || [])
+      .filter((k) => k.name.includes(rest) || (k.description || "").toLowerCase().includes(rest))
+      .map((k) => ({ cmd: k.name, show: "/skill " + k.name, desc: (k.description || "") + (k.kind === "项目" ? " · 项目" : " · U 盘") }));
+    if (!pal.length) pal = [{ cmd: "__none", show: "还没有技能：在工作区或 U 盘的 .agent/skills/<名字>/SKILL.md 放一个", desc: "", disabled: true }];
   } else return palClose();
   palIdx = 0;
   palRender();
@@ -1036,12 +1224,28 @@ function palPick() {
   const cmd = v.indexOf(" ") < 0 ? v : v.slice(0, v.indexOf(" "));
   if (it.show?.startsWith("/mode ")) { setMode(it.cmd); window.dispatchEvent(new CustomEvent("ua:mode-change", { detail: { mode: it.cmd } })); toast("已切到 " + it.desc, "ok"); clearComposer(); return; }
   if (it.show?.startsWith("/model ")) { S.active = it.cmd; window.dispatchEvent(new CustomEvent("ua:model-change", { detail: { name: it.cmd } })); clearComposer(); return; }
+  if (it.show?.startsWith("/skill ")) {
+    const extra = txtEl().value.slice(txtEl().value.indexOf(" ") + 1).replace(it.cmd, "").trim();
+    setInput("请用 skill 工具加载「" + it.cmd + "」技能，然后照它说的做。" + (extra ? "另外：" + extra : ""));
+    return;
+  }
+  // 自定义命令：交给服务端展开（$ARGUMENTS / $1..$9 / @file），展开结果放回输入框让人过一眼
+  if (it.custom) {
+    const line = txtEl().value.trim();
+    const args = line.includes(" ") ? line.slice(line.indexOf(" ") + 1).trim() : "";
+    api.expandCommand(it.custom, args)
+      .then((r) => { setInput(r.text); toast("已展开自定义命令「" + it.custom + "」（来自" + (r.kind || "?") + "），看一眼再回车", "ok"); })
+      .catch((e) => toast(e.message, "err"));
+    return;
+  }
   switch (cmd) {
     case "/new": clearComposer(); $("#newChat").click(); return;
     case "/compact": clearComposer(); doCompact(); return;
     case "/export": clearComposer(); exportSession(); return;
     case "/thinking": clearComposer(); toggleThinking(); return;
     case "/details": clearComposer(); toggleDetails(); return;
+    case "/check": clearComposer(); doCheck(""); return;
+    case "/goal": clearComposer(); doGoal(""); return;
     case "/remember": $("#txt").value = "/remember "; focusInput(); return;
     case "/init": setInput("请通读工作区（用 fs_list / fs_search / fs_read），在工作区根目录生成一份 AGENTS.md：说明这个文件夹的用途、关键文件、常用命令和注意事项，精炼实用。"); return;
     default: clearComposer(); showStatus(true);
@@ -1098,6 +1302,62 @@ function sessionMarkdown(title, events) {
   }
   flush();
   return out.join("\n");
+}
+
+// 完成标准：设 / 看 / 清（/goal <内容>、/goal clear）
+export async function doGoal(arg) {
+  if (!S.sessionId) return toast("还没有会话，先聊一句再用 /goal", "err");
+  const text = String(arg || "").trim();
+  try {
+    if (!text) {
+      const cur = await api.getGoal(S.sessionId);
+      if (!cur.goal) return toast("还没设完成标准。用法：/goal 测试全绿且 README 写清楚", "err");
+      toast("当前完成标准：" + cur.goal, "ok");
+      renderGoalChip();
+      return;
+    }
+    if (text === "clear" || text === "清除") {
+      await api.setGoal(S.sessionId, "");
+      toast("已清除完成标准", "ok");
+    } else {
+      await api.setGoal(S.sessionId, text);
+      toast("已记下完成标准，它会一直做到真有实据为止", "ok");
+    }
+    renderGoalChip();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+export async function renderGoalChip() {
+  const chip = $("#sbGoal");
+  if (!chip) return;
+  if (!S.sessionId) {
+    chip.hidden = true;
+    return;
+  }
+  try {
+    const cur = await api.getGoal(S.sessionId);
+    chip.hidden = !cur.goal;
+    if (cur.goal) {
+      chip.textContent = "标准：" + cur.goal.slice(0, 18) + (cur.goal.length > 18 ? "…" : "");
+      chip.title = "本次任务的完成标准：" + cur.goal + "\n（/goal clear 清除）";
+    }
+  } catch {
+    chip.hidden = true;
+  }
+}
+
+// 手动跑一次检查（/check 或设置里的「现在跑一次」）
+export async function doCheck(only = "") {
+  if (!S.sessionId) return toast("还没有会话，先随便聊一句再检查", "err");
+  toast("正在跑检查…");
+  try {
+    const r = await api.check(S.sessionId, only);
+    addCheckCard(r);
+    toast(r.summary || (r.ok ? "检查通过" : "检查没过"), r.ok ? "ok" : "err");
+  } catch (e) {
+    toast(e.message, "err");
+  }
 }
 
 export async function showStatus(full) {
@@ -1282,6 +1542,9 @@ export function initChat() {
   });
   $("#send").onclick = () => (S.sending ? abortRun() : sendMessage(txtEl().value));
   $("#runStop").onclick = () => abortRun();
+  $("#sbJobs").onclick = () => toggleJobsPanel();
+  refreshJobs();
+  setInterval(refreshJobs, 4000); // 后台任务状态：本地接口，4 秒刷一次不心疼
   $("#ctxCompact").onclick = () => doCompact();
   $("#attach").onclick = () => $("#file").click();
   $("#file").onchange = (e) => { addFiles([...e.target.files]); e.target.value = ""; };
