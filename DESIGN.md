@@ -144,6 +144,32 @@ J 模式门禁: readonly 模式下 /api/chat 请求 fs_write → SSE 收到 deny
 K 图片: /api/chat 带 1 张 1x1 png base64（Mock provider）→ 会话 jsonl 里 user 事件含 images 且长度>0，对话正常完成
 ```
 
+## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）
+
+### P0
+1. **多轮上下文 + /compact**：/api/chat 从会话 jsonl 重建历史发给模型（当前是每条独立，重大 bug）；看板/预算：估算 token（字符/2.5），超 24k 字提示压缩；POST /api/compact 用模型把旧轮次摘要成 {type:"compact",summary,keep} 事件，历史重建时用摘要替代被压部分。core/context.mjs 纯函数实现 + 单测
+2. **AGENTS.md 注入 + /init**：工作区根 AGENTS.md（≤8KB）自动进系统提示；/init 前端展开为提示词让 agent 生成该文件
+3. **写操作 diff 预览**：工具可导出 preview(args,ctx)；fs_write 覆盖→行级 diff（core/diff.mjs LCS，超 400 行截断），fs_edit→老/新对照，fs_delete→目标信息；confirm_request 事件带 preview，网页弹窗渲染 +/- 着色
+4. **update_plan 计划工具**：risk low，参数 {items:[{step,status:pending|doing|done}]}；事件 {type:"plan"} 泵入主流；网页渲染计划卡（含进度），同会话新计划覆盖旧卡；当前计划注入系统提示
+5. **Ollama 离线预置**：config.example.json 加「Ollama 本地」行（openai-chat, http://127.0.0.1:11434/v1）；provider 无 secret 时不发 Authorization 头；README 离线用法
+6. **用量显示**：适配器解析 usage（chat: stream_options.include_usage 末块；anthropic: message_start/message_delta；responses: response.completed.usage）发 {type:"usage"}；网页顶栏显示「上下文≈x 字 · 本会话 y tokens」；/status 弹详情
+
+### P1
+7. **持久记忆**：U 盘 data/memory.md，GET/POST /api/memory；≤4KB 注入系统提示；/remember 追加；设置抽屉可编辑
+8. **斜杠命令面板**：输入框打 / 弹面板（↑↓ 选、Enter 定），支持 /new /mode /model /compact /init /status /remember /help；filter 即输即筛
+9. **会话重命名**：POST /api/session-rename {id,title} 存 data/titles.json；侧栏双击改名
+10. **文本文件拖入**：拖拽/粘贴文本文件（≤100KB/个，合计 200KB）转成代码块并入消息
+
+### v4 验收
+```
+O 多轮上下文: 本地假上游捕获第二次请求 body → messages 含第一轮 user+assistant
+P 压缩: /api/compact 后会话有 compact 事件；再次 chat 请求 body 中旧轮次被摘要替代
+Q diff 预览: confirm 模式覆盖写 → confirm_request.preview.kind=="diff" 且含 +/- 行
+R 计划: MOCKSCRIPT 调 update_plan → 事件流有 plan；系统提示含当前计划
+S 记忆: POST /api/memory 后 systemPrompt 含该内容（单测）；前端 /remember 追加
+T 重命名: rename 后 ls 列表 title 变化
+```
+
 ## 已知限制（写进 README）
 ```
 

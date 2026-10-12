@@ -11,15 +11,16 @@ import { truncate } from "./util.mjs";
 
 function endpoint(provider) {
   const base = String(provider.baseURL || "").replace(/\/+$/, "");
+  const auth = provider.secret ? { Authorization: `Bearer ${provider.secret}` } : {}; // 空钥匙（如 Ollama）不发鉴权头
   switch (provider.protocol) {
     case "openai-chat":
-      return { url: `${base}/chat/completions`, headers: { Authorization: `Bearer ${provider.secret}` } };
+      return { url: `${base}/chat/completions`, headers: auth };
     case "openai-responses":
-      return { url: `${base}/responses`, headers: { Authorization: `Bearer ${provider.secret}` } };
+      return { url: `${base}/responses`, headers: auth };
     case "anthropic":
       return {
         url: `${base}/v1/messages`,
-        headers: { "x-api-key": provider.secret, "anthropic-version": "2023-06-01" },
+        headers: { ...(provider.secret ? { "x-api-key": provider.secret } : {}), "anthropic-version": "2023-06-01" },
       };
     default:
       throw new Error(`未知协议 ${provider.protocol}`);
@@ -67,6 +68,7 @@ function bodyOpenaiChat(provider, messages, tools) {
     model: provider.model,
     messages: msgs,
     stream: true,
+    stream_options: { include_usage: true },
     ...(tools.length
       ? {
           tools: tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.params } })),
@@ -177,12 +179,23 @@ async function assertOk(res, protocol) {
 
 async function* streamOpenaiChat(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
-  const res = await fetch(url, {
+  const reqBody = bodyOpenaiChat(provider, messages, tools);
+  let res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify(bodyOpenaiChat(provider, messages, tools)),
+    body: JSON.stringify(reqBody),
     signal,
   });
+  if (res.status === 400) {
+    // 某些兼容端点不认识 stream_options，去掉后重试一次
+    delete reqBody.stream_options;
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(reqBody),
+      signal,
+    });
+  }
   await assertOk(res, "openai-chat");
   const acc = new Map(); // index → {id, name, args}
   let stop = "stop";
@@ -194,6 +207,7 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
     } catch {
       continue;
     }
+    if (j.usage) yield { type: "usage", input: j.usage.prompt_tokens || 0, output: j.usage.completion_tokens || 0 };
     const ch = j.choices?.[0];
     const d = ch?.delta;
     if (d?.content) yield { type: "text", delta: d.content };
@@ -254,6 +268,7 @@ async function* streamOpenaiResponses(provider, messages, tools, signal) {
       calls.set(j.item.call_id, a);
       yield { type: "tool_delta", id: j.item.call_id, delta: "" };
     } else if (type === "response.completed" || type === "response.incomplete") {
+      if (j.response?.usage) yield { type: "usage", input: j.response.usage.input_tokens || 0, output: j.response.usage.output_tokens || 0 };
       stop = j.response?.status === "incomplete" ? "length" : "stop";
       break;
     } else if (type === "response.failed" || type === "error") {
@@ -306,8 +321,11 @@ async function* streamAnthropic(provider, messages, tools, signal) {
     } else if (type === "content_block_stop") {
       curTool = null;
     } else if (type === "message_delta") {
+      if (j.usage) yield { type: "usage", input: 0, output: j.usage.output_tokens || 0 };
       if (j.delta?.stop_reason === "tool_use") stop = "tool_calls";
       else if (j.delta?.stop_reason === "end_turn") stop = "stop";
+    } else if (type === "message_start") {
+      if (j.message?.usage) yield { type: "usage", input: j.message.usage.input_tokens || 0, output: 0 };
     } else if (type === "error") {
       yield { type: "error", message: j.error?.message || "anthropic 流失败" };
       return;
@@ -345,9 +363,11 @@ function mockScript(userText) {
 }
 
 async function* streamMock(provider, messages, tools, signal) {
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+  const lastUser = messages[lastUserIdx];
   const script = mockScript(lastUser?.text || "");
-  const toolCount = messages.filter((m) => m.role === "tool").length; // 已完成的工具步数，剧本从这续播
+  // 只数「最后一条用户消息之后」的工具步，避免把历史旧轮次的工具算进剧本进度
+  const toolCount = messages.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length;
   const rest = script.slice(toolCount);
   if (rest.length && rest[0].tool) {
     const step = rest[0];

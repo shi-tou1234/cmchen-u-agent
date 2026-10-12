@@ -6,7 +6,7 @@ import { truncate } from "./util.mjs";
 const MAX_STEPS = 30;
 const MAX_SUB_STEPS = 15;
 
-export function systemPrompt({ workspace, uaHome, mode, platform }) {
+export function systemPrompt({ workspace, uaHome, mode, platform, memory, agentsMd, state }) {
   const lines = [
     "你是 u-agent——一个跑在用户 U 盘里的本地 AI 助手，通过工具帮用户操作这台电脑上的文件、执行命令、联网查资料、操作 git。",
     `今天是 ${new Date().toISOString().slice(0, 10)}。运行平台：${platform}。`,
@@ -16,9 +16,16 @@ export function systemPrompt({ workspace, uaHome, mode, platform }) {
     "- 高危操作（删除、覆盖已有文件、命令执行）会走审批；被拒绝时不要反复尝试，向用户解释原因。",
     "- shell 只在必要时用；绝不执行破坏系统的命令（格式化、关机、删系统目录等会被无条件拦截）。",
     "- 子任务多且相互独立时，用 spawn_subagent 并行拆解。",
+    "- 任务超过 3 个步骤时，先用 update_plan 建立计划，每完成一步更新状态。",
     `- 回答用用户的语言（默认中文），当前权限模式：${MODE_LABEL[mode] || mode}。`,
   ];
   if (MODE_PROMPT[mode]) lines.push(MODE_PROMPT[mode]);
+  if (state?.plan?.length) {
+    lines.push("当前任务计划：");
+    for (const it of state.plan) lines.push(`- [${it.status === "done" ? "x" : it.status === "doing" ? "…" : " "}] ${it.step}`);
+  }
+  if (agentsMd) lines.push(`工作区约定文件 AGENTS.md（用户项目自有规则，优先遵守）：\n<agents_md>\n${agentsMd}\n</agents_md>`);
+  if (memory) lines.push(`跨会话记忆（用户此前叮嘱过的事，注意遵守）：\n<memory>\n${memory}\n</memory>`);
   return lines.join("\n");
 }
 
@@ -43,6 +50,8 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         if (ev.type === "text") {
           roundText += ev.delta;
           yield { type: "assistant_delta", delta: ev.delta };
+        } else if (ev.type === "usage") {
+          yield ev; // 透传用量给界面/服务端累计
         } else if (ev.type === "error") {
           throw new Error(ev.message);
         } else if (ev.type === "end") {
@@ -76,8 +85,14 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         } else {
           let approved = true;
           if (g === "confirm") {
-            const { id: confirmId, done: decided } = ctx.confirm({ tool: tc.name, args: tc.args });
-            yield { type: "confirm_request", confirmId, id: tc.id, name: tc.name, args: tc.args };
+            let preview;
+            try {
+              preview = typeof tool.preview === "function" ? await tool.preview(tc.args || {}, ctx) : undefined;
+            } catch {
+              preview = undefined;
+            }
+            const { id: confirmId, done: decided } = ctx.confirm({ tool: tc.name, args: tc.args, risk, preview });
+            yield { type: "confirm_request", confirmId, id: tc.id, name: tc.name, args: tc.args, risk, preview };
             approved = await decided;
             yield { type: "confirm_result", confirmId, approved };
           }

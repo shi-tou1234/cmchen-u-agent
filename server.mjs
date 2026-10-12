@@ -6,6 +6,8 @@ import crypto from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Registry } from "./core/tools.mjs";
 import { runAgent } from "./core/agent-loop.mjs";
+import { streamChat } from "./core/providers.mjs";
+import { buildHistory, budgetOf, compactPrompt } from "./core/context.mjs";
 import { Sessions } from "./core/sessions.mjs";
 import { ConfirmGate } from "./core/confirm.mjs";
 import { MODES } from "./core/modes.mjs";
@@ -111,6 +113,30 @@ function maskState(st) {
 // ---------- 会话运行态 ----------
 const running = new Map(); // sessionId → {abort: AbortController, mode}
 
+const MEMORY = path.join(DATA, "memory.md");
+const TITLES = path.join(DATA, "titles.json");
+const readMemory = () => {
+  try {
+    return fs.readFileSync(MEMORY, "utf8").slice(0, 4096);
+  } catch {
+    return "";
+  }
+};
+const loadTitles = () => readJson(TITLES, {});
+const saveTitles = (t) => writeJson(TITLES, t);
+
+let agentsCache = { mtime: 0, text: "" };
+function agentsMdOf(workspace) {
+  try {
+    const p = path.join(workspace, "AGENTS.md");
+    const st = fs.statSync(p);
+    if (st.mtimeMs !== agentsCache.mtime) agentsCache = { mtime: st.mtimeMs, text: fs.readFileSync(p, "utf8").slice(0, 8192) };
+    return agentsCache.text;
+  } catch {
+    return "";
+  }
+}
+
 function settingsReady(st) {
   return !!st.workspace;
 }
@@ -126,7 +152,7 @@ function sseHead(res) {
 }
 const sse = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-const LOG_TYPES = new Set(["user", "assistant_message", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary"]);
+const LOG_TYPES = new Set(["user", "assistant_message", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan"]);
 
 async function handleChat(req, res, body) {
   const st = loadState();
@@ -149,11 +175,15 @@ async function handleChat(req, res, body) {
 
   const abort = new AbortController();
   running.set(sessionId, { abort, mode });
+  // 多轮上下文：从会话日志重建历史（含 compact 摘要替换），再拼上本条消息
+  const history = buildHistory(sessions.read(sessionId));
+  const messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
+  const budget = budgetOf(messages);
   sessions.append(sessionId, { type: "mode", mode });
   sessions.append(sessionId, { type: "user", text, images });
 
   sseHead(res);
-  sse(res, { type: "session", sessionId, provider: provider.name, mode });
+  sse(res, { type: "session", sessionId, provider: provider.name, mode, budget });
 
   const ctx = {
     uaHome: UA_HOME,
@@ -164,7 +194,9 @@ async function handleChat(req, res, body) {
     registry,
     signal: abort.signal,
     subDepth: 0,
-    // 生成确认单：登记进 pending 表，网页 /api/confirm 裁决后 resolve
+    state: {},
+    memory: readMemory(),
+    agentsMd: agentsMdOf(st.workspace),
     confirm: (info) => {
       const id = genId("cfm");
       const p = new Promise((resolve) => {
@@ -175,15 +207,15 @@ async function handleChat(req, res, body) {
     },
   };
 
-  let lastAssistant = "";
+  let usageTotal = { input: 0, output: 0 };
   try {
-    for await (const ev of runAgent({
-      provider,
-      messages: [{ role: "user", text, ...(images.length ? { images } : {}) }],
-      registry,
-      ctx,
-    })) {
-      if (ev.type === "assistant_message" || ev.type === "done") lastAssistant = ev.text || lastAssistant;
+    for await (const ev of runAgent({ provider, messages, registry, ctx })) {
+      if (ev.type === "usage") {
+        usageTotal.input += ev.input || 0;
+        usageTotal.output += ev.output || 0;
+        sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output });
+        continue;
+      }
       if (LOG_TYPES.has(ev.type)) sessions.append(sessionId, ev);
       sse(res, ev);
     }
@@ -307,7 +339,64 @@ const server = http.createServer(async (req, res) => {
       const st = saveState(patch);
       return sendJson(res, 200, maskState(st));
     }
-    if (req.method === "GET" && u.pathname === "/api/sessions") return sendJson(res, 200, sessions.list());
+    if (req.method === "GET" && u.pathname === "/api/sessions") {
+      const titles = loadTitles();
+      return sendJson(res, 200, sessions.list().map((s) => ({ ...s, title: titles[s.id] || s.title })));
+    }
+    if (req.method === "POST" && u.pathname === "/api/session-rename") {
+      const b = await readBody(req);
+      const id = String(b.id || "");
+      try {
+        sessions.fileOf(id); // 校验 id 合法
+      } catch {
+        return sendJson(res, 400, { error: "非法会话 id" });
+      }
+      const titles = loadTitles();
+      const t = String(b.title || "").trim().slice(0, 60);
+      if (t) titles[id] = t;
+      else delete titles[id];
+      saveTitles(titles);
+      return sendJson(res, 200, { ok: true, title: t });
+    }
+    if (req.method === "GET" && u.pathname === "/api/memory") return sendJson(res, 200, { text: readMemory() });
+    if (req.method === "POST" && u.pathname === "/api/memory") {
+      const b = await readBody(req);
+      const t = String(b.text || "").slice(0, 8192);
+      fs.mkdirSync(DATA, { recursive: true });
+      fs.writeFileSync(MEMORY, t, "utf8");
+      return sendJson(res, 200, { ok: true, chars: t.length });
+    }
+    if (req.method === "POST" && u.pathname === "/api/compact") {
+      const b = await readBody(req);
+      const st = loadState();
+      const sid = String(b.sessionId || "");
+      let events = [];
+      try {
+        events = sessions.read(sid);
+      } catch {
+        return sendJson(res, 404, { error: "会话不存在" });
+      }
+      const provider = st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0];
+      if (!provider) return sendJson(res, 400, { error: "没有可用的模型通道" });
+      const msgs = buildHistory(events);
+      const keepTail = Math.max(0, Math.min(6, msgs.length - 2));
+      if (msgs.length < 4 || msgs.length - keepTail < 2) return sendJson(res, 400, { error: "对话还太短，无需压缩" });
+      const before = budgetOf(msgs);
+      let summary = "";
+      try {
+        for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail) }], [], AbortSignal.timeout(90000))) {
+          if (ev.type === "text") summary += ev.delta;
+          else if (ev.type === "error") throw new Error(ev.message);
+        }
+      } catch (e) {
+        return sendJson(res, 500, { error: "压缩失败：" + e.message });
+      }
+      summary = summary.trim();
+      if (!summary) return sendJson(res, 500, { error: "压缩失败：模型没有返回摘要" });
+      sessions.append(sid, { type: "compact", summary, atIndex: events.length, keepTail });
+      const after = budgetOf(buildHistory(sessions.read(sid)));
+      return sendJson(res, 200, { ok: true, summary, before, after });
+    }
     if (req.method === "DELETE" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
       try {

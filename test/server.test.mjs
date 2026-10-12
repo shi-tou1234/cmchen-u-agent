@@ -10,6 +10,7 @@ import { REPO, tmpDir } from "./helpers.mjs";
 const PORT = 3817 + Math.floor(Math.random() * 500);
 const BASE = `http://127.0.0.1:${PORT}`;
 let child;
+let UP;
 
 function freePort(p) {
   return new Promise((r) => {
@@ -53,6 +54,14 @@ async function jjson(p, opts = {}) {
   return { status: r.status, json: await r.json().catch(() => ({})), res: r };
 }
 
+async function activateUp() {
+  await jjson("/api/settings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Mock" }),
+  });
+}
+
 async function chat(body) {
   const res = await jfetch("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const text = await res.text();
@@ -90,8 +99,16 @@ test.before(async () => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, searchKeys: {} }),
   });
+  // v0.3：启动本地假上游并注册为可用通道
+  UP = await startUpstream();
+  const st2 = await jjson("/api/settings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Mock" }),
+  });
+  assert.equal(st2.status, 200, "注册上游通道应成功");
 });
-test.after(() => child?.kill());
+test.after(() => { UP?.server.close(); child?.kill(); });
 
 test("健康检查：工具已加载（免解锁）", async () => {
   const j = await (await fetch(`${BASE}/api/health`)).json();
@@ -265,4 +282,123 @@ test("会话删除：DELETE 后列表与读取都没有了", async () => {
   assert.equal(del.status, 200);
   const list = await (await jfetch("/api/sessions")).json();
   assert.ok(!list.some((s) => s.id === sid), "删除后列表不应包含该会话");
+});
+
+/* ===== v0.3 追加：真上游捕获多轮/压缩/计划/记忆/重命名/预览 ===== */
+import http from "node:http";
+
+function startUpstream() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        requests.push(JSON.parse(body || "{}"));
+      } catch {
+        requests.push({});
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      for (const c of [
+        { choices: [{ delta: { content: "好的，我记住了。" } }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+        { usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [] },
+      ])
+        res.write("data: " + JSON.stringify(c) + String.fromCharCode(10, 10));
+      res.write("data: [DONE]" + String.fromCharCode(10, 10));
+      res.end();
+    });
+  });
+  return new Promise((r) => server.listen(0, "127.0.0.1", () => r({ server, requests, url: "http://127.0.0.1:" + server.address().port })));
+}
+
+test("验收O：多轮上下文——第二轮请求携带第一轮", async () => {
+  await activateUp();
+  const sid = "s-multiturn-test";
+  await chat({ sessionId: sid, message: { text: "请记住数字 42" }, mode: "confirm", provider: "Up" });
+  await chat({ sessionId: sid, message: { text: "我刚才说的数字是多少？" }, mode: "confirm", provider: "Up" });
+  const last = UP.requests.at(-1);
+  const flat = JSON.stringify(last.messages || last.input || "");
+  assert.ok(flat.includes("记住数字 42"), "第二轮请求必须包含第一轮用户消息");
+  assert.ok(flat.includes("好的，我记住了"), "且包含第一轮助手回复");
+});
+
+test("验收P：压缩后旧轮次被摘要替代", async () => {
+  await activateUp();
+  const sid = "s-compact-test";
+  await chat({ sessionId: sid, message: { text: "第一件事：查询版本号" }, mode: "confirm", provider: "Up" });
+  await chat({ sessionId: sid, message: { text: "第二件事：查个天气" }, mode: "confirm", provider: "Up" });
+  await chat({ sessionId: sid, message: { text: "第三件事：算个数" }, mode: "confirm", provider: "Up" });
+  const c = await jjson("/api/compact", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: sid, provider: "Up" }),
+  });
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  await chat({ sessionId: sid, message: { text: "继续" }, mode: "confirm", provider: "Up" });
+  const last = UP.requests.at(-1);
+  const flat = JSON.stringify(last.messages || last.input || "");
+  assert.ok(flat.includes("更早对话的摘要"), "压缩后请求应带摘要标记");
+  assert.ok(!flat.includes("第一件事：查询版本号"), "被压缩的旧轮次不应原样出现");
+});
+
+test("验收Q：覆盖写 confirm_request 带 diff 预览", async () => {
+  await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir }) });
+  const sid = "s-preview-test";
+  await chat({ sessionId: sid, message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "prev.txt", content: "第一版" } }]) }, mode: "confirm" });
+  const r = await chat({
+    sessionId: sid,
+    message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "prev.txt", content: "第二版\n新增行" } }]) },
+    mode: "confirm",
+  });
+  const req = r.events.find((e) => e.type === "confirm_request");
+  assert.ok(req, "应出现确认请求");
+  assert.equal(req.preview?.kind, "diff", "确认请求应带 diff 预览");
+  assert.ok((req.preview.lines || []).some((l) => l.op === "+" && l.text.includes("新增行")));
+  assert.ok((req.preview.lines || []).some((l) => l.op === "-" && l.text.includes("第一版")));
+});
+
+test("验收R：update_plan 产生计划事件并记录", async () => {
+  const r = await chat({
+    message: {
+      text:
+        "MOCKSCRIPT:" +
+        JSON.stringify([
+          { tool: "update_plan", args: { items: [{ step: "调研", status: "doing" }, { step: "实现", status: "pending" }] }, say: "先立计划" },
+          { say: "计划已立。" },
+        ]),
+    },
+    mode: "confirm",
+  });
+  const plan = r.events.find((e) => e.type === "plan");
+  assert.ok(plan, "应有 plan 事件");
+  assert.equal(plan.items.length, 2);
+  assert.equal(plan.items[1].status, "pending");
+});
+
+test("验收S：记忆写入后注入模型系统提示", async () => {
+  await activateUp();
+  await jjson("/api/memory", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "用户喜欢用中文且回答要短" }) });
+  await chat({ sessionId: "s-mem-test", message: { text: "打个招呼" }, mode: "confirm", provider: "Up" });
+  const last = UP.requests.at(-1);
+  const sys = (last.messages || []).find((m) => m.role === "system");
+  assert.ok(JSON.stringify(sys).includes("用户喜欢用中文且回答要短"), "系统提示应含记忆内容");
+  await jjson("/api/memory", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "" }) });
+});
+
+test("验收T：会话重命名", async () => {
+  const { events } = await chat({ message: { text: "这是要被重命名的会话" }, mode: "confirm" });
+  const sid = events.find((e) => e.type === "session").sessionId;
+  const r = await jjson("/api/session-rename", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: sid, title: "我的调研会话" }) });
+  assert.equal(r.status, 200);
+  const list = await (await jfetch("/api/sessions")).json();
+  assert.equal(list.find((s) => s.id === sid)?.title, "我的调研会话");
+});
+
+test("用量事件透传（upstream 回传 usage）", async () => {
+  await activateUp();
+  const { events } = await chat({ sessionId: "s-usage-test", message: { text: "你好" }, mode: "confirm", provider: "Up" });
+  const u = events.find((e) => e.type === "usage");
+  assert.ok(u, "应有 usage 事件");
+  assert.ok(u.output >= 5);
 });

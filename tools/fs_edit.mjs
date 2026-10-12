@@ -14,6 +14,13 @@ export default {
     },
     required: ["path", "old", "new"],
   },
+  async preview(args, ctx) {
+    const p = resolveInside([ctx.workspace, ctx.uaHome], args.path, ctx.workspace);
+    const old = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+    const { makeDiff, diffStat } = await import("../core/diff.mjs");
+    const d = makeDiff(old, old.split(args.old).join(args.new));
+    return { ...d, stat: diffStat(d.lines || []), path: p, note: d.note };
+  },
   async run(args, ctx) {
     const p = resolveInside([ctx.workspace, ctx.uaHome], args.path, ctx.workspace);
     const raw = fs.readFileSync(p, "utf8");
