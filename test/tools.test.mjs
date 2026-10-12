@@ -57,6 +57,8 @@ test("shell_run：正常执行 + 黑名单无条件拦截", async () => {
   await assert.rejects(() => run("shell_run", { command: "format c: /q" }, ctx), /无条件拦截/);
   await assert.rejects(() => run("shell_run", { command: "shutdown /s" }, ctx), /拦截/);
   await assert.rejects(() => run("shell_run", { command: "del /s /q C:\\Windows" }, ctx), /拦截/);
+  await assert.rejects(() => run("shell_run", { command: "fo^rmat c: /q" }, ctx), /拦截/, "caret 转义不应绕过黑名单");
+  await assert.rejects(() => run("shell_run", { command: 'f"or"mat c: /q' }, ctx), /拦截/, "引号拆分不应绕过黑名单");
   await assert.rejects(() => run("shell_run", { command: "echo x", cwd: "C:\\Windows" }, ctx), /越界/);
 });
 

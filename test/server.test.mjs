@@ -1148,8 +1148,10 @@ test("v9.2 新增：本会话不再问这类命令（前缀放行，且范围写
     const dec = new TextDecoder();
     let buf = "";
     let events = [];
-    let done = false;
-    while (!done) {
+    let approved = false;
+    // 读到流自然结束为止（本轮真正跑完再发下一条）——原先拿到确认单就早退，
+    // 那条路径依赖"同会话允许并发"，与 v9.7 的禁并发语义冲突
+    for (;;) {
       const { done: d, value } = await rd.read();
       if (d) break;
       buf += dec.decode(value, { stream: true });
@@ -1162,10 +1164,10 @@ test("v9.2 新增：本会话不再问这类命令（前缀放行，且范围写
         let ev;
         try { ev = JSON.parse(mm[1]); } catch { continue; }
         events.push(ev);
-        if (ev.type === "confirm_request" && !done) {
+        if (ev.type === "confirm_request" && !approved) {
+          approved = true;
           assert.equal(ev.prefix, "dir", "确认单里要写清「这类命令」的范围");
           await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId: ev.confirmId, approve: true, rememberPrefix: ev.prefix }) });
-          done = true;
         }
       }
     }
@@ -1390,4 +1392,30 @@ test("v9.3 新增：后台任务——起得来、看得到输出、停得掉、
   const r2 = await chat({ sessionId: sid, mode: "full", provider: "Mock", message: { text: look } });
   const tr2 = r2.events.find((e) => e.type === "tool_result" && e.name === "shell_jobs");
   assert.match(tr2?.text || "", /job-/, "shell_jobs 要能看到任务");
+});
+
+/* ===== v0.9.7：加固（Host 校验 / 同会话禁并发） ===== */
+test("v9.7 Host 头校验：外部域名的 Host 一律 403，本机照常", async () => {
+  const port = Number(new URL(BASE).port);
+  const code = await new Promise((res) => {
+    const rq = http.request({ host: "127.0.0.1", port, path: "/api/health", headers: { host: "evil.example:1234" } }, (r) => {
+      r.resume();
+      res(r.statusCode);
+    });
+    rq.on("error", () => res(0));
+    rq.end();
+  });
+  assert.equal(code, 403, "DNS rebinding 场景（Host=外部域名）应被拒");
+  assert.equal((await jfetch("/api/health")).status, 200, "正常本机 Host 不受影响");
+});
+
+test("v9.7 同一会话并发聊天被拒（409）", async () => {
+  const sid = "s-conc";
+  // 先建文件（新建=非高危直接跑），再用「覆盖」占住确认弹窗，让第一轮处在跑的状态
+  await chat({ sessionId: sid, provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "conc.txt", content: "v1" } }]) }, mode: "confirm" });
+  const first = chat({ sessionId: sid, provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "conc.txt", content: "v2" }, say: "覆盖" }]) }, mode: "confirm" });
+  await new Promise((r) => setTimeout(r, 400));
+  const second = await jjson("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Mock", message: { text: "插队一条" }, mode: "confirm" }) });
+  assert.equal(second.status, 409, "并发应被拒：" + JSON.stringify(second.json));
+  await first; // 等第一轮走完（确认超时自动拒绝）
 });

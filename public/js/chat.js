@@ -1,5 +1,5 @@
 // 对话区：消息渲染、SSE 收发、工具/计划卡、高危确认、斜杠命令、附件
-import { api } from "./api.js";
+import { api, net } from "./api.js";
 import { S, setMode, MODES, MODE_HINT, ACTION_META } from "./state.js";
 import { $, $$, el, esc, icon, md, toast, kb } from "./ui.js";
 import { renderModelBtn, renderModeBtn, cycleMode } from "./picker.js";
@@ -151,6 +151,8 @@ export async function sendMessage(text) {
     );
     if (!res.ok || !res.body) {
       const j = await res.json().catch(() => ({}));
+      // 解锁过期（服务重启/令牌失效）：聊天口也走统一锁屏，而不是只弹一条错误就没了
+      if (res.status === 401 && j.locked && net.onLocked) net.onLocked();
       throw new Error(j.error || `服务返回 ${res.status}`);
     }
     const reader = res.body.getReader();

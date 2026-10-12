@@ -16,6 +16,10 @@ const BLACKLIST = [
   [/remove-item\b[^&|>]*-recurse[^&|>]*[a-z]:\\/i, "PowerShell 递归删绝对路径"],
 ];
 
+// cmd 的 ^ 是转义符、引号在分词时会被吃掉：fo^rmat、f"or"mat 到 cmd 里都会还原成 format。
+// 匹配前把这两类字符去掉再查一遍——黑名单是防手滑的护栏，别被这两种写法轻易绕过。
+const unescapeForMatch = (cmd) => String(cmd).replace(/\^/g, "").replace(/"/g, "");
+
 export default {
   name: "shell_run",
   description: "在指定目录执行 cmd 命令（高危：每次都要审批；破坏系统命令无条件拒绝）",
@@ -29,8 +33,9 @@ export default {
     required: ["command"],
   },
   async run(args, ctx) {
+    const probe = unescapeForMatch(args.command);
     for (const [re, label] of BLACKLIST) {
-      if (re.test(args.command)) throw new Error(`命令被无条件拦截（${label}）：${args.command}`);
+      if (re.test(args.command) || re.test(probe)) throw new Error(`命令被无条件拦截（${label}）：${args.command}`);
     }
     const cwd = resolveInside([ctx.workspace, ctx.uaHome], args.cwd || ".", ctx.workspace);
     const r = await runCommand({
