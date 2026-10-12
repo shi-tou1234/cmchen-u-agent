@@ -4,8 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
-import { execSync } from "node:child_process";
-import { freshRegistry, makeCtx, tmpDir } from "./helpers.mjs";
+import { freshRegistry, makeCtx, tmpDir, runSyncRetry } from "./helpers.mjs";
 
 let reg;
 test.before(async () => {
@@ -72,11 +71,12 @@ test("git 六件套（本地裸仓库当远程）", async (t) => {
   const ws = tmpDir();
   const remote = path.join(tmpDir(), "remote.git").replace(/\\/g, "/");
   const wsF = ws.replace(/\\/g, "/");
-  execSync(`git init -q --bare "${remote}"`);
-  execSync(`git init -q -b main "${wsF}"`);
-  execSync(`git -C "${wsF}" config user.email t@t`);
-  execSync(`git -C "${wsF}" config user.name t`);
-  execSync(`git -C "${wsF}" remote add origin "${remote}"`);  const ctx = makeCtx({ workspace: ws, registry: reg });
+  runSyncRetry("git", ["init", "-q", "--bare", remote]);
+  runSyncRetry("git", ["init", "-q", "-b", "main", wsF]);
+  runSyncRetry("git", ["-C", wsF, "config", "user.email", "t@t"]);
+  runSyncRetry("git", ["-C", wsF, "config", "user.name", "t"]);
+  runSyncRetry("git", ["-C", wsF, "remote", "add", "origin", remote]);
+  const ctx = makeCtx({ workspace: ws, registry: reg });
 
   const st0 = await run("git_status", {}, ctx);
   assert.match(st0, /main/);
@@ -89,7 +89,7 @@ test("git 六件套（本地裸仓库当远程）", async (t) => {
   const df = await run("git_diff", {}, ctx);
   assert.match(df, /v2/);
   // push：先手动建 upstream（本地裸仓库），再走工具
-  execSync(`git -C "${wsF}" push -u origin main`, { stdio: "ignore" });
+  runSyncRetry("git", ["-C", wsF, "push", "-u", "origin", "main"], { stdio: "ignore" });
   const push = await run("git_push", {}, ctx);
   assert.match(push, /git push|Everything up-to-date|main/);
   const pull = await run("git_pull", {}, ctx);

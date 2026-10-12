@@ -17,10 +17,26 @@ export function decodeOutput(buf) {
   }
 }
 
-export function runCommand({ command, args = [], cwd, timeoutMs = 30000, maxOut = 200000, env = {} }) {
+// Windows 偶发 EBUSY/EPERM 重试：CreateProcess 撞上杀软扫描或文件系统瞬时占用，等一下重试即可恢复
+// （本机"git 六件套"测试红就是这一类）。只重试"进程还没起来"的启动失败；正常退出码（哪怕非 0）不重试。
+const SPAWN_RETRYABLE = new Set(["EBUSY", "EPERM", "EAGAIN"]);
+const SPAWN_ATTEMPTS = 3;
+
+export async function runCommand(opts) {
+  for (let attempt = 0; ; attempt++) {
+    const r = await spawnOnce(opts);
+    const retryable = r.spawnErrorCode && SPAWN_RETRYABLE.has(r.spawnErrorCode);
+    delete r.spawnErrorCode;
+    if (!retryable || attempt >= SPAWN_ATTEMPTS - 1) return r;
+    await new Promise((res) => setTimeout(res, 150 * (attempt + 1))); // 150ms / 300ms 退避
+  }
+}
+
+function spawnOnce({ command, args = [], cwd, timeoutMs = 30000, maxOut = 200000, env = {} }) {
   const t0 = Date.now();
   return new Promise((resolve) => {
     let child;
+    let sawSpawn = false;
     try {
       child = spawn(command, args, {
         cwd,
@@ -29,9 +45,10 @@ export function runCommand({ command, args = [], cwd, timeoutMs = 30000, maxOut 
         shell: false,
       });
     } catch (e) {
-      resolve({ code: -1, stdout: "", stderr: e.message, timedOut: false });
+      resolve({ code: -1, stdout: "", stderr: e.message, timedOut: false, spawnErrorCode: e.code });
       return;
     }
+    child.on("spawn", () => { sawSpawn = true; });
     const outChunks = [];
     const errChunks = [];
     let outBytes = 0;
@@ -51,15 +68,15 @@ export function runCommand({ command, args = [], cwd, timeoutMs = 30000, maxOut 
     child.stderr.on("data", (d) => {
       if (errBytes < maxOut * 2) { errChunks.push(d); errBytes += d.length; }
     });
-    const finish = (code, extraErr = "") => {
+    const finish = (code, extraErr = "", spawnErrorCode) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       const out = truncate(decodeOutput(Buffer.concat(outChunks)), maxOut);
       const err = truncate(decodeOutput(Buffer.concat(errChunks)) + extraErr, maxOut);
-      resolve({ code, stdout: out, stderr: err, timedOut, ms: Date.now() - t0 });
+      resolve({ code, stdout: out, stderr: err, timedOut, ms: Date.now() - t0, spawnErrorCode });
     };
-    child.on("error", (e) => finish(-1, e.message));
+    child.on("error", (e) => finish(-1, e.message, sawSpawn ? undefined : e.code));
     child.on("close", (code) => finish(code));
   });
 }
