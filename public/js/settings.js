@@ -4,7 +4,7 @@ import { api } from "./api.js";
 import { S, setMode, MODES, ACTION_META, DEFAULT_AUTO_APPROVE } from "./state.js";
 import { $, $$, el, esc, icon, toast } from "./ui.js";
 import { fillProviders, showThinking, setShowThinking, refreshCustomCommands, doCheck } from "./chat.js";
-import { brandChip } from "./picker.js";
+import { brandChip, chipOf } from "./picker.js";
 import { notifyOn, setNotifyOn, askPermission, notifyGranted } from "./notify.js";
 import { CATALOG, GROUPS, providerFromPreset, presetById, matchPreset, protocolForModel, normalizeBaseURL } from "./catalog.js";
 
@@ -445,7 +445,7 @@ function renderVendors(q) {
         <div class="vendor-grid">${x.items
           .map(
             (p) => `<button class="vendor" data-id="${p.id}">
-            <span class="brand-chip lg" style="background:${p.color};color:#fff">${esc(p.short)}</span>
+            ${chipOf(p, "brand-chip lg")}
             <span class="vendor-name">${esc(p.name)}</span>
             <span class="vendor-note">${p.noKey ? "不用钥匙" : (p.models || []).slice(0, 2).join(" / ") || "需填模型名"}</span>
           </button>`
@@ -481,7 +481,7 @@ function chooseVendor(id) {
   $("#wizSub").textContent = wizPreset ? `${wizPreset.name} · ${protoLabel(wizPreset.protocol)}` : "任何 OpenAI 兼容 / Anthropic 协议的服务都行";
 
   $("#wizChip").innerHTML = wizPreset
-    ? `<span class="brand-chip lg" style="background:${wizPreset.color};color:#fff">${esc(wizPreset.short)}</span>`
+    ? chipOf(wizPreset, "brand-chip lg")
     : `<span class="brand-chip lg" style="background:var(--hover);color:var(--muted)"><svg class="ic ic-sm"><use href="#i-plus"/></svg></span>`;
   $("#wizName").textContent = wizProv.name;
   $("#wizNote").textContent = wizPreset?.note || (wizPreset ? `地址：${wizPreset.baseURL}` : "协议选 OpenAI 兼容（绝大多数服务都走这个）");

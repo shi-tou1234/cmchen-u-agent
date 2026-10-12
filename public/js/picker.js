@@ -31,7 +31,15 @@ export function brandChip(p, cls = "brand-chip") {
   if (!pre) {
     return `<span class="${cls}" style="background:var(--hover);color:var(--muted)">${esc((p.name || "?").slice(0, 2).toUpperCase())}</span>`;
   }
-  return `<span class="${cls}" style="background:${pre.color};color:#fff">${esc(pre.short)}</span>`;
+  return chipOf(pre, cls);
+}
+
+// 厂商牌：有官方图标（simple-icons）就用图标，没有就用品牌色的字母牌
+export function chipOf(pre, cls = "brand-chip") {
+  if (pre?.icon) {
+    return `<span class="${cls} chip-ic" style="background:${pre.color};color:#fff" title="${esc(pre.name || "")}"><svg class="ic"><use href="#i-v-${esc(pre.icon)}"/></svg></span>`;
+  }
+  return `<span class="${cls}" style="background:${pre.color || "var(--hover)"};color:#fff" title="${esc(pre?.name || "")}">${esc((pre?.short || "?").slice(0, 3))}</span>`;
 }
 
 /* ---------- 模型通道 ---------- */
@@ -98,10 +106,12 @@ export function renderModeBtn() {
   $("#modeBtn").dataset.mode = S.mode;
   $("#modeBtn").title = m.name + "：" + m.desc;
 
-  const chip = $("#sbMode");
-  chip.dataset.mode = S.mode;
-  chip.title = m.name + " · " + m.desc + "（点一下换）";
-  chip.innerHTML = `${icon(m.icon, "ic ic-sm")}<b>${esc(m.short)}</b>${icon("chevron-down", "ic ic-sm caret")}`;
+  const chip = $("#sbMode"); // 老位置（状态条）已经撤了，留着兼容旧页面
+  if (chip) {
+    chip.dataset.mode = S.mode;
+    chip.title = m.name + " · " + m.desc + "（点一下换）";
+    chip.innerHTML = `${icon(m.icon, "ic ic-sm")}<b>${esc(m.short)}</b>${icon("chevron-down", "ic ic-sm caret")}`;
+  }
 
   $("#modeList").innerHTML = MODES.map(
     (x, i) => `<button class="pop-item ${x.id === S.mode ? "on" : ""}" data-i="${i}" role="option">
@@ -154,7 +164,8 @@ export function initPicker() {
   $("#modelBtn").onclick = (e) => { e.stopPropagation(); openPop("#modelBtn", "#modelPop"); };
   $("#modeBtn").onclick = (e) => { e.stopPropagation(); openPop("#modeBtn", "#modePop"); };
   // 状态条上的模式芯片：点它等同于点顶栏那个（面板锚在顶栏，位置更好找）
-  $("#sbMode").onclick = (e) => { e.stopPropagation(); openPop("#modeBtn", "#modePop"); };
+  const sb = $("#sbMode");
+  if (sb) sb.onclick = (e) => { e.stopPropagation(); openPop("#modeBtn", "#modePop"); };
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".pop") && !e.target.closest("#modelBtn") && !e.target.closest("#modeBtn") && !e.target.closest("#sbMode")) closeAll();
   });
