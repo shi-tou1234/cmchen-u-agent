@@ -918,3 +918,76 @@ test("v8.1 新增：从某条消息重来——后面的对话不再进上下文
 
   await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "" });
 });
+
+/* ===== v0.8.2：网关适配（OpenCode Go 这类：要会话头、地址可能被粘成整条接口地址） ===== */
+test("v8.2 新增：OpenCode Go 式网关——地址自动纠偏、会话标识自动带上、能真跑通", async () => {
+  // 假网关完全照 Go 的规则来：不是 Bearer sk-go-… 就 401；没带 x-opencode-session 就 400 MissingSessionID
+  const seen = [];
+  const gw = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      seen.push({ url: req.url, headers: req.headers, body });
+      const send = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+      if (!/^Bearer sk-go-/.test(String(req.headers.authorization || ""))) {
+        return send(401, { error: { type: "server_error", message: "Upstream request failed: Invalid credential" } });
+      }
+      if (!req.headers["x-opencode-session"]) {
+        return send(400, { type: "error", error: { type: "MissingSessionID", message: "Request is missing x-opencode-session" } });
+      }
+      if (req.url.endsWith("/models")) return send(200, { object: "list", data: [{ id: "glm-5.3" }, { id: "kimi-k3" }] });
+      if (req.url.endsWith("/chat/completions")) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "收到，我在" } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      return send(404, { error: { message: "not found" } });
+    });
+  });
+  const gwUrl = await new Promise((r) => gw.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${gw.address().port}`)));
+  try {
+    // 用户把文档里那条完整接口地址粘进了「服务地址」
+    const provider = {
+      name: "GoGate", protocol: "openai-chat", preset: "ocgo",
+      baseURL: `${gwUrl}/zen/go/v1/chat/completions`, model: "glm-5.3", secret: "sk-go-test",
+    };
+
+    const lm = await jjson("/api/list-models", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider }) });
+    assert.equal(lm.status, 200, JSON.stringify(lm.json));
+    assert.deepEqual(lm.json.models.map((m) => m.id), ["glm-5.3", "kimi-k3"]);
+    assert.equal(lm.json.base, `${gwUrl}/zen/go/v1`, "要多一层 /go 且不带接口尾巴");
+    assert.match(lm.json.note, /纠成/, "要告诉用户地址被纠正过");
+    assert.ok(seen.some((s) => s.url === "/zen/go/v1/models"), "请求要打到纠偏后的路径");
+
+    const t = await jjson("/api/test-provider", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider }) });
+    assert.equal(t.status, 200, JSON.stringify(t.json));
+    assert.match(t.json.sample, /收到，我在/);
+    assert.ok(seen.some((s) => s.url === "/zen/go/v1/chat/completions" && s.headers["x-opencode-session"]), "不带会话标识 Go 网关直接 400");
+    assert.match(String(seen.find((s) => s.url.endsWith("/chat/completions"))?.headers["user-agent"] || ""), /u-agent/, "要自报家门");
+
+    // 存成通道后，正常对话（对话路径也要带会话标识，且同一会话内要稳定）
+    await postSettings({ providers: [...EXAMPLE_PROVIDERS, provider], active: "GoGate", workspace: wsDir });
+    const mark = seen.length;
+    const r = await chat({ sessionId: "s-gogate", mode: "confirm", provider: "GoGate", message: { text: "你好" } });
+    assert.ok(r.events.some((e) => e.type === "assistant_message" && /收到，我在/.test(e.text || "")), "真跑一轮应该能拿到回复");
+    const chatReqs = seen.slice(mark).filter((s) => s.url.endsWith("/chat/completions"));
+    assert.ok(chatReqs.length >= 1, "对话请求应该打到网关上");
+    const sids = new Set(chatReqs.map((s) => s.headers["x-opencode-session"]));
+    assert.equal(sids.size, 1, "同一个会话内的会话标识要稳定（网关靠它做路由与缓存）");
+    assert.match([...sids][0], /s-gogate/, "会话标识直接用会话 id");
+
+    // 钥匙不对时给人话 + 指路（拿 Go 钥匙打 Zen 地址的经典坑）
+    const wrong = await jjson("/api/test-provider", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: { ...provider, secret: "sk-nope", baseURL: "https://opencode.ai/zen/v1" } }),
+    });
+    assert.equal(wrong.status, 400);
+    assert.match(wrong.json.error, /钥匙无效/);
+  } finally {
+    gw.close();
+  }
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+});

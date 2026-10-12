@@ -81,7 +81,7 @@ public\css\app.css     设计令牌（明暗两套）+ 组件样式 + 响应式
 public\js\ui.js        DOM/转义/Markdown 行式解析/Toast/图标
 public\js\api.js       后端接口封装（统一 401 未解锁回调）
 public\js\state.js     运行态单一数据源 S + 模式表 + 放行动作表
-public\js\catalog.js   模型厂商预设库（22 家，四组）
+public\js\catalog.js   模型厂商预设库（24 家，四组；含按模型分协议的网关）
 public\js\picker.js    顶栏两个弹出选择器：模型通道、权限模式（+ 状态条模式芯片）
 public\js\chat.js      消息流渲染、SSE、工具卡/计划卡、本轮改动卡（含撤销）、高危确认（可附言）、斜杠命令、附件、用量条、导出
 public\js\settings.js  设置面板：分类导航 + 分区卡 + 通道卡 + 目录选择 + 添加通道向导 + 自动放行 + 提醒 + 检查点占用
@@ -343,6 +343,19 @@ t 压缩指示语: /api/compact 的 instruction 进压缩提示；不带时不�
 u 界面实测（无头 Edge）：撤销两段确认、改动卡已撤销态、回放保持、检查点占用卡、@ 提及附内容、↑ 历史、粘贴清洗、/export，零 JS 报错
 v 回退对话: 回退后新请求里不再出现被丢的那句、回退点之前的还在、带一句说明；非 user 位置 400；未解锁 401；日志追加不删旧记录；文件没被动过
 ```
+
+### v8.2 追加：网关适配（OpenCode Zen / Go 这类"按模型分协议"的服务）
+
+领导实测「填了 OpenCode Go 的钥匙，拉不到模型、也连不上」，查下来是三件事叠在一起，全部修掉：
+
+- **地址不同**：Go 的接口是 `https://opencode.ai/zen/go/v1`，比 Zen 的 `https://opencode.ai/zen/v1` 多一层 `/go`；拿 Go 的钥匙打 Zen 地址会报 `Invalid credential`。→ 预设库补 `OpenCode Zen` / `OpenCode Go` 两家（聚合/中转组），地址、候选模型、说明都带好，向导里搜 "opencode" 就能选到
+- **网关强制要会话标识**：Go 要求每个会话带稳定的 `x-opencode-session` 头（否则 400 `MissingSessionID`），并要求客户端自报家门。→ `core/providers.mjs` 的 `buildHeaders()`：主机是 opencode.ai（或通道来自这两家预设）时自动带上 `x-opencode-session=<本次会话 id>`，同一会话内稳定；所有请求带 `user-agent: u-agent/<版本>`。别家厂商一个多余的头发都不加
+- **按模型分协议**：同一地址下 Claude 系走 `/messages`（Anthropic）、GPT/Grok 系走 `/responses`（Responses）、GLM/Kimi/DeepSeek/MiniMax 走 `/chat/completions`（OpenAI 兼容），Gemini 与 jev 走网关专用接口（本 agent 不支持）。→ `catalog.js` 的 `protocolForModel(modelId)`：向导里选中/输入模型即自动切协议并说明原因；已存在的通道若协议与模型不匹配，通道卡上出现「协议不对，点我改」一键修
+- **地址纠偏**：用户常把文档里整条接口地址（`…/v1/chat/completions`）粘进「服务地址」。→ `normalizeBase()`（前端 `normalizeBaseURL` 同一套规则）去掉尾巴上的端点路径，失焦时纠偏并明确告知；对话、连通测试、拉取清单三条路都走它，**已经存坏的通道不用重填也能自愈**
+- **`/v1` 不再叠两层**（真 bug）：anthropic 协议原来固定拼 `${base}/v1/messages`，地址本身带 `/v1` 时变成 `/v1/v1/messages`，网关直接掐连接。→ base 以 `/v1` 结尾时只拼 `/messages`
+- **拉清单更皮实**：`/api/list-models` 按协议排出候选地址逐个试（`{base}/models`、`{base}/v1/models`），返回 HTML 时直说"多半把服务地址填成了官网/控制台地址"，全失败时把**每个地址各自的结果**列出来；接受 `{data:[]}`、`{models:[]}`、裸数组三种形状
+- **报错说人话**：`friendlyUpstreamError()` 把 `MissingSessionID` / `Invalid credential` / 404 model 等翻成可操作的中文（并保留 HTTP 状态码与上游原文），其中钥匙类错误在 Zen 地址下会直接提示改用 Go 的地址
+- 验收：`test/providers.test.mjs`（地址纠偏、路径拼装、请求头、报错翻译）+ `test/catalog.test.mjs`（预设数、分协议映射、避重名）+ `test/server.test.mjs`（照 Go 规则搭的假网关：清单/连通/真跑一轮都通，且同一会话的会话标识稳定）+ 无头浏览器实测（搜得到两家、选 Claude 自动切 Anthropic、地址纠偏、不匹配徽标一键修），共 114 用例全绿、零 JS 报错
 
 ## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）
 

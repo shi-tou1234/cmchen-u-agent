@@ -9,22 +9,86 @@
 //   {type:"error", message} {type:"end", stopReason, toolCalls:[{id,name,args:object}]}
 import { truncate } from "./util.mjs";
 
-function endpoint(provider) {
-  const base = String(provider.baseURL || "").replace(/\/+$/, "");
-  const auth = provider.secret ? { Authorization: `Bearer ${provider.secret}` } : {}; // 空钥匙（如 Ollama）不发鉴权头
-  switch (provider.protocol) {
-    case "openai-chat":
-      return { url: `${base}/chat/completions`, headers: auth };
-    case "openai-responses":
-      return { url: `${base}/responses`, headers: auth };
-    case "anthropic":
-      return {
-        url: `${base}/v1/messages`,
-        headers: { ...(provider.secret ? { "x-api-key": provider.secret } : {}), "anthropic-version": "2023-06-01" },
-      };
-    default:
-      throw new Error(`未知协议 ${provider.protocol}`);
+export const UA = "u-agent/1.0"; // 网关（如 OpenCode Go）要求客户端自报家门，别用默认的 HTTP 库名
+
+// 服务地址纠偏：用户常常把整条接口地址粘进来（文档里就是这么列的），
+// 这里统一去掉尾巴上的端点路径，只留到版本号那一层。
+//   https://opencode.ai/zen/go/v1/chat/completions → https://opencode.ai/zen/go/v1
+//   https://api.deepseek.com/v1/                       → https://api.deepseek.com/v1
+export function normalizeBase(raw) {
+  let b = String(raw || "").trim().replace(/\/+$/, "");
+  b = b.replace(/\/(chat\/completions|responses|completions|messages|models)$/i, "");
+  return b.replace(/\/+$/, "");
+}
+
+// 有些网关按模型分协议（OpenCode Zen / Go 就是）：请求要带一个稳定的会话标识做路由与缓存。
+// 只对这类主机自动补，其它厂商一个多余的头发都不加。
+const SESSION_HOSTS = /(^|\.)opencode\.ai$/i;
+const SESSION_PRESETS = new Set(["oczen", "ocgo"]); // 预设库里的 OpenCode Zen / Go
+function hostOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
   }
+}
+
+// 统一构造请求头：鉴权 + 客户端标识 +（需要时）会话头 + 用户自定义头
+export function buildHeaders(provider, url) {
+  const h = {
+    "content-type": "application/json",
+    "user-agent": provider.userAgent || UA,
+  };
+  if (provider.protocol === "anthropic") {
+    if (provider.secret) h["x-api-key"] = provider.secret;
+    h["anthropic-version"] = "2023-06-01";
+  } else if (provider.secret) {
+    h.Authorization = `Bearer ${provider.secret}`; // 空钥匙（如 Ollama）不发鉴权头
+  }
+  const needsSession = SESSION_HOSTS.test(hostOf(url)) || SESSION_PRESETS.has(String(provider.preset || ""));
+  if (provider.sessionId && needsSession) h["x-opencode-session"] = String(provider.sessionId);
+  for (const [k, v] of Object.entries(provider.extraHeaders || {})) {
+    if (k && v !== undefined && v !== null) h[String(k)] = String(v);
+  }
+  return h;
+}
+
+export function endpoint(provider) {
+  const base = normalizeBase(provider.baseURL);
+  // anthropic 的路径本来就带 /v1；地址里已经有了就别再叠一层（否则 /v1/v1/messages，网关直接掐连接）
+  const anthropicPath = /\/v1$/i.test(base) ? "/messages" : "/v1/messages";
+  const path =
+    provider.protocol === "openai-chat"
+      ? "/chat/completions"
+      : provider.protocol === "openai-responses"
+      ? "/responses"
+      : provider.protocol === "anthropic"
+      ? anthropicPath
+      : null;
+  if (!path) throw new Error(`未知协议 ${provider.protocol}`);
+  const url = `${base}${path}`;
+  return { url, headers: buildHeaders(provider, url) };
+}
+
+// 网关给的原话常常太机器：翻译成人能照着改的句子；每句都带上 HTTP 状态码，便于排查
+export function friendlyUpstreamError(status, body, provider) {
+  const text = String(body || "");
+  const base = normalizeBase(provider?.baseURL);
+  const tail = truncate(text.trim(), 300);
+  const tag = `（HTTP ${status}）`;
+  if (/MissingSessionID/i.test(text)) {
+    return `这家网关要求请求带会话标识${tag}（u-agent 会自动补 x-opencode-session；见到这句说明地址或版本不对）：${tail}`;
+  }
+  if (status === 401 || status === 403 || /Invalid credential|invalid_api_key|Unauthorized|bad ?key/i.test(text)) {
+    const hint = /^https:\/\/opencode\.ai\/zen\/v1$/i.test(base)
+      ? "；如果你用的是 OpenCode Go 订阅，地址要写成 https://opencode.ai/zen/go/v1（比 Zen 多一层 /go）"
+      : "";
+    return `钥匙无效或没有这个模型的权限${tag}${hint}：${tail}`;
+  }
+  if ((status === 400 || status === 404) && /model|not supported|unknown|does not exist|no such/i.test(text)) {
+    return `这家服务不认这个模型，或该模型不走当前协议${tag}（有的网关按模型分协议：Claude 系选 Anthropic、GPT/Grok 系选 Responses、其余选 OpenAI 兼容）：${tail}`;
+  }
+  return `模型服务返回 HTTP ${status}：${tail || "（没有正文）"}`;
 }
 
 function dataUrl(img) {
@@ -166,13 +230,16 @@ async function* sseLines(res) {
   if (buf.trim().startsWith("data:")) yield buf.trim().slice(5).trim();
 }
 
-async function assertOk(res, protocol) {
+async function assertOk(res, provider) {
   if (res.ok) return;
   let detail = "";
   try {
-    detail = truncate(await res.text(), 800);
+    detail = await res.text();
   } catch {}
-  throw new Error(`模型服务返回 HTTP ${res.status}（${protocol}）：${detail || res.statusText}`);
+  const e = new Error(friendlyUpstreamError(res.status, detail, provider));
+  e.status = res.status; // 上层（连通测试/清单拉取）可以据此再加工
+  e.body = detail;
+  throw e;
 }
 
 // ---------- 三协议流解析 ----------
@@ -182,7 +249,7 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
   const reqBody = bodyOpenaiChat(provider, messages, tools);
   let res = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers,
     body: JSON.stringify(reqBody),
     signal,
   });
@@ -191,12 +258,12 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
     delete reqBody.stream_options;
     res = await fetch(url, {
       method: "POST",
-      headers: { "content-type": "application/json", ...headers },
+      headers,
       body: JSON.stringify(reqBody),
       signal,
     });
   }
-  await assertOk(res, "openai-chat");
+  await assertOk(res, provider);
   const acc = new Map(); // index → {id, name, args}
   let stop = "stop";
   for await (const data of sseLines(res)) {
@@ -243,11 +310,11 @@ async function* streamOpenaiResponses(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
   const res = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers,
     body: JSON.stringify(bodyOpenaiResponses(provider, messages, tools)),
     signal,
   });
-  await assertOk(res, "openai-responses");
+  await assertOk(res, provider);
   const calls = new Map(); // call_id → {name, args}
   let stop = "stop";
   for await (const data of sseLines(res)) {
@@ -292,11 +359,11 @@ async function* streamAnthropic(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
   const res = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers,
     body: JSON.stringify(bodyAnthropic(provider, messages, tools)),
     signal,
   });
-  await assertOk(res, "anthropic");
+  await assertOk(res, provider);
   const calls = new Map(); // index → {id, name, args}
   let stop = "stop";
   let curTool = null;

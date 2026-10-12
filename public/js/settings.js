@@ -6,7 +6,7 @@ import { $, $$, el, esc, icon, toast } from "./ui.js";
 import { fillProviders } from "./chat.js";
 import { brandChip } from "./picker.js";
 import { notifyOn, setNotifyOn, askPermission, notifyGranted } from "./notify.js";
-import { CATALOG, GROUPS, providerFromPreset, presetById, matchPreset } from "./catalog.js";
+import { CATALOG, GROUPS, providerFromPreset, presetById, matchPreset, protocolForModel, normalizeBaseURL } from "./catalog.js";
 
 const PANELS = [
   { id: "general", label: "通用", icon: "monitor" },
@@ -156,11 +156,15 @@ function renderProviders() {
   provs.forEach((p, ix) => {
     const preset = matchPreset(p);
     const ready = isReady(p);
+    // 有的网关按模型分协议：协议和模型名对不上时，卡片上直接给个一键改（多半就是「连不上」的原因）
+    const want = preset?.protocolPerModel ? protocolForModel(p.model) : null;
+    const badProto = want && want.protocol && want.protocol !== p.protocol;
     const node = el(`<div class="prov ${ready ? "ready" : ""}">
       <div class="prov-head">
         ${brandChip(p)}
         <span class="prov-name">${esc(p.name || "未命名")}</span>
         ${p.name === (S.active || "") ? `<span class="prov-tag on">在用</span>` : ""}
+        ${badProto ? `<button class="ghost-btn" data-act="fixproto">协议不对，点我改</button>` : ""}
         <span class="prov-meta">${esc(p.model || "未填模型")}${preset ? " · " + esc(preset.name) : ""}</span>
         <span class="grow"></span>
         <span class="prov-state ${stateLabel(p).cls}">${stateLabel(p).text}</span>
@@ -256,9 +260,55 @@ function renderProviders() {
     const read = () => readRow(node, p);
     node.querySelector(".nm").addEventListener("input", () => { read(); node.querySelector(".prov-name").textContent = p.name || "未命名"; markDirty(); });
     node.querySelector(".pt").addEventListener("change", () => { read(); renderProviders(); markDirty(); });
-    node.querySelector(".bu").addEventListener("input", () => { read(); markDirty(); });
-    node.querySelector(".mo").addEventListener("input", () => { read(); markDirty(); });
+
+    // 服务地址：把整条接口地址（…/chat/completions 这种）粘进来也能用，失焦时自动纠偏
+    const buEl = node.querySelector(".bu");
+    buEl.addEventListener("input", () => { read(); markDirty(); });
+    buEl.addEventListener("blur", () => {
+      const fixed = normalizeBaseURL(buEl.value);
+      if (fixed && fixed !== buEl.value.trim()) {
+        buEl.value = fixed;
+        read();
+        markDirty();
+        result.className = "test-result";
+        result.textContent = `服务地址已纠成 ${fixed}`;
+      }
+    });
+
+    // 网关按模型分协议：模型名一改就自动切协议（Claude→Anthropic、GPT/Grok→Responses、其余→OpenAI 兼容）
+    const moEl = node.querySelector(".mo");
+    const syncProtocol = () => {
+      if (!preset?.protocolPerModel) return;
+      const hit = protocolForModel(p.model);
+      if (!hit) return;
+      if (!hit.protocol) {
+        result.className = "test-result bad";
+        result.textContent = hit.note;
+        return;
+      }
+      if (hit.protocol !== p.protocol) {
+        p.protocol = hit.protocol;
+        node.querySelector(".pt").value = hit.protocol;
+        result.className = "test-result ok";
+        result.textContent = `这家网关按模型分协议，协议已自动改成「${protoLabel(hit.protocol)}」`;
+        markDirty();
+      }
+    };
+    moEl.addEventListener("input", () => { read(); markDirty(); });
+    moEl.addEventListener("change", syncProtocol);
+    moEl.addEventListener("blur", syncProtocol);
     node.querySelector(".ky").addEventListener("input", () => { read(); markDirty(); });
+
+    const fixBtn = node.querySelector('[data-act="fixproto"]');
+    if (fixBtn) {
+      fixBtn.onclick = (e) => {
+        e.stopPropagation();
+        p.protocol = want.protocol;
+        renderProviders();
+        markDirty();
+        toast(`协议已改成「${protoLabel(want.protocol)}」，点「测试连接」验一下`, "ok");
+      };
+    }
 
     box.appendChild(node);
   });
@@ -394,14 +444,35 @@ function chooseVendor(id) {
     .map((m) => `<button class="model-tag ${m === wizProv.model ? "on" : ""}" data-m="${esc(m)}">${esc(m)}</button>`)
     .join("");
   $("#wizTest").textContent = "";
+  applyModelProtocol(wizProv.model);
   $("#wizModels").onclick = (e) => {
     const b = e.target.closest(".model-tag");
     if (!b) return;
     $$(".model-tag", $("#wizModels")).forEach((x) => x.classList.remove("on"));
     b.classList.add("on");
     $("#wizModel").value = b.dataset.m;
+    applyModelProtocol(b.dataset.m);
   };
+  $("#wizModel").onchange = () => applyModelProtocol($("#wizModel").value.trim());
   setTimeout(() => (wizPreset?.noKey ? $("#wizModel") : $("#wizKey")).focus(), 60);
+}
+
+// 网关（OpenCode Zen / Go）按模型分协议：选中模型时自动把协议切对，并说清为什么
+function applyModelProtocol(modelId) {
+  if (!wizPreset?.protocolPerModel || !modelId) return;
+  const hit = protocolForModel(modelId);
+  if (!hit) return;
+  const box = $("#wizTest");
+  if (!hit.protocol) {
+    box.className = "test-result bad";
+    box.textContent = hit.note;
+    return;
+  }
+  if ($("#wizProto").value !== hit.protocol) {
+    $("#wizProto").value = hit.protocol;
+    box.className = "test-result ok";
+    box.textContent = `这家网关按模型分协议：${modelId} 已自动改用「${protoLabel(hit.protocol)}」`;
+  }
 }
 
 async function wizTest() {
@@ -651,6 +722,15 @@ export function initSettings() {
   };
   $("#wizTestBtn").onclick = wizTest;
   $("#wizFetch").onclick = wizFetchModels;
+  // 地址粘成整条接口地址（…/chat/completions）也能用：失焦自动纠偏并说明
+  $("#wizBase").addEventListener("blur", () => {
+    const fixed = normalizeBaseURL($("#wizBase").value);
+    if (fixed && fixed !== $("#wizBase").value.trim()) {
+      $("#wizBase").value = fixed;
+      $("#wizTest").className = "test-result";
+      $("#wizTest").textContent = `服务地址已纠成 ${fixed}`;
+    }
+  });
   $("#reTest").onclick = async () => {
     const p = provs.find((x) => x.name === S.active) || provs[0];
     if (!p) return toast("还没有通道", "err");
