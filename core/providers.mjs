@@ -70,7 +70,32 @@ export function endpoint(provider) {
   return { url, headers: buildHeaders(provider, url) };
 }
 
-// 网关给的原话常常太机器：翻译成人能照着改的句子；每句都带上 HTTP 状态码，便于排查
+// 网络层失败（连不上/被掐断/DNS/超时）翻译成人能照着做的句子。
+// 网关常常不回 HTTP 状态码而是直接掐连接，这时只有 e.cause.code 可看，必须摊开说。
+export function describeFetchError(err, url) {
+  const name = err?.name || "";
+  const cause = String(err?.cause?.code || err?.cause?.message || err?.cause || "");
+  const msg = String(err?.message || "fetch failed");
+  if (name === "TimeoutError" || /timeout/i.test(cause)) return `请求超时：${url}（网络太慢，或这家服务没在响应）`;
+  let hint = "";
+  if (/ENOTFOUND|EAI_AGAIN/i.test(cause)) hint = "（域名解析不了：没网、DNS 出问题，或这个域名需要代理才能访问）";
+  else if (/ECONNREFUSED/i.test(cause)) hint = "（对方端口没在听：地址或端口写错，或服务没启动——本机服务如 Ollama 要先跑起来）";
+  else if (/ECONNRESET|ETIMEDOUT|ERR_SSL|SSL|TLS|socket hang up|other side closed/i.test(cause)) hint = "（连上又被掐断：多半是需要代理、服务地址写错，或对方网关不认这个客户端）";
+  else if (/certificate|self-signed|self signed/i.test(cause)) hint = "（证书问题：本机时间不对或有中间人代理）";
+  return `连不上 ${url}${hint}原始错误：${cause || msg}`;
+}
+
+// 统一的 POST：网络层失败一律换成上面那句人话
+async function postStream(url, headers, body, signal) {
+  try {
+    return await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+  } catch (e) {
+    if (e?.name === "AbortError") throw e; // 用户主动停止，不改写
+    throw new Error(describeFetchError(e, url));
+  }
+}
+
+// 上游报错翻译成人话（含状态码，便于排查）
 export function friendlyUpstreamError(status, body, provider) {
   const text = String(body || "");
   const base = normalizeBase(provider?.baseURL);
@@ -217,9 +242,16 @@ async function* sseLines(res) {
   const decoder = new TextDecoder();
   let buf = "";
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      // 流跑到一半被掐断（网关超时、断网）：说清楚是"中途断了"，不是"连不上"
+      if (e?.name === "AbortError") throw e;
+      throw new Error(`回复中断：连接在半路被切断（${String(e?.cause?.code || e?.message || "terminated")}）——可以重发这一条，或把任务拆小一点`);
+    }
+    if (chunk.done) break;
+    buf += decoder.decode(chunk.value, { stream: true });
     let idx;
     while ((idx = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, idx).replace(/\r$/, "");
@@ -247,21 +279,11 @@ async function assertOk(res, provider) {
 async function* streamOpenaiChat(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
   const reqBody = bodyOpenaiChat(provider, messages, tools);
-  let res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(reqBody),
-    signal,
-  });
+  let res = await postStream(url, headers, reqBody, signal);
   if (res.status === 400) {
     // 某些兼容端点不认识 stream_options，去掉后重试一次
     delete reqBody.stream_options;
-    res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(reqBody),
-      signal,
-    });
+    res = await postStream(url, headers, reqBody, signal);
   }
   await assertOk(res, provider);
   const acc = new Map(); // index → {id, name, args}
@@ -308,12 +330,7 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
 
 async function* streamOpenaiResponses(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(bodyOpenaiResponses(provider, messages, tools)),
-    signal,
-  });
+  const res = await postStream(url, headers, bodyOpenaiResponses(provider, messages, tools), signal);
   await assertOk(res, provider);
   const calls = new Map(); // call_id → {name, args}
   let stop = "stop";
@@ -357,12 +374,7 @@ async function* streamOpenaiResponses(provider, messages, tools, signal) {
 
 async function* streamAnthropic(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(bodyAnthropic(provider, messages, tools)),
-    signal,
-  });
+  const res = await postStream(url, headers, bodyAnthropic(provider, messages, tools), signal);
   await assertOk(res, provider);
   const calls = new Map(); // index → {id, name, args}
   let stop = "stop";

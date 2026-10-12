@@ -355,7 +355,9 @@ v 回退对话: 回退后新请求里不再出现被丢的那句、回退点之�
 - **`/v1` 不再叠两层**（真 bug）：anthropic 协议原来固定拼 `${base}/v1/messages`，地址本身带 `/v1` 时变成 `/v1/v1/messages`，网关直接掐连接。→ base 以 `/v1` 结尾时只拼 `/messages`
 - **拉清单更皮实**：`/api/list-models` 按协议排出候选地址逐个试（`{base}/models`、`{base}/v1/models`），返回 HTML 时直说"多半把服务地址填成了官网/控制台地址"，全失败时把**每个地址各自的结果**列出来；接受 `{data:[]}`、`{models:[]}`、裸数组三种形状
 - **报错说人话**：`friendlyUpstreamError()` 把 `MissingSessionID` / `Invalid credential` / 404 model 等翻成可操作的中文（并保留 HTTP 状态码与上游原文），其中钥匙类错误在 Zen 地址下会直接提示改用 Go 的地址
-- 验收：`test/providers.test.mjs`（地址纠偏、路径拼装、请求头、报错翻译）+ `test/catalog.test.mjs`（预设数、分协议映射、避重名）+ `test/server.test.mjs`（照 Go 规则搭的假网关：清单/连通/真跑一轮都通，且同一会话的会话标识稳定）+ 无头浏览器实测（搜得到两家、选 Claude 自动切 Anthropic、地址纠偏、不匹配徽标一键修），共 114 用例全绿、零 JS 报错
+- **网络层失败也不许甩「fetch failed」**：`describeFetchError()` 按 `cause.code` 分辨 —— `ENOTFOUND` 说"域名解析不了（没网/DNS/需要代理）"、`ECONNREFUSED` 说"对方端口没在听（地址端口写错或本机服务没启动）"、`ECONNRESET` 说"连上又被掐断（需要代理/地址错/网关不认这个客户端）"、超时与证书问题各自单说；流跑到一半被切断另有说法（"回复中断…可以重发这一条"），别和"连不上"混为一谈。对话、连通测试、拉清单三条路都用它
+- **测试必须离线**：不许在测试里打真实公网（换个网络环境就假失败）—— 网关行为用本地假网关复刻（照 Go 的规则：不带 `x-opencode-session` 就 400、钥匙不对就 401），纯字符串的指路逻辑放 `providers.test.mjs` 直测函数
+- 验收：`test/providers.test.mjs`（地址纠偏、路径拼装、请求头、报错翻译）+ `test/catalog.test.mjs`（预设数、分协议映射、避重名）+ `test/server.test.mjs`（照 Go 规则搭的假网关：清单/连通/真跑一轮都通，且同一会话的会话标识稳定）+ 无头浏览器实测（搜得到两家、选 Claude 自动切 Anthropic、地址纠偏、不匹配徽标一键修），共 116 用例全绿、零 JS 报错
 
 ## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）
 

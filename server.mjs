@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Registry } from "./core/tools.mjs";
 import { runAgent } from "./core/agent-loop.mjs";
-import { streamChat, normalizeBase, buildHeaders } from "./core/providers.mjs";
+import { streamChat, normalizeBase, buildHeaders, describeFetchError } from "./core/providers.mjs";
 import { buildHistory, budgetOf, compactPrompt } from "./core/context.mjs";
 import { Sessions } from "./core/sessions.mjs";
 import { ConfirmGate } from "./core/confirm.mjs";
@@ -23,7 +23,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.8.2";
+const VERSION = "0.8.3";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -745,7 +745,7 @@ const server = http.createServer(async (req, res) => {
           }
           return sendJson(res, 200, { models: ids.map((id) => ({ id })), count: ids.length, base, note: base !== String(p.baseURL || "").replace(/\/+$/, "") ? `已把服务地址纠成：${base}` : "" });
         } catch (e) {
-          tried.push(`${url} → ${e.name === "TimeoutError" ? "请求超时（15 秒）" : e.message}`);
+          tried.push(`${url} → ${describeFetchError(e, url)}`);
         }
       }
       return sendJson(res, 400, {
