@@ -321,7 +321,12 @@ async function selfCheck() {
   $("#lockForm").onsubmit = (e) => { e.preventDefault(); goLock(); };
   document.documentElement.dataset.uaReady = "1"; // 告诉看门狗：脚本跑起来了
 
-  net.onLocked = () => showLock(false);
+  net.onLocked = () => {
+    // 锁屏已经显示时不要再重置它：重复 showLock 会清空正在输入的密码、
+    // 把「设置密码」界面强行切回「输入密码」。只在锁屏藏起来（解锁态失效）时才弹出
+    if (!$("#lock").classList.contains("hide")) return;
+    showLock(false);
+  };
   const steps = [
     ["主题", initTheme],
     ["对话区", chat.initChat],

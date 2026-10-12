@@ -914,6 +914,9 @@ function renderRunChip() {
 // 后台任务：状态条上一个芯片，点开看列表、输出尾巴与停止按钮
 let jobsPanelOpen = false;
 export async function refreshJobs() {
+  // 未解锁前不轮询：这个请求在锁屏期间只会拿回 401，
+  // 而 401 会触发锁屏重置——把人正在输入的密码一遍遍清空（曾把人挡在门外登不进去）
+  if (!S.ready) return;
   const chip = $("#sbJobs");
   if (!chip) return;
   try {
