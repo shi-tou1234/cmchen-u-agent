@@ -21,6 +21,7 @@ export class Sessions {
   }
 
   append(id, event) {
+    if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true }); // 运行中目录被删时自愈
     fs.appendFileSync(this.fileOf(id), JSON.stringify({ ts: nowTs(), ...event }) + "\n", "utf8");
   }
 

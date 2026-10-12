@@ -308,6 +308,15 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, maskState(st));
     }
     if (req.method === "GET" && u.pathname === "/api/sessions") return sendJson(res, 200, sessions.list());
+    if (req.method === "DELETE" && u.pathname === "/api/session") {
+      const id = u.searchParams.get("id") || "";
+      try {
+        fs.rmSync(sessions.fileOf(id), { force: true });
+      } catch {
+        return sendJson(res, 404, { error: "会话不存在" });
+      }
+      return sendJson(res, 200, { ok: true });
+    }
     if (req.method === "GET" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
       let events = [];
