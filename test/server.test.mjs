@@ -875,3 +875,46 @@ test("v8 新增：/compact 可以点名保住什么", async () => {
 
   await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "" });
 });
+
+/* ===== v0.8.1：只回退对话（不动文件） ===== */
+test("v8.1 新增：从某条消息重来——后面的对话不再进上下文，文件改动不受影响", async () => {
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Mock", workspace: wsDir, assist: "" });
+  const sid = "s-rewind-" + Date.now().toString(36); // 每次跑用新会话，免得旧记录累积把断言撑爆
+  fs.writeFileSync(path.join(wsDir, "keep-me.txt"), "别动我", "utf8");
+  for (const t of ["第一句：看看工作区", "第二句：记一下重点", "第三句：这句我反悔了"]) {
+    await chat({ sessionId: sid, message: { text: t }, mode: "confirm", provider: "Up" });
+  }
+  const before = await jjson("/api/session?id=" + encodeURIComponent(sid));
+  const users = before.json.events.filter((e) => e.type === "user");
+  assert.equal(users.length, 3);
+  const third = before.json.events.findIndex((e) => e.type === "user" && e.text.includes("反悔"));
+  const second = before.json.events.findIndex((e) => e.type === "user" && e.text.includes("第二句"));
+
+  // 回退到第二条：第三条（含它之后的回复）应被丢掉
+  const rw = await jjson("/api/rewind", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, atIndex: second }) });
+  assert.equal(rw.status, 200, JSON.stringify(rw.json));
+  assert.ok(rw.json.dropped >= 2, `应丢掉第三条及其回复，实际 ${rw.json.dropped}`);
+  assert.ok(rw.json.budget.chars > 0, "回退后要带回新的上下文用量");
+
+  // 日志里留痕（追加式，不删旧记录），文件没被动过
+  const after = await jjson("/api/session?id=" + encodeURIComponent(sid));
+  assert.ok(after.json.events.some((e) => e.type === "rewind" && e.atIndex === second), "回退要写进会话日志");
+  assert.equal(after.json.events.length > before.json.events.length, true, "日志是追加的，旧记录仍在（可审计）");
+  assert.equal(fs.readFileSync(path.join(wsDir, "keep-me.txt"), "utf8"), "别动我", "回退对话不动文件");
+
+  // 真正生效：下一次请求的上下文里不应再出现被丢掉的那句
+  await chat({ sessionId: sid, message: { text: "换个方向问" }, mode: "confirm", provider: "Up" });
+  const last = UP.requests[UP.requests.length - 1];
+  const body = JSON.stringify(last.body || last);
+  assert.ok(!/反悔/.test(body), "被回退的那句不许再发给模型");
+  assert.match(body, /第二句/, "回退点之前的对话要留着");
+  assert.match(body, /回退/, "要留一句说明告诉模型上下文被裁剪过");
+
+  // 边界：只能从「你发的消息」处回退
+  const bad = await jjson("/api/rewind", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, atIndex: 0 }) });
+  assert.equal(bad.status, 400, "从非用户消息处回退要拒绝");
+  const raw = await fetch(`${BASE}/api/rewind`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, atIndex: second }) });
+  assert.equal(raw.status, 401, "未解锁不许回退");
+
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "" });
+});

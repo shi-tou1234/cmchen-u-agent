@@ -4,10 +4,25 @@ export const BUDGET_CHARS = 24000; // 估算超此值建议压缩
 
 export const estTokens = (text) => Math.ceil(String(text || "").length / CHARS_PER_TOKEN);
 
+// 回退（rewind）标记：每条记录 {atIndex: 回退到的事件下标, marker: 标记自身的位置}
+// 落在 (atIndex, marker) 区间里的事件都是"被用户丢掉的对话"——日志仍留着（追加式、可审计），
+// 但重建上下文与界面回放都不再理它们。多条回退标记各管各的区间。
+export function rewindRanges(events) {
+  const out = [];
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (ev.type === "rewind" && Number.isInteger(ev.atIndex)) out.push({ atIndex: ev.atIndex, marker: i });
+  }
+  return out;
+}
+
+export const isDropped = (ranges, i) => ranges.some((r) => i > r.atIndex && i < r.marker);
+
 // 会话事件 → 统一消息数组。
 // 轮次归属：assistant_message 与紧随的 tool_call/tool_result 属同一轮，合并成
 // assistant{text, toolCalls} + tool 消息各一条，避免把一个回合拆成多条 assistant。
 // 若有 compact 事件：atIndex 之前的事件用摘要替代。
+// 若有 rewind 事件：被回退掉的那段直接跳过，并在原位留一句系统提示。
 export function buildHistory(events) {
   let compact = null;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -16,6 +31,7 @@ export function buildHistory(events) {
       break;
     }
   }
+  const ranges = rewindRanges(events);
   const msgs = [];
   let cur = null; // 当前 assistant 回合 {text, toolCalls[]}
   const flushCur = () => {
@@ -26,8 +42,14 @@ export function buildHistory(events) {
   };
   for (let i = 0; i < events.length; i++) {
     if (compact && i < compact.atIndex) continue;
+    if (isDropped(ranges, i)) continue;
     const ev = events[i];
     switch (ev.type) {
+      case "rewind":
+        // 回退点到标记之间没有留下任何上下文——给模型一句说明，免得它以为对话是断的
+        flushCur();
+        msgs.push({ role: "system", text: "【用户在此处回退过对话：这之后的内容已被丢弃，不属当前上下文】" });
+        break;
       case "user":
         flushCur();
         msgs.push({ role: "user", text: ev.text || "", images: ev.images || [] });

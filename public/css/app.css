@@ -307,6 +307,17 @@ ul.dots li { margin: 3px 0; }
 .msg { margin-bottom: 22px; }
 .msg-row { display: flex; gap: 10px; align-items: flex-start; }
 .msg-user { display: flex; justify-content: flex-end; }
+/* 从这儿重来：回退对话（只影响上下文，不动文件）。平时藏起来，鼠标移到这条消息上才出现 */
+.rw-btn { order: -1; align-self: center; margin-right: 8px; height: 24px; padding: 0 8px; font-size: 11.5px; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer; opacity: 0; transition: opacity .15s;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--muted); }
+.msg-user:hover .rw-btn, .rw-btn:focus-visible { opacity: 1; }
+.rw-btn:hover { color: var(--fg); background: var(--hover); }
+.rw-btn.armed { opacity: 1; color: var(--danger); background: var(--danger-soft); border-color: transparent; }
+@media (hover: none) { .rw-btn { opacity: 1; } }
+.rewind-line { display: flex; align-items: center; gap: 8px; margin: 4px 0 22px; padding: 7px 12px; font-size: 12px;
+  color: var(--muted); border: 1px dashed var(--line); border-radius: var(--r-md); background: var(--surface-2); }
+.rewind-line .ic { color: var(--accent); flex: none; }
 .msg-user .bubble { max-width: 84%; background: var(--accent-soft); border: 1px solid transparent;
   border-radius: 16px 16px 4px 16px; padding: 9px 14px; white-space: pre-wrap; word-break: break-word; }
 .msg-user.empty .bubble { background: var(--surface); border-color: var(--line); }

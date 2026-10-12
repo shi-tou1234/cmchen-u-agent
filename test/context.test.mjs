@@ -72,3 +72,51 @@ test("systemPrompt 注入：记忆 / 计划 / AGENTS.md", () => {
   assert.match(sp, /本项目用 pnpm 构建/);
   assert.match(sp, /第一步/);
 });
+
+test("rewind：被回退的那段不进上下文，原位留一句说明", async () => {
+  const { buildHistory, rewindRanges, isDropped } = await import("../core/context.mjs");
+  const ev = (type, extra = {}, ts = 1) => ({ ts, type, ...extra });
+  const events = [
+    ev("user", { text: "第一轮：查目录" }),
+    ev("assistant_message", { text: "目录如下…" }),
+    ev("user", { text: "第二轮：改配置" }),
+    ev("assistant_message", { text: "改好了" }),
+    ev("user", { text: "第三轮：删库" }),
+    ev("tool_call", { id: "t1", name: "fs_delete", args: { path: "a.txt" } }),
+    ev("tool_result", { id: "t1", name: "fs_delete", text: "已删除" }),
+    ev("assistant_message", { text: "删完了" }),
+    ev("rewind", { atIndex: 3, dropped: 4 }), // 回退到第二轮助手回复之后
+  ];
+  const ranges = rewindRanges(events);
+  assert.equal(ranges.length, 1);
+  assert.equal(isDropped(ranges, 4), true, "第三轮用户消息应被丢掉");
+  assert.equal(isDropped(ranges, 7), true, "丢弃区间的助手回复也应被丢掉");
+  assert.equal(isDropped(ranges, 3), false, "回退点之前的不动");
+  assert.equal(isDropped(ranges, 8), false, "标记自身不算被丢");
+
+  const msgs = buildHistory(events);
+  const texts = msgs.map((m) => m.text || "").join(" | ");
+  assert.ok(texts.includes("第二轮：改配置"), "回退点之前的对话要留下");
+  assert.ok(!texts.includes("第三轮：删库"), "回退点之后的对话不许进上下文");
+  assert.ok(!texts.includes("已删除"), "被丢掉那段的工具结果也不许进");
+  assert.ok(msgs.some((m) => m.role === "system" && /回退/.test(m.text)), "要留一句说明，免得模型以为对话断了");
+});
+
+test("rewind：回退后又聊新的，新内容正常进上下文", async () => {
+  const { buildHistory } = await import("../core/context.mjs");
+  const ev = (type, extra = {}) => ({ ts: 1, type, ...extra });
+  const events = [
+    ev("user", { text: "旧话题" }),
+    ev("assistant_message", { text: "旧回复" }),
+    ev("user", { text: "走错方向了" }),
+    ev("assistant_message", { text: "错误回复" }),
+    ev("rewind", { atIndex: 1, dropped: 2 }),
+    ev("user", { text: "换个问法" }),
+    ev("assistant_message", { text: "新回复" }),
+  ];
+  const msgs = buildHistory(events);
+  const texts = msgs.map((m) => m.text || "").join(" | ");
+  assert.ok(texts.includes("旧话题") && texts.includes("旧回复"));
+  assert.ok(!texts.includes("错误回复"));
+  assert.ok(texts.includes("换个问法") && texts.includes("新回复"), "回退之后聊的算数");
+});
