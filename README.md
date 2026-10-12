@@ -44,14 +44,18 @@ runtime|data|config.json   运行时与数据（不进 git）
 
 ## 测试
 
-`runtime\node\node.exe --test test/*.test.mjs` —— 37 个用例：三协议流解析、沙箱越界、五档门禁、确认闸、fs/git/shell/web 工具、服务器端到端（含图片与模式拦截）。
+`runtime\node\node.exe --test test/*.test.mjs` —— 56 个用例：三协议流解析、沙箱越界、五档门禁、确认闸、fs/git/shell/web 工具、多轮上下文重建、压缩摘要替换、diff 预览、计划/记忆/重命名、服务器端到端（含图片、模式拦截与真上游捕获）。
 
 ## 已知限制
 
-- 目标机需能访问所选模型服务（联网）；Mock 模式离线可用
+- 目标机需能访问所选模型服务（联网）；Mock 模式离线可用；装 Ollama 可完全离线（预置通道已带，模型自备）
 - 目标机使用 git 工具需其装有 git；钥匙加密存于 U 盘 `data\vault.bin`（网页里不可见、文件不存明文，但属防偷看级防护，U 盘仍别外借）
 - 忘记启动密码：删掉 U 盘 `data\lock.json` 重新设置
 - shell 30 秒超时、输出 200KB 截断；只支持 Win10/11 x64
+
+## Roadmap（对标 codex，已记账待排）
+
+MCP 工具服务器接入、Skills 技能包、后台常驻 shell（/ps）、OAuth 订阅登录（不填钥匙用会员）、会话分叉（/fork）。
 
 ## License
 

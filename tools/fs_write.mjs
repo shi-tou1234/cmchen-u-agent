@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveInside } from "../core/sandbox.mjs";
+import { makeDiff, diffStat } from "../core/diff.mjs";
 import { truncate } from "../core/util.mjs";
 
 export default {
@@ -22,6 +23,14 @@ export default {
       content: { type: "string", description: "完整文件内容（UTF-8 文本）" },
     },
     required: ["path", "content"],
+  },
+  // 覆盖已有文件时给网页弹窗提供 diff 预览
+  async preview(args, ctx) {
+    const p = resolveInside([ctx.workspace, ctx.uaHome], args.path, ctx.workspace);
+    if (!fs.existsSync(p)) return { kind: "info", note: `新建文件：${p}` };
+    const old = fs.readFileSync(p, "utf8");
+    const d = makeDiff(old, args.content ?? "");
+    return { ...d, stat: diffStat(d.lines || []), path: p, note: d.note };
   },
   async run(args, ctx) {
     const p = resolveInside([ctx.workspace, ctx.uaHome], args.path, ctx.workspace);
