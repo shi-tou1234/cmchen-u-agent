@@ -108,6 +108,7 @@
     <header class="topbar">
       <button class="icon-btn hide-wide" id="menuBtn" aria-label="会话列表"><svg class="ic"><use href="#i-menu"/></svg></button>
       <h2 class="topbar-title" id="topTitle">新会话</h2>
+      <span class="run-chip" id="runChip" hidden><span class="dot"></span><span id="runText">运行中</span><button id="runStop" title="停止这一轮">停止</button></span>
       <div class="grow"></div>
       <div class="pop-anchor">
         <button class="tool-pill" id="modelBtn" aria-haspopup="listbox" aria-expanded="false">
@@ -227,6 +228,19 @@
                 <button class="btn btn-ghost" id="notifyTest">试发一条</button>
               </div>
               <p class="field-help" id="notifyHelp">浏览器会问一次「是否允许通知」；拒绝了也不要紧，标题照样会闪。换台电脑要重新允许一次。</p>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h3>对话显示</h3>
+              <p>只影响这台电脑上的显示，不写进 U 盘数据；对话里输入 <code>/thinking</code>、<code>/details</code> 也能随时切</p>
+            </div>
+            <div class="card-body">
+              <div class="row-between">
+                <label class="switch"><input type="checkbox" id="thinkOn"><span class="track"></span><b id="thinkState">开启</b></label>
+                <span class="field-help">显示模型的思考过程（会以「已思考 N 秒」的小块出现，点开可看全过程）</span>
+              </div>
             </div>
           </div>
 

@@ -49,13 +49,14 @@ export const api = {
   saveMemory: (text) => post("/api/memory", { text }),
 
   sessions: () => get("/api/sessions"),
-  session: (id) => get("/api/session?id=" + encodeURIComponent(id)),
+  session: (id, provider) => get("/api/session?id=" + encodeURIComponent(id) + (provider ? "&provider=" + encodeURIComponent(provider) : "")),
   renameSession: (id, title) => post("/api/session-rename", { id, title }),
   dropSession: (id) => req("/api/session?id=" + encodeURIComponent(id), { method: "DELETE" }),
 
   confirm: (confirmId, approve, note) => post("/api/confirm", { confirmId, approve, note: note || "" }),
   abort: (sessionId) => post("/api/abort", { sessionId }),
   compact: (sessionId, provider, instruction) => post("/api/compact", { sessionId, provider, instruction: instruction || "" }),
+  modelInfo: (provider) => post("/api/model-info", { provider }),
   rewind: (sessionId, atIndex) => post("/api/rewind", { sessionId, atIndex }),
   testProvider: (provider) => post("/api/test-provider", { provider }),
   listModels: (provider) => post("/api/list-models", { provider }),

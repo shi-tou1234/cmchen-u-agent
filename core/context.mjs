@@ -1,8 +1,23 @@
 // 对话历史重建 + 上下文预算 + 压缩标记处理。core/context.mjs（纯函数，好测）
-const CHARS_PER_TOKEN = 2.5;
-export const BUDGET_CHARS = 24000; // 估算超此值建议压缩
 
-export const estTokens = (text) => Math.ceil(String(text || "").length / CHARS_PER_TOKEN);
+// token 估算：中日韩字符基本 1 字 = 1 token，其余文字约 3.6 字符 = 1 token。
+// （原来一律按 2.5 字/token 估，中文场景会低估、代码场景会高估，两个方向都影响压缩时机）
+const CJK_RE = /[\u2E80-\uD7FF\uF900-\uFAFF\uFF00-\uFFEF]/;
+export function estTokens(text) {
+  const s = String(text ?? "");
+  let cjk = 0;
+  let n = 0;
+  for (const ch of s) {
+    n++;
+    if (CJK_RE.test(ch)) cjk++;
+  }
+  return Math.ceil(cjk + (n - cjk) / 3.6);
+}
+
+// 兜底预算（认不出模型时用）：≈ 200k 窗口留 25% 给输出与工具结果
+export const DEFAULT_LIMIT_TOKENS = 150000;
+// 老接口保留：有些地方只需要一个"大概多少字"的量级概念
+export const BUDGET_CHARS = Math.round((DEFAULT_LIMIT_TOKENS / 0.75) * 2);
 
 // 回退（rewind）标记：每条记录 {atIndex: 回退到的事件下标, marker: 标记自身的位置}
 // 落在 (atIndex, marker) 区间里的事件都是"被用户丢掉的对话"——日志仍留着（追加式、可审计），
@@ -58,7 +73,8 @@ export function buildHistory(events) {
         // 独立回复：上一个回合已带着文本但无工具（罕见）时先固化；然后开始本回合
         if (cur && cur.text && !cur.toolCalls.length) flushCur();
         if (cur && cur.toolCalls.length) flushCur(); // 工具回合已收尾又来文本 = 新一轮
-        cur = { text: ev.text || "", toolCalls: [] };
+        // thinking：只有 anthropic 开了思考才需要，下一轮要原样带回去（含签名），否则 API 会拒
+        cur = { text: ev.text || "", toolCalls: [], ...(ev.thinking?.text ? { thinking: ev.thinking } : {}) };
         break;
       case "tool_call":
         if (!cur) cur = { text: "", toolCalls: [] };
@@ -77,14 +93,36 @@ export function buildHistory(events) {
   return msgs;
 }
 
-export function budgetOf(messages) {
+// 预算：按「这个模型真实能吃多少 token」算占比，而不是拿一个写死的字数上限吓唬人。
+// opts: { limitTokens 可用预算, windowTokens 模型窗口 }
+export function budgetOf(messages, opts = {}) {
+  const limitTokens = Number(opts.limitTokens) > 0 ? Number(opts.limitTokens) : DEFAULT_LIMIT_TOKENS;
+  const windowTokens = Number(opts.windowTokens) > 0 ? Number(opts.windowTokens) : limitTokens;
   let chars = 0;
-  for (const m of messages) {
+  let tokens = 0;
+  for (const m of messages || []) {
     chars += (m.text || "").length;
-    if (m.toolCalls) for (const t of m.toolCalls) chars += JSON.stringify(t.args || {}).length + t.name.length;
-    if (m.images?.length) chars += m.images.length * 1000; // 图片按定值估算
+    tokens += estTokens(m.text) + 4; // 每条消息一点固定开销
+    if (m.toolCalls?.length) {
+      const j = JSON.stringify(m.toolCalls);
+      chars += j.length;
+      tokens += estTokens(j);
+    }
+    if (m.images?.length) {
+      chars += m.images.length * 1000;
+      tokens += m.images.length * 900; // 图片按 900 token/张估（约 1MP）
+    }
   }
-  return { chars: Math.round(chars), tokens: Math.ceil(chars / CHARS_PER_TOKEN), over: chars > BUDGET_CHARS };
+  const pct = limitTokens ? Math.round((tokens / limitTokens) * 100) : 0;
+  return {
+    chars: Math.round(chars),
+    tokens,
+    limitTokens,
+    windowTokens,
+    pct,
+    warn: tokens > limitTokens * 0.8, // 到 80% 就该提醒压缩了
+    over: tokens > limitTokens,
+  };
 }
 
 // 生成给模型看的压缩请求（保留最近 keepTail 条消息不动；instruction = 用户点名要保住什么）

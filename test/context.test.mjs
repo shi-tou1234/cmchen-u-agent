@@ -43,9 +43,21 @@ test("buildHistory：compact 之前的轮次被摘要替代", () => {
 
 test("budgetOf / estTokens", () => {
   assert.equal(estTokens("12345"), 2);
-  const b = budgetOf([{ role: "user", text: "x".repeat(60000) }]);
+  // 中日韩字符按 1 字 1 token 估（旧版按 2.5 字/token 一律折算，中文场景会低估）
+  assert.equal(estTokens("你好世界"), 4);
+  assert.ok(estTokens("中".repeat(100)) > estTokens("x".repeat(100)));
+  // 预算按传入的模型额度算；不传就用兜底额度
+  const b = budgetOf([{ role: "user", text: "x".repeat(60000) }], { limitTokens: 10000 });
   assert.ok(b.over);
+  assert.equal(b.limitTokens, 10000);
   assert.ok(b.chars >= 60000);
+  assert.ok(b.pct >= 100);
+  // 大窗口模型下同样内容不该再喊"要压缩了"
+  const roomy = budgetOf([{ role: "user", text: "x".repeat(60000) }], { limitTokens: 750000, windowTokens: 1000000 });
+  assert.equal(roomy.over, false);
+  assert.equal(roomy.warn, false);
+  assert.equal(roomy.windowTokens, 1000000);
+  assert.ok(roomy.pct < 10);
 });
 
 test("compactPrompt：保留最近几条不动，旧内容进提示词", () => {

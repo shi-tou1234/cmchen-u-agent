@@ -212,3 +212,88 @@ test("网络层失败也要说人话（不能只甩一句 fetch failed）", asyn
   assert.match(e.message, /连不上/);
   assert.ok(!/^fetch failed$/.test(e.message), "不许只留 fetch failed");
 });
+
+/* ===== v0.9：思考过程（reasoning）解析与回传 ===== */
+test("openai-chat：reasoning_content 走思考通道，不混进正文", async () => {
+  const up = await mockUpstream((req, res) =>
+    sse(res, [
+      { choices: [{ delta: { reasoning_content: "先想想…" } }] },
+      { choices: [{ delta: { content: "答案是 42。" } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ])
+  );
+  const provider = { protocol: "openai-chat", baseURL: up.url, model: "deepseek-v4-pro", secret: "k" };
+  const evs = await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+  assert.equal(evs.filter((e) => e.type === "reasoning").map((e) => e.delta).join(""), "先想想…");
+  assert.equal(evs.filter((e) => e.type === "text").map((e) => e.delta).join(""), "答案是 42。");
+  await up.close();
+});
+
+test("openai-responses：思考摘要字段也认，且请求里带 reasoning 摘要开关", async () => {
+  const up = await mockUpstream((req, res) => {
+    const b = up.requests[up.requests.length - 1].body;
+    assert.equal(b.reasoning?.summary, "auto", "要主动要思考摘要");
+    sse(res, [
+      { type: "response.reasoning_summary_text.delta", delta: "权衡了一下" },
+      { type: "response.output_text.delta", delta: "结论如下" },
+      { type: "response.completed", response: { status: "completed", usage: { input_tokens: 1, output_tokens: 2 } } },
+    ]);
+  });
+  const provider = { protocol: "openai-responses", baseURL: up.url, model: "gpt-5.6-sol", secret: "k" };
+  const evs = await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+  assert.equal(evs.filter((e) => e.type === "reasoning").map((e) => e.delta).join(""), "权衡了一下");
+  assert.equal(evs.filter((e) => e.type === "text").map((e) => e.delta).join(""), "结论如下");
+  await up.close();
+});
+
+test("anthropic：思考流解析 + 签名，下一轮把 thinking 块原样带回", async () => {
+  const up = await mockUpstream((req, res) =>
+    sse(res, [
+      { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+      { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+      { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "我在想：先看目录。" } },
+      { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "SIG-ABC" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "text" } },
+      { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "答案是 42。" } },
+      { type: "content_block_stop", index: 1 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } },
+      { type: "message_stop" },
+    ])
+  );
+  const provider = { protocol: "anthropic", baseURL: up.url, model: "claude-sonnet-5-5", secret: "k" };
+  const evs = await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+  assert.equal(evs.filter((e) => e.type === "reasoning").map((e) => e.delta).join(""), "我在想：先看目录。");
+  const end = evs.find((e) => e.type === "end");
+  assert.equal(end.thinking.text, "我在想：先看目录。");
+  assert.equal(end.thinking.signature, "SIG-ABC", "签名要留下，多轮必须带回去");
+  // 第一轮请求体：开了思考（模型表说支持），且 max_tokens > 思考预算
+  const first = up.requests[0].body;
+  assert.ok(first.thinking?.budget_tokens >= 1024, "anthropic 的思考要显式开");
+  assert.ok(first.max_tokens > first.thinking.budget_tokens, "max_tokens 必须大于思考预算");
+  // 第二轮：thinking 块（含签名）要出现在 assistant 消息的最前面
+  await collect(streamChat(provider, [{ role: "user", text: "hi" }, { role: "assistant", text: "答案是 42。", thinking: end.thinking }, { role: "user", text: "再来" }], []));
+  const asst = up.requests[1].body.messages.find((m) => m.role === "assistant");
+  assert.equal(asst.content[0].type, "thinking");
+  assert.equal(asst.content[0].thinking, "我在想：先看目录。");
+  assert.equal(asst.content[0].signature, "SIG-ABC");
+  assert.equal(asst.content[1].type, "text");
+  await up.close();
+});
+
+test("anthropic：显式关掉思考就不再发 thinking 参数", async () => {
+  const up = await mockUpstream((req, res) => {
+    assert.equal(up.requests[0].body.thinking, undefined, "关掉就不该带 thinking");
+    sse(res, [{ type: "message_start", message: { usage: { input_tokens: 1 } } }, { type: "message_stop" }]);
+  });
+  const provider = { protocol: "anthropic", baseURL: up.url, model: "claude-sonnet-5-5", secret: "k", thinking: false };
+  await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+  await up.close();
+});
+
+test("Mock：剧本里写 think 会先吐思考过程（离线演示也能看效果）", async () => {
+  const script = [{ think: "我在想…", say: "好的。" }];
+  const evs = await collect(streamChat({ protocol: "mock" }, [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], []));
+  assert.equal(evs.filter((e) => e.type === "reasoning").map((e) => e.delta).join(""), "我在想…");
+  assert.match(evs.filter((e) => e.type === "text").map((e) => e.delta).join(""), /好的/);
+});

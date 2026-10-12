@@ -78,6 +78,8 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
     while (steps < maxSteps) {
       steps++;
       let roundText = "";
+      let roundThink = "";
+      let thinkMs = 0;
       let ended = null;
       const stream = streamChat(provider, [{ role: "system", text: systemPrompt(ctx) }, ...history], toolList, ctx.signal);
       while (true) {
@@ -86,6 +88,11 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         if (ev.type === "text") {
           roundText += ev.delta;
           yield { type: "assistant_delta", delta: ev.delta };
+        } else if (ev.type === "reasoning") {
+          // 模型的思考过程：流给界面看（不塞进上下文，也不回传给模型）
+          if (!roundThink) thinkMs = Date.now();
+          roundThink += ev.delta;
+          yield { type: "reasoning_delta", delta: ev.delta };
         } else if (ev.type === "usage") {
           yield ev; // 透传用量给界面/服务端累计
         } else if (ev.type === "error") {
@@ -95,7 +102,9 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         }
       }
       if (!ended) throw new Error("模型流意外中断");
-      if (roundText) yield { type: "assistant_message", text: roundText };
+      if (roundThink) yield { type: "reasoning", text: truncate(roundThink, 8000), ms: thinkMs ? Date.now() - thinkMs : 0 };
+      const thinkForHistory = ended.thinking || null; // anthropic 开了思考，下一轮必须原样带回去（含签名）
+      if (roundText || thinkForHistory) yield { type: "assistant_message", text: roundText || "", ...(thinkForHistory ? { thinking: thinkForHistory } : {}) };
 
       if (!ended.toolCalls.length) {
         finalText = roundText;
@@ -103,7 +112,7 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         return;
       }
 
-      history.push({ role: "assistant", text: roundText, toolCalls: ended.toolCalls });
+      history.push({ role: "assistant", text: roundText, toolCalls: ended.toolCalls, ...(thinkForHistory ? { thinking: thinkForHistory } : {}) });
       for (const tc of ended.toolCalls) {
         const tool = registry.get(tc.name);
         if (!tool) {
