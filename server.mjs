@@ -16,7 +16,7 @@ import { resolveInside } from "./core/sandbox.mjs";
 import { modelInfo, budgetOfModel } from "./core/model-windows.mjs";
 import { loadCommands, loadSkills, skillsPromptSection, expandCommand } from "./core/skills.mjs";
 import { MODES, DEFAULT_AUTO_APPROVE } from "./core/modes.mjs";
-import { readJson, writeJson, genId, truncate } from "./core/util.mjs";
+import { readJson, writeJson, writeFileAtomic, genId, truncate } from "./core/util.mjs";
 import { runChecks, fixPrompt, checkSummary, CHECKS_MAX_FIX } from "./core/checks.mjs";
 import { listJobs, jobLog, stopJob, runningCount, killAllJobs } from "./core/jobs.mjs";
 
@@ -27,7 +27,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.9.6";
+const VERSION = "0.9.7";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -48,8 +48,7 @@ function vaultSave(obj) {
   const iv = crypto.randomBytes(12);
   const c = crypto.createCipheriv("aes-256-gcm", VAULT_KEY, iv);
   const enc = Buffer.concat([c.update(JSON.stringify(obj), "utf8"), c.final()]);
-  fs.mkdirSync(DATA, { recursive: true });
-  fs.writeFileSync(VAULT, Buffer.concat([iv, c.getAuthTag(), enc]));
+  writeFileAtomic(VAULT, Buffer.concat([iv, c.getAuthTag(), enc])); // 原子写：断电/拔盘不会写出半个钥匙库
 }
 function vaultLoad() {
   try {
@@ -67,7 +66,9 @@ function defaultProviders() {
     { name: "Mock", protocol: "mock", baseURL: "", model: "mock-1", secret: "" },
   ];
 }
+let stateCache = null; // 每个请求都读盘 + 解密 vault 太亏（U 盘上尤其费时）；saveState 写盘后置空
 function loadState() {
+  if (stateCache) return stateCache;
   const base = readJson(CONFIG, null) || readJson(EXAMPLE, null) || {};
   const vault = vaultLoad();
   const settings = readJson(SETTINGS, {});
@@ -75,7 +76,7 @@ function loadState() {
     ...p,
     secret: vault.providers?.[p.name] || "",
   }));
-  return {
+  const built = {
     providers,
     active: base.active || settings.active || providers[0]?.name,
     workspace: settings.workspace || "",
@@ -86,6 +87,8 @@ function loadState() {
     // 改动后的自动检查：test / lint 命令行（在工作区里跑；auto=改过文件就自动跑，失败回喂模型自修）
     checks: { test: settings.checks?.test || "", lint: settings.checks?.lint || "", auto: settings.checks?.auto !== false },
   };
+  stateCache = built;
+  return built;
 }
 function saveState(patch) {
   const cur = loadState();
@@ -104,6 +107,7 @@ function saveState(patch) {
   for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
   vaultSave(vault);
   writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt, checks });
+  stateCache = null; // 写盘了，缓存作废
   return loadState();
 }
 if (!fs.existsSync(CONFIG)) saveState({});
@@ -111,7 +115,8 @@ if (!fs.existsSync(CONFIG)) saveState({});
 // ---------- 密码锁 ----------
 // 密码存在 U 盘 data\lock.json：跟盘走、不跟机器走——同一只盘插到任何电脑都是同一个密码。
 // 只有「这只盘从来没设过密码」时才允许设置，设过之后任何机器都只能输入、不能重设。
-const sessionTokens = new Set();
+const sessionTokens = new Map(); // token → 最后活跃时间；12 小时不活跃即失效（防只增不减、防 cookie 永久有效）
+const TOKEN_TTL_MS = Number(process.env.UA_TOKEN_TTL_MS) || 12 * 3600 * 1000;
 const FREE_PATHS = new Set(["/api/health", "/api/lock-status", "/api/unlock", "/api/lock-set", "/api/lock-change"]);
 
 // 输错冷却：连错 5 次起，冷却 30 秒并逐次翻倍，最多 10 分钟（防拿盘暴力试）
@@ -143,7 +148,19 @@ function cookieOf(req) {
   const m = /(?:^|;\s*)ua_tok=([a-f0-9]{64})/.exec(req.headers.cookie || "");
   return m ? m[1] : null;
 }
-const unlocked = (req) => sessionTokens.has(cookieOf(req));
+// 滑动续期：在用就一直有效，放着 12 小时没动就作废（顺手把过期项删掉）
+function unlocked(req) {
+  const tok = cookieOf(req);
+  if (!tok) return false;
+  const last = sessionTokens.get(tok);
+  if (!last) return false;
+  if (Date.now() - last > TOKEN_TTL_MS) {
+    sessionTokens.delete(tok);
+    return false;
+  }
+  sessionTokens.set(tok, Date.now());
+  return true;
+}
 
 function maskState(st) {
   return {
@@ -266,7 +283,6 @@ function sseHead(res) {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
     connection: "keep-alive",
-    "access-control-allow-origin": "http://127.0.0.1",
   });
   res.write(":ok\n\n");
 }
@@ -446,6 +462,8 @@ async function autoTitle(sessionId, userText, reply, provider, st) {
 async function handleChat(req, res, body) {
   const st = loadState();
   const sessionId = body.sessionId || sessions.create("s");
+  // 同一会话不许并发两条流：会互相覆盖「停止」句柄、日志交错（多标签页/重放才会走到这）
+  if (running.has(sessionId)) return sendJson(res, 409, { error: "这个会话上一轮还在跑——等它结束或先停止，再发下一条" });
   const mode = MODES.includes(body.mode) ? body.mode : "confirm";
   const picked = st.providers.find((p) => p.name === (body.provider || st.active)) || st.providers[0];
   if (!picked) return sendJson(res, 400, { error: "没有可用的模型通道，请先在设置里配置" });
@@ -670,6 +688,12 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://127.0.0.1");
   try {
+    // Host 只认本机：服务只绑 127.0.0.1，但 DNS rebinding 能让恶意网页的域名解析到
+    // 127.0.0.1 再来读这里的接口——校验 Host 头把这条堵死
+    const hostName = String(req.headers.host || "").replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
+    if (hostName !== "127.0.0.1" && hostName !== "localhost" && hostName !== "::1") {
+      return sendJson(res, 403, { error: "只接受本机访问（Host 校验未通过）" });
+    }
     // 密码锁：白名单之外的功能接口必须先解锁
     if (u.pathname.startsWith("/api/") && !FREE_PATHS.has(u.pathname) && !unlocked(req)) {
       return sendJson(res, 401, { error: "请先输入密码解锁", locked: true });
@@ -709,7 +733,9 @@ const server = http.createServer(async (req, res) => {
       lockFail.n = 0;
       lockFail.until = 0;
       const tok = crypto.randomBytes(32).toString("hex");
-      sessionTokens.add(tok);
+      const now = Date.now();
+      for (const [t, at] of sessionTokens) if (now - at > TOKEN_TTL_MS) sessionTokens.delete(t); // 顺手清过期
+      sessionTokens.set(tok, now);
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8",
         "set-cookie": `ua_tok=${tok}; Path=/; HttpOnly; SameSite=Strict`,
@@ -1172,8 +1198,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET") {
       let p = u.pathname === "/" ? "/index.html" : u.pathname;
       p = path.normalize(p).replace(/^([/\\])+/, "");
-      const file = path.join(UA_HOME, "public", p);
-      if (!file.startsWith(path.join(UA_HOME, "public"))) return sendJson(res, 403, { error: "forbidden" });
+      const publicRoot = path.join(UA_HOME, "public");
+      const file = path.join(publicRoot, p);
+      const rel = path.relative(publicRoot, file); // 用 relative 判定边界（前缀写法会放行 public-xxx 这类兄弟目录名）
+      if (rel.startsWith("..") || path.isAbsolute(rel)) return sendJson(res, 403, { error: "forbidden" });
       if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return sendJson(res, 404, { error: "not found" });
       const type = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".svg": "image/svg+xml" }[path.extname(file)] || "application/octet-stream";
       res.writeHead(200, { "content-type": type, "cache-control": "no-store" });

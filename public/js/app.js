@@ -101,8 +101,15 @@ async function unlock(pw) {
   } catch (e) {
     lockError(e.message || "密码不对");
     $("#lkPw").value = "";
-    const m = /冷却\s*(\d+)\s*秒/.exec(e.message || "");
-    if (m) startCooldown(+m[1]);
+    // 冷却秒数优先读结构化字段：429 的文案是「请 N 秒后再试」，没有「冷却」二字，
+    // 只靠文案匹配会漏掉倒计时（403 的文案里有，所以过去看起来"有时好有时不好"）
+    const sec = Number(e.data?.cooldown) || 0;
+    if (sec > 0) {
+      startCooldown(sec);
+    } else {
+      const m = /冷却\s*(\d+)\s*秒/.exec(e.message || "");
+      if (m) startCooldown(+m[1]);
+    }
   }
 }
 
