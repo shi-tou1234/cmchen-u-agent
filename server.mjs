@@ -423,7 +423,7 @@ const server = http.createServer(async (req, res) => {
       if (!file.startsWith(path.join(UA_HOME, "public"))) return sendJson(res, 403, { error: "forbidden" });
       if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return sendJson(res, 404, { error: "not found" });
       const type = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".svg": "image/svg+xml" }[path.extname(file)] || "application/octet-stream";
-      res.writeHead(200, { "content-type": type });
+      res.writeHead(200, { "content-type": type, "cache-control": "no-store" });
       return fs.createReadStream(file).pipe(res);
     }
     sendJson(res, 404, { error: "not found" });
