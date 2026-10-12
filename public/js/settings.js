@@ -65,6 +65,8 @@ async function loadAll() {
     provs = st.providers.map((p) => ({ ...p }));
     S.autoApprove = normalizeAA(st.autoApprove);
     S.assist = st.assist || "";
+    S.autoCompactAt = st.autoCompactAt === undefined ? 0.8 : Number(st.autoCompactAt);
+    $("#autoCompactSel").value = String(S.autoCompactAt);
     renderProviders();
     renderAutoApprove();
   } catch (e) {
@@ -598,6 +600,7 @@ async function save() {
     searchKeys: { tavily: $("#kTavily").value.trim(), brave: $("#kBrave").value.trim() },
     autoApprove: S.autoApprove,
     assist: $("#assistSel").value || "",
+    autoCompactAt: Number($("#autoCompactSel").value) || 0,
   };
   const btn = $("#saveSet");
   btn.disabled = true;
@@ -807,6 +810,7 @@ export function initSettings() {
   $("#kTavily").addEventListener("input", markDirty);
   $("#kBrave").addEventListener("input", markDirty);
   $("#assistSel").addEventListener("change", markDirty);
+  $("#autoCompactSel").addEventListener("change", markDirty);
 
   // 提醒（只存浏览器本地，跟这台电脑走）
   $("#notifyOn").checked = notifyOn();

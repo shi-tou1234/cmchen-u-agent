@@ -1,6 +1,6 @@
 // agent 主循环：prompt → 模型流 → tool_calls → 模式门禁/确认 → 执行 → 回填 → 循环
 import { streamChat } from "./providers.mjs";
-import { gateWith, MODE_LABEL, MODE_PROMPT } from "./modes.mjs";
+import { gateWith, MODE_LABEL, MODE_PROMPT, commandPrefix, matchesPrefix } from "./modes.mjs";
 import { truncate } from "./util.mjs";
 import path from "node:path";
 
@@ -73,6 +73,7 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
   const history = [...messages];
   let finalText = "";
   let steps = 0;
+  ctx.loopGuard = ctx.loopGuard || { lastSig: "", count: 0 }; // 防死循环：连续重复同一个调用才计数（跨轮保持，由服务端按会话持有）
 
   try {
     while (steps < maxSteps) {
@@ -113,10 +114,18 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
       }
 
       history.push({ role: "assistant", text: roundText, toolCalls: ended.toolCalls, ...(thinkForHistory ? { thinking: thinkForHistory } : {}) });
-      for (const tc of ended.toolCalls) {
+
+      // ── 一轮里的多个工具调用 ──
+      // 门禁判定、弹窗、检查点按顺序做（要排队、要追加写清单，必须串行）；
+      // 真正执行并行跑（默认 4 路）——多文件、多子任务时能省掉大量干等。
+      // 结果按原顺序回填给模型（tool 消息顺序必须跟 assistant 里的 tool_calls 对齐）。
+      const results = new Array(ended.toolCalls.length).fill(null);
+      const jobs = [];
+      for (let idx = 0; idx < ended.toolCalls.length; idx++) {
+        const tc = ended.toolCalls[idx];
         const tool = registry.get(tc.name);
         if (!tool) {
-          history.push({ role: "tool", toolCallId: tc.id, toolName: tc.name, text: `错误：没有名为 ${tc.name} 的工具` });
+          results[idx] = `错误：没有名为 ${tc.name} 的工具`;
           yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, text: `没有名为 ${tc.name} 的工具` };
           continue;
         }
@@ -128,9 +137,21 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           autoApprove: ctx.settings?.autoApprove,
           autoCount: ctx.autoCount || 0,
         });
-        const g = decided.g;
+        let g = decided.g;
+        let why = ""; // 放行/追问的原因，网页上要写给人看
+        if (g === "confirm" && tc.name === "shell_run" && matchesPrefix(tc.args?.command, ctx.cmdPrefixes)) {
+          g = "run"; // 用户在这一轮之前点过「本会话不再问这类命令」
+          why = "本会话已放行这类命令";
+        }
         if (decided.auto) ctx.autoCount = (ctx.autoCount || 0) + 1;
-        yield { type: "tool_call", id: tc.id, name: tc.name, args: tc.args, risk, gate: g, auto: !!decided.auto };
+        // 防死循环（对标 OpenCode 的 doom_loop）：同一个调用反复来第 3 次，就不再自动放行，改成问一句
+        const sig = tc.name + "::" + JSON.stringify(tc.args || {});
+        if (ctx.loopGuard.lastSig === sig) ctx.loopGuard.count++;
+        else { ctx.loopGuard.lastSig = sig; ctx.loopGuard.count = 1; }
+        const repeat = ctx.loopGuard.count; // 连续重复第几次
+        const doom = g === "run" && repeat >= 3;
+        if (doom) g = "confirm";
+        yield { type: "tool_call", id: tc.id, name: tc.name, args: tc.args, risk, gate: g, auto: !!decided.auto || why !== "", ...(doom ? { doom: repeat } : {}), ...(why ? { why } : {}) };
 
         // 改动类工具（或要弹确认的）：先算好预览——确认弹窗与本轮改动总览都用它
         let preview;
@@ -143,71 +164,104 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         }
         const chg = g === "deny" ? null : buildChange(tc.name, tc.args, ctx, preview);
 
-        let resultText;
         if (g === "deny") {
           // 注意：tool.risk 可能是函数（动态风险），得用上面已经算好的 risk 值
-          resultText = `已拒绝（当前为${MODE_LABEL[ctx.mode]}）：工具 ${tc.name} 的风险等级是 ${risk}，此模式不允许。请向用户说明并让其切换权限模式。`;
-          yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: resultText };
-        } else {
-          let approved = true;
-          let verdictNote = "";
-          if (g === "confirm") {
-            const { id: confirmId, done: decided } = ctx.confirm({ tool: tc.name, args: tc.args, risk, preview });
-            yield { type: "confirm_request", confirmId, id: tc.id, name: tc.name, args: tc.args, risk, preview };
-            const v = await decided; // 老式 confirm 返回布尔，新式返回 {ok, note}
-            const isObj = v !== null && typeof v === "object";
-            approved = isObj ? !!v.ok : !!v;
-            verdictNote = isObj ? String(v.note || "") : "";
-            if (approved) ctx.autoCount = 0; // 用户亲自确认过，重新计连续自动次数
-            yield { type: "confirm_result", confirmId, approved, note: verdictNote };
-          }
-          if (!approved) {
-            resultText = verdictNote ? `用户拒绝了该操作，并说：${verdictNote}` : "用户拒绝或超时未确认该操作。";
-            yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: resultText };
-          } else {
-            const t0 = Date.now();
-            // 改动类工具：动手之前先拍一张检查点（回滚靠它），拍完才允许工具跑
-            let cp = null;
-            if (chg && typeof ctx.snapshot === "function") {
-              try { cp = await ctx.snapshot({ name: tc.name, args: tc.args || {}, toolCallId: tc.id }); } catch { cp = null; }
-            }
-            // 子事件桥：工具（如 spawn_subagent）通过 ctx.emit 发出的事件泵进主流
-            const q = [];
-            let doneTool = false;
-            const toolPromise = tool.run(tc.args || {}, { ...ctx, emit: (e) => q.push(e) }).finally(() => (doneTool = true));
-            toolPromise.catch(() => {}); // 立刻接管拒绝，防止轮询 sleep 期间触发 unhandledRejection 崩进程；错误仍由下方 await 抛出
-            try {
-              while (true) {
-                if (q.length) {
-                  yield q.shift();
-                  continue;
-                }
-                if (doneTool) break;
-                await new Promise((r) => setTimeout(r, 30));
-              }
-              const out = await toolPromise;
-              resultText = typeof out === "string" ? out : JSON.stringify(out);
-              // 批准时附的话一并交给模型，它下一步就会照办
-              if (verdictNote) resultText += `\n（用户批准这一步时补了一句：${verdictNote}）`;
-              yield { type: "tool_result", id: tc.id, name: tc.name, ok: true, text: resultText, ms: Date.now() - t0 };
-              // 真的改成功了才记进「本轮改动」——被拒/出错的都不算
-              if (chg) {
-                if (cp) {
-                  try {
-                    const cid = await cp.finish();
-                    if (cid) chg.cp = cid; // 事件带上检查点 id，网页据此提供「撤销本轮改动」
-                  } catch {}
-                }
-                yield { ...chg, type: "change", id: tc.id };
-              }
-            } catch (e) {
-              resultText = `工具执行出错：${e.message}`;
-              while (q.length) yield q.shift();
-              yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, text: resultText, ms: Date.now() - t0 };
-            }
+          results[idx] = `已拒绝（当前为${MODE_LABEL[ctx.mode]}）：工具 ${tc.name} 的风险等级是 ${risk}，此模式不允许。请向用户说明并让其切换权限模式。`;
+          yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: results[idx] };
+          continue;
+        }
+
+        let note = "";
+        if (g === "confirm") {
+          const why = doom ? `同一个调用（${tc.name}）这一轮已经重复 ${repeat} 次，可能卡在循环里` : "";
+          const prefix = tc.name === "shell_run" ? commandPrefix(tc.args?.command) : "";
+          const { id: confirmId, done: decidedP } = ctx.confirm({ tool: tc.name, args: tc.args, risk, preview, reason: why, prefix, sessionId: ctx.sessionId });
+          yield { type: "confirm_request", confirmId, id: tc.id, name: tc.name, args: tc.args, risk, preview, reason: why, prefix };
+          const v = await decidedP; // 老式 confirm 返回布尔，新式返回 {ok, note}
+          const isObj = v !== null && typeof v === "object";
+          const ok = isObj ? !!v.ok : !!v;
+          note = isObj ? String(v.note || "") : "";
+          if (ok) ctx.autoCount = 0; // 用户亲自确认过，重新计连续自动次数
+          if (ok) ctx.loopGuard.count = 0; // 用户点头了，重复计数重来
+          yield { type: "confirm_result", confirmId, approved: ok, note };
+          if (!ok) {
+            results[idx] = note ? `用户拒绝了该操作，并说：${note}` : doom ? `同一个调用重复 ${repeat} 次、又没得到确认，已跳过。请不要重复同样的调用，换个思路或向用户说明。` : "用户拒绝或超时未确认该操作。";
+            yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: results[idx] };
+            continue;
           }
         }
-        history.push({ role: "tool", toolCallId: tc.id, toolName: tc.name, text: truncate(resultText, 40000) });
+
+        // 改动类工具：动手之前先拍检查点（回滚靠它），拍完才允许工具跑
+        let cp = null;
+        if (chg && typeof ctx.snapshot === "function") {
+          try { cp = await ctx.snapshot({ name: tc.name, args: tc.args || {}, toolCallId: tc.id }); } catch { cp = null; }
+        }
+        jobs.push({ idx, tc, tool, chg, cp, note, started: Date.now() });
+      }
+
+      // 并行跑，但按「工具自己的声明」分片（对标 Codex 的 supports_parallel 与 dsh 的 isConcurrencySafe）：
+      // 只读工具声明 parallel:true 才允许同批并发；写文件、跑命令、git 提交这类一律独占，
+      // 形成排序屏障——绝不让人家的 shell 命令和文件写入互相踩。
+      const CONCURRENCY = Math.max(1, Number(process.env.UA_TOOL_CONCURRENCY) || 4);
+      const batches = [];
+      let buf = [];
+      for (const job of jobs) {
+        if (job.tool.parallel) {
+          buf.push(job);
+          if (buf.length >= CONCURRENCY) { batches.push(buf); buf = []; }
+        } else {
+          if (buf.length) { batches.push(buf); buf = []; }
+          batches.push([job]); // 独占：单独一片，前后都是屏障
+        }
+      }
+      if (buf.length) batches.push(buf);
+
+      for (const chunk of batches) {
+        const q = [];
+        let settled = 0;
+        const promises = chunk.map((job) =>
+          Promise.resolve()
+            .then(() => job.tool.run(job.tc.args || {}, { ...ctx, emit: (e) => q.push(e) }))
+            .then(
+              (out) => ({ job, ok: true, text: typeof out === "string" ? out : JSON.stringify(out) }),
+              (e) => ({ job, ok: false, text: `工具执行出错：${e.message}` })
+            )
+            .then((r) => { settled++; return r; })
+        );
+        while (settled < chunk.length) {
+          if (q.length) { yield q.shift(); continue; }
+          await new Promise((r) => setTimeout(r, 30));
+        }
+        while (q.length) yield q.shift();
+        const outs = await Promise.all(promises);
+        for (const out of outs) {
+          const { idx, tc, chg, cp, note: jnote, started } = out.job;
+          const ms = Date.now() - started;
+          let text = out.text;
+          // 批准时附的话一并交给模型，它下一步就会照办
+          if (out.ok && jnote) text += `\n（用户批准这一步时补了一句：${jnote}）`;
+          // 超长输出：落盘 + 掐头去尾 + 附上「哪里能读全文」（比硬截断友好，模型能自己取回来）
+          if (out.ok && typeof ctx.spill === "function") {
+            try { text = ctx.spill(text, tc); } catch {}
+          }
+          results[idx] = text;
+          yield { type: "tool_result", id: tc.id, name: tc.name, ok: out.ok, text, ms };
+          // 真的改成功了才记进「本轮改动」——被拒/出错的都不算
+          if (out.ok && chg) {
+            if (cp) {
+              try {
+                const cid = await cp.finish();
+                if (cid) chg.cp = cid; // 事件带上检查点 id，网页据此提供「撤销本轮改动」
+              } catch {}
+            }
+            yield { ...chg, type: "change", id: tc.id };
+          }
+        }
+      }
+      for (let idx = 0; idx < ended.toolCalls.length; idx++) {
+        const tc = ended.toolCalls[idx];
+        // 结果已经过 spill 处理（该落的盘都落了），这里只做个保险截断
+        history.push({ role: "tool", toolCallId: tc.id, toolName: tc.name, text: truncate(results[idx] ?? "（这一步没有产生结果）", 48000) });
       }
     }
     yield {

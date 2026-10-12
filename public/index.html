@@ -151,6 +151,7 @@
         </span>
         <button class="ghost-btn" id="ctxCompact" title="把前面的对话压缩成摘要，腾出空间"><svg class="ic ic-sm"><use href="#i-refresh"/></svg>压缩</button>
       </div>
+      <div class="queue-list" id="queueList" hidden></div>
       <div class="palette" id="palette" hidden></div>
       <div class="composer" id="composer">
         <div class="attach-list" id="imgs" hidden></div>
@@ -241,6 +242,15 @@
                 <label class="switch"><input type="checkbox" id="thinkOn"><span class="track"></span><b id="thinkState">开启</b></label>
                 <span class="field-help">显示模型的思考过程（会以「已思考 N 秒」的小块出现，点开可看全过程）</span>
               </div>
+              <label class="field mt">
+                <span class="field-label">上下文自动压缩</span>
+                <select class="input input-sm" id="autoCompactSel" style="max-width:230px">
+                  <option value="0.8">到 80% 自动压缩（默认）</option>
+                  <option value="0.9">到 90% 自动压缩</option>
+                  <option value="0">关闭（只提醒，手动点压缩）</option>
+                </select>
+                <span class="field-help">快满的时候先用轻量通道把旧对话摘要掉，省得模型报超限；摘要会存进会话日志</span>
+              </label>
             </div>
           </div>
 
@@ -572,6 +582,7 @@
       </div>
     </header>
     <div class="sheet-body single">
+      <div id="cfmWhy" class="cfm-why" hidden></div>
       <div id="cfmBody"></div>
       <label class="field mt">
         <span class="field-label">补一句话（可选）</span>
@@ -580,6 +591,7 @@
     </div>
     <footer class="sheet-foot">
       <span class="grow"></span>
+      <button class="btn btn-ghost" id="cfmAlways" hidden></button>
       <button class="btn btn-ghost" id="cfmNo">拒绝</button>
       <button class="btn btn-warn" id="cfmYes">批准执行</button>
     </footer>

@@ -385,6 +385,27 @@ y 思考流: 三协议各自字段都解析成 reasoning；anthropic 请求带 t
 z 工具条与布局: 单行渲染 + 左竖线分组 + 展开看细节；内容列 940px；运行中胶囊在等待批准时可见、结束后隐藏
 ```
 
+### v9.1 追加：一轮多工具并行 + 自动压缩 + 计划跨轮存活
+
+- **并行工具调用**（对标 Codex/Claude Code 一轮里并行跑多个独立工具）：门禁判定、确认弹窗、检查点快照仍然**串行**（要排队、要追加写清单），**执行并行**（默认 4 路，`UA_TOOL_CONCURRENCY` 可调）；结果按原顺序回填给模型（`tool` 消息顺序必须与 assistant 的 `tool_calls` 对齐），界面按到达顺序渲染（事件本来就带 id）。多文件改动、多子任务时省掉大量干等
+- **自动压缩**：上下文涨到阈值（默认 80%，设置 → 通用 → 上下文自动压缩 可选 90% 或关闭）就先用轻量通道把旧轮次摘要掉再问模型——对标 Codex 的 auto-compact；压缩逻辑抽成 `compactSession()` 与手动 `/compact` 共用；失败绝不挡住这一轮；事件带 `auto:true` 落盘、界面 toast 说明「x → y tokens」
+- **计划跨轮存活**（对标 Claude Code「任务跨压缩存活」）：`/api/chat` 开始时从会话日志里找回最后一条**未被回退**的 `plan` 事件，塞回主循环状态，于是系统提示每轮都带着当前计划；Mock 剧本新增 `tools:[…]`（一轮多个工具调用）与 `think` 支持，便于离线演示与测试
+
+### v9.2 追加：照 Codex / dsh / ZCode / MiniMax 源码学来的一批（调研在 PROGRESS 记了出处）
+
+两个调研 agent 扒了 openai/codex、deepseek-ai/deepseek-harness（dsh）、anomalyco/opencode、zai-org/ZCode、MiniMax-AI/minimax-code、MoonshotAI/kimi-code、XiaomiMiMo/MiMo-Code 的源码与文档，落地了下面这些：
+
+- **并行执行改成「声明制 + 独占屏障」**（Codex `supports_parallel_tool_calls` / dsh `isConcurrencySafe`）：只读工具在定义里写 `parallel: true`（fs_list/fs_read/fs_search/sys_info/git_status/git_diff/git_log/web_search/web_fetch/spawn_subagent）才允许同批并发；写文件、跑命令、git 提交这类不声明 → **单独成片**，前后都是屏障。原来「一律 4 路并行」会让 shell 与写操作互相踩，是这轮调研抓出来的真隐患
+- **超长工具输出可恢复**（dsh spill-policy）：超过 4 万字符时掐头（9000）去尾（3000），全文写进 `data/spill/<会话>/<调用>.txt`，给模型的消息里附「完整输出已存到 <路径>，用 fs_read 带 offset/limit 分段读，或 fs_search 在里面搜」——比硬截断友好，模型能自己取回来；日志也不再被超长输出撑爆
+- **审批弹窗加「本会话不再问这类命令」**（Codex 的 "don't ask again for commands that start with …"）：按钮上直接写清范围（`本会话不再问「git status …」`），前缀按「到第一个带 - 或 = 的 token 之前、最多两段」取（`git status --short` → `git status`，`npm install x` → `npm install`），前缀后必须跟空白或结尾（`git status` 不会匹配到 `git statuser`）；只作用于当前会话、内存态、重启即失效；事件里带 `why: 本会话已放行这类命令` 便于追溯
+- **防死循环（doom loop）**（OpenCode 的 `doom_loop`）：同一条工具调用**连续**重复到第 3 次，即使完全权限也不再直接放行，改成问一句并写明「可能卡在循环里」；计数按会话跨轮保持，用户点头后清零；工具条上标「重复第 N 次」
+- **网络抖一下自动重试**（Codex `responses_retry`）：只对「没拿到响应」和 429/5xx 重试两次（0.6s→2.4s 退避），鉴权类错误不重试；超长流中途断线单独提示「可以重发这一条」
+- **命令结果带耗时**：`exit=0 · 1.2s`，模型与人都能看出是不是卡住了
+- **消息排队 / 中途接着说**（MiniMax Code 的 Enter 排队）：正在跑的时候**回车 = 排队**（出现可取消的排队条，点条子还能放回输入框改），**点发送按钮 = 停下**；这一轮跑完自动接着发。输入区提示改成「正在跑：回车 = 排队接着说，点右侧按钮 = 停下」
+- **Shift+Tab 循环切权限模式**（ZCode / OpenCode / Codex 都有）：设置面板里也能换，随手切更顺
+- **确认弹窗写清「为什么问你」**：防死循环、本会话放行等原因直接显示在弹窗顶部
+- 验收：134 用例全绿（新增：一轮多工具并行与顺序对齐、计划跨轮注入、自动压缩触发与关闭、超长输出落盘可恢复、本会话命令前缀放行与范围、防死循环第 3 次拦截）；无头实测（`.workbuddy/tools/cdp-v11.mjs`）：放行按钮文案「本会话不再问「dir …」」、排队条出现/清空/自动发出、第二次同样的命令不再弹窗、命令条显示 `exit=0 · 0.0s …（20 行）`，零 JS 报错
+
 ## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）
 
 ### P0

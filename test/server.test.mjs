@@ -1048,3 +1048,154 @@ test("v9 新增：通道可手动指定上下文窗口，覆盖自动匹配", as
   const local = await jjson("/api/model-info", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: { name: "Ollama", protocol: "openai-chat", baseURL: "http://127.0.0.1:11434/v1", model: "qwen3:8b", secret: "" } }) });
   assert.ok(local.json.windowTokens <= 65536, `本机模型窗口应打折，实际 ${local.json.windowTokens}`);
 });
+
+/* ===== v0.9.1：一轮多工具并行 + 计划跨轮存活 + 自动压缩 ===== */
+test("v9.1 新增：一轮里的多个工具调用并行执行，结果按原顺序回填", async () => {
+  const sid = "s-parallel";
+  const script = [
+    {
+      say: "一次建三个文件。",
+      tools: [
+        { tool: "fs_write", args: { path: "par-a.txt", content: "A" } },
+        { tool: "fs_write", args: { path: "par-b.txt", content: "B" } },
+        { tool: "fs_list", args: { path: "." } },
+      ],
+    },
+    { say: "都建好了。" },
+  ];
+  const r = await chat({ sessionId: sid, mode: "full", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } });
+  const calls = r.events.filter((e) => e.type === "tool_call");
+  assert.equal(calls.length, 3, "三个工具调用都应发出");
+  const results = r.events.filter((e) => e.type === "tool_result");
+  assert.equal(results.length, 3, "三个都要有结果");
+  assert.deepEqual(results.map((x) => x.name), ["fs_write", "fs_write", "fs_list"], "结果顺序要跟调用顺序一致");
+  assert.ok(results.every((x) => x.ok), "都该成功");
+  assert.ok(fs.existsSync(path.join(wsDir, "par-a.txt")) && fs.existsSync(path.join(wsDir, "par-b.txt")), "两个文件都要真的建出来");
+  // 顺序对齐还体现在落盘：tool 消息必须按 tool_calls 顺序
+  const log = JSON.parse("[" + sessionLog(sid).trim().split("\n").join(",") + "]");
+  const tcs = log.filter((e) => e.type === "tool_call").map((e) => e.name);
+  const trs = log.filter((e) => e.type === "tool_result").map((e) => e.name);
+  assert.deepEqual(tcs, trs, "日志里调用与结果的顺序要对齐");
+});
+
+test("v9.1 新增：计划跨轮存活（下一轮的请求里带着上一轮立的计划）", async () => {
+  const sid = "s-plan-persist";
+  const plan = [{ step: "先读配置", status: "done" }, { step: "再改端口", status: "doing" }, { step: "最后跑测试", status: "pending" }];
+  await chat({ sessionId: sid, mode: "confirm", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "update_plan", args: { items: plan } }, { say: "计划立好了" }]) } });
+  // 下一轮换个能捕获请求的通道：系统提示里应带着这份计划
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Up", workspace: wsDir, assist: "" });
+  await chat({ sessionId: sid, mode: "confirm", provider: "Up", message: { text: "继续" } });
+  const all = UP.requests.map((r) => JSON.stringify(r)).join(String.fromCharCode(10));
+  assert.match(all, /先读配置/, "上一轮的计划要重新注入系统提示");
+  assert.match(all, /再改端口/);
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+});
+
+test("v9.1 新增：上下文到阈值自动压缩（用轻量通道摘要旧轮次）", async () => {
+  const sid = "s-autocompact";
+  const small = { name: "SmallWin", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k", contextWindow: 12000 };
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, small, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "SmallWin", workspace: wsDir, assist: "Up", autoCompactAt: 0.5 });
+  // 灌几轮长文本：12000 窗口 → 预算 9000、阈值 4500 tokens；每轮 6000 字中文 ≈ 6000 token
+  const seen = [];
+  for (let i = 1; i <= 4; i++) {
+    const r = await chat({ sessionId: sid, mode: "confirm", provider: "SmallWin", message: { text: `第${i}轮：` + "内容".repeat(3000) } });
+    seen.push(...r.events);
+  }
+  const auto = seen.find((e) => e.type === "compact" && e.auto);
+  assert.ok(auto, "涨过阈值的那一轮应自动压缩：" + JSON.stringify(seen.map((e) => e.type)));
+  assert.ok(auto.after.tokens < auto.before.tokens, "压完要更小");
+  assert.match(sessionLog(sid), /"type":"compact".*"auto":true/, "自动压缩要落盘（带 auto 标记）");
+  const after = await jjson("/api/session?id=" + encodeURIComponent(sid) + "&provider=SmallWin");
+  assert.ok(after.json.budget.tokens < 4500, `压缩后应回落到阈值以下，实际 ${after.json.budget.tokens}`);
+  // 关掉后：继续灌长文本，也不该再自动压
+  await postSettings({ autoCompactAt: 0 });
+  const seen2 = [];
+  for (let i = 5; i <= 7; i++) {
+    const r = await chat({ sessionId: sid, mode: "confirm", provider: "SmallWin", message: { text: `第${i}轮：` + "内容".repeat(3000) } });
+    seen2.push(...r.events);
+  }
+  assert.ok(!seen2.some((e) => e.type === "compact" && e.auto), "关掉后不该再自动压缩");
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "", autoCompactAt: 0.8 });
+});
+
+/* ===== v0.9.2：输出落盘可恢复 + 本会话命令放行 + 防死循环 ===== */
+test("v9.2 新增：超长工具输出掐头去尾落盘，并给模型一条读回来的路", async () => {
+  const sid = "s-spill";
+  const big = path.join(wsDir, "spill-src.txt");
+  fs.writeFileSync(big, "第 i 行 " + "x".repeat(120) + "\n" + "内容".repeat(30000), "utf8");
+  const script = [{ tool: "fs_read", args: { path: "spill-src.txt" }, say: "" }, { say: "读完了" }];
+  const r = await chat({ sessionId: sid, mode: "full", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } });
+  const tr = r.events.find((e) => e.type === "tool_result" && e.name === "fs_read");
+  assert.ok(tr, "要有 fs_read 的结果");
+  assert.match(tr.text, /完整输出已存到/, "超长输出要落盘并告知路径");
+  const m = /完整输出已存到 (.+?)，/.exec(tr.text);
+  assert.ok(m && fs.existsSync(m[1]), `落盘文件要真的存在：${m[1]}`);
+  assert.ok(fs.readFileSync(m[1], "utf8").length > 60000, "落盘的是完整输出");
+  assert.ok(m[1].includes(path.join("data", "spill")), "要落在 U 盘 data/spill 下");
+});
+
+test("v9.2 新增：本会话不再问这类命令（前缀放行，且范围写清楚）", async () => {
+  const sid = "s-cmd-allow";
+  const runCmd = (text) => chat({ sessionId: sid, mode: "confirm", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "shell_run", args: { command: text } }, { say: "跑完了" }]) } });
+  // 起一轮并拿到确认单，同时把「不再问 dir 这类」记下来
+  const first = (async () => {
+    const res = await jfetch("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: sid, mode: "confirm", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "shell_run", args: { command: "dir" } }, { say: "跑完了" }]) } }),
+    });
+    const rd = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let events = [];
+    let done = false;
+    while (!done) {
+      const { done: d, value } = await rd.read();
+      if (d) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 2);
+        const mm = /^data: (.*)$/.exec(line);
+        if (!mm) continue;
+        let ev;
+        try { ev = JSON.parse(mm[1]); } catch { continue; }
+        events.push(ev);
+        if (ev.type === "confirm_request" && !done) {
+          assert.equal(ev.prefix, "dir", "确认单里要写清「这类命令」的范围");
+          await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId: ev.confirmId, approve: true, rememberPrefix: ev.prefix }) });
+          done = true;
+        }
+      }
+    }
+    return events;
+  })();
+  const evs = await first;
+  assert.ok(evs.some((e) => e.type === "confirm_request"), "第一次应该问你");
+
+  // 第二次同样的命令：不该再问（本会话已放行），并且标出为什么
+  const second = await runCmd("dir /b");
+  assert.ok(!second.events.some((e) => e.type === "confirm_request"), "本会话放行后不该再弹窗");
+  const tc = second.events.find((e) => e.type === "tool_call" && e.name === "shell_run");
+  assert.equal(tc.gate, "run");
+  assert.match(String(tc.why || ""), /本会话已放行/, "事件里要写明放行原因");
+  // 前缀不能顺带放行别的命令
+  const other = await runCmd("echo 别的命令");
+  assert.ok(other.events.some((e) => e.type === "confirm_request"), "别的命令还是要问");
+});
+
+test("v9.2 新增：同一个调用重复第 3 次就不再自动放行（防死循环）", async () => {
+  const sid = "s-doom";
+  const one = () => chat({ sessionId: sid, mode: "full", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "doom.txt", content: "同样的内容" } }, { say: "写好了" }]) } });
+  const r1 = await one();
+  const r2 = await one();
+  const r3 = await one();
+  const gateOf = (r) => r.events.find((e) => e.type === "tool_call" && e.name === "fs_write");
+  assert.equal(gateOf(r1).gate, "run", "第 1 次照常（完全权限）");
+  assert.equal(gateOf(r2).gate, "run", "第 2 次也照常");
+  const g3 = gateOf(r3);
+  assert.equal(g3.gate, "confirm", "第 3 次同一个调用要停下来问一句");
+  assert.equal(g3.doom, 3, "事件里要标出重复了几次");
+  assert.ok(r3.events.some((e) => e.type === "confirm_request"), "应弹确认");
+});

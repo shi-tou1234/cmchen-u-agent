@@ -52,6 +52,7 @@ export const S = {
   lastSent: null,
   autoApprove: { ...DEFAULT_AUTO_APPROVE }, // 细粒度放行开关（设置里来的）
   assist: "",            // 轻量通道名（起标题/压缩用；空=跟随当前通道）
+  autoCompactAt: 0.8,    // 上下文到多少比例自动压缩（0=关）
   changes: [],           // 本轮改动（change 事件攒起来，done 时出「本轮改动」卡）
   images: [],            // {mediaType,data,url}
   texts: [],             // {name,text}

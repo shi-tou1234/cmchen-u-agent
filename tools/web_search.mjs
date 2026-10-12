@@ -51,6 +51,9 @@ export default {
   name: "web_search",
   description: "联网搜索，返回标题+链接+摘要。优先用配置了 key 的 Tavily/Brave，否则免 key 的 DuckDuckGo（国内网络可能不通）",
   risk: "low",
+
+  parallel: true, // 只读：可与同批其它只读工具并行（不声明就独占）
+  // 见 core/agent-loop.mjs 的调度：只读同批并发，其余单独成片
   params: {
     type: "object",
     properties: { query: { type: "string", description: "搜索词" } },

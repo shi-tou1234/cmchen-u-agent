@@ -8,6 +8,9 @@ export default {
   name: "spawn_subagent",
   description: "派生一个子 agent 独立完成子任务（子 agent 看不到主对话，task 里要把上下文写全）。返回子 agent 的最终汇报",
   risk: "medium",
+
+  parallel: true, // 只读：可与同批其它只读工具并行（不声明就独占）
+  // 见 core/agent-loop.mjs 的调度：只读同批并发，其余单独成片
   params: {
     type: "object",
     properties: {

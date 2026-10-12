@@ -91,6 +91,31 @@ export function isSafeCommand(cmd) {
   return SAFE_CMD.test(c);
 }
 
+// 「本会话不再问这类命令」用的前缀：取到第一个带 - 或 = 的 token 之前，最多两段
+//   git status --short → "git status"；npm install left-pad → "npm install"；dir → "dir"
+export function commandPrefix(cmd) {
+  const toks = String(cmd || "").trim().split(/\s+/).filter(Boolean).slice(0, 2);
+  const keep = [];
+  for (const t of toks) {
+    if (/^-|^-{2}|=/.test(t)) break;
+    keep.push(t);
+    if (keep.length >= 2) break;
+  }
+  return keep.join(" ") || String(cmd || "").trim().slice(0, 40);
+}
+
+// 某条命令是否落在用户「本会话已放行」的前缀里（前缀后必须是空白或结尾，别让 git status 匹配到 git statuser）
+export function matchesPrefix(cmd, prefixes) {
+  const c = String(cmd || "").trim().toLowerCase();
+  if (!c) return false;
+  for (const p of prefixes || []) {
+    const pre = String(p || "").trim().toLowerCase();
+    if (!pre) continue;
+    if (c === pre || c.startsWith(pre + " ")) return true;
+  }
+  return false;
+}
+
 /**
  * 细粒度门禁：在套餐判定为「需要确认」时，再看开关能不能放行。
  * @returns {{g:"run"|"confirm"|"deny", auto:boolean, reason?:string}}
