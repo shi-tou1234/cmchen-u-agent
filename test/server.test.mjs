@@ -257,3 +257,12 @@ test("子任务经服务器跑通（subagent_event 出现在 SSE）", async () =
   const tr = events.find((e) => e.type === "tool_result" && e.name === "spawn_subagent");
   assert.match(tr?.text || "", /子任务完成/);
 });
+
+test("会话删除：DELETE 后列表与读取都没有了", async () => {
+  const { events } = await chat({ message: { text: "删除测试会话" }, mode: "confirm" });
+  const sid = events.find((e) => e.type === "session").sessionId;
+  const del = await jfetch("/api/session?id=" + encodeURIComponent(sid), { method: "DELETE" });
+  assert.equal(del.status, 200);
+  const list = await (await jfetch("/api/sessions")).json();
+  assert.ok(!list.some((s) => s.id === sid), "删除后列表不应包含该会话");
+});
