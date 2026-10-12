@@ -827,3 +827,19 @@ ul.dots li { margin: 3px 0; }
 .job-cmd { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .job-meta { color: var(--faint); font-size: 11.5px; flex: none; font-variant-numeric: tabular-nums; }
 .job-out { margin: 0 12px 8px; max-height: 220px; overflow: auto; }
+
+/* 厂商牌：官方图标版（品牌色底 + 白色图形，跟字母牌同一套尺寸） */
+.brand-chip.chip-ic { display: grid; place-items: center; color: #fff; }
+.brand-chip.chip-ic .ic { width: 13px; height: 13px; stroke: none; fill: currentColor; }
+.brand-chip.lg.chip-ic .ic { width: 18px; height: 18px; }
+
+/* ---------- 输入框那行的选择器（对标 Cursor / OpenCode / Cline：模型与模式就放在输入框上） ---------- */
+.pop-up { top: auto; bottom: calc(100% + 8px); left: 0; right: auto; animation: pop-up-in .12s ease-out; }
+@keyframes pop-up-in { from { opacity: 0; transform: translateY(4px); } }
+.tool-pill.pill-sm { height: 28px; padding: 0 8px 0 6px; max-width: 260px; font-size: 12px; background: transparent; }
+.tool-pill.pill-sm:hover { background: var(--hover); }
+.tool-pill.pill-sm .tool-pill-text { font-size: 12px; }
+.tool-pill.pill-sm .caret { opacity: .55; }
+.composer-bar .pop-anchor { display: inline-flex; }
+.composer-bar .brand-chip { width: 18px; height: 18px; font-size: 9px; border-radius: 5px; }
+.composer-bar .brand-chip.chip-ic .ic { width: 11px; height: 11px; }
