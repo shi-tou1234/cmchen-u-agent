@@ -291,19 +291,59 @@ function bindGlobal() {
   S.onSessionTouched = () => refreshSessions();
 }
 
+/* ================= 启动自检 ================= */
+// 页面与服务对不上（浏览器缓存了旧脚本、或控制台窗口里跑的还是旧版服务）是"密码框整页刷新"的元凶，
+// 这里主动查一遍并把话说明白，而不是让人对着刷新的页面发懵。
+function bootWarn(msg) {
+  const w = $("#bootWarn");
+  if (!w) return;
+  w.hidden = false;
+  w.textContent = "⚠ " + msg;
+}
+async function selfCheck() {
+  const pageVer = document.querySelector('meta[name="ua-version"]')?.content || "?";
+  try {
+    const j = await api.health();
+    if (j.version && j.version !== pageVer) {
+      bootWarn("服务在跑旧版（v" + j.version + "），页面是 v" + pageVer + "：关掉那个黑色控制台窗口、重新双击 启动U-Agent.bat 就好（这样它才会加载新代码）。");
+      return false;
+    }
+  } catch {
+    bootWarn("连不上本地服务了：控制台窗口可能被关掉了，重新双击 启动U-Agent.bat。");
+    return false;
+  }
+  return true;
+}
+
 /* ================= 入口 ================= */
 (function main() {
-  net.onLocked = () => showLock(false);
-  initTheme();
-  chat.initChat();
-  initSettings();
-  initPicker();
-  bindGlobal();
-  chat.renderWelcome();
-  chat.setSendUI();
-  renderSessionList();
-
+  // 密码锁的绑定放在最前面：后面任何一处出错都不该让密码屏失灵
   $("#lockForm").onsubmit = (e) => { e.preventDefault(); goLock(); };
+  document.documentElement.dataset.uaReady = "1"; // 告诉看门狗：脚本跑起来了
+
+  net.onLocked = () => showLock(false);
+  const steps = [
+    ["主题", initTheme],
+    ["对话区", chat.initChat],
+    ["设置面板", initSettings],
+    ["顶栏选择器", initPicker],
+    ["全局绑定", bindGlobal],
+  ];
+  for (const [name, fn] of steps) {
+    try {
+      fn();
+    } catch (e) {
+      // 一处坏掉不影响其它：把错说出来（并提示可能是缓存混版），密码屏照旧可用
+      console.error("[u-agent] 初始化「" + name + "」失败：", e);
+      bootWarn("界面初始化「" + name + "」出错（" + (e?.message || e) + "）。先按 Ctrl+F5 强制刷新；还不行就把这段告诉开发。");
+    }
+  }
+  try {
+    chat.renderWelcome();
+    chat.setSendUI();
+    renderSessionList();
+  } catch {}
 
   api.status().then((st) => showLock(!!st.setup, st)).catch(() => showLock(false));
+  selfCheck();
 })();

@@ -843,3 +843,9 @@ ul.dots li { margin: 3px 0; }
 .composer-bar .pop-anchor { display: inline-flex; }
 .composer-bar .brand-chip { width: 18px; height: 18px; font-size: 9px; border-radius: 5px; }
 .composer-bar .brand-chip.chip-ic .ic { width: 11px; height: 11px; }
+
+/* 启动自检横幅（页面与服务对不上时贴在顶上，替掉"莫名其妙一直刷新"） */
+.boot-warn { position: fixed; top: 0; left: 0; right: 0; z-index: 999; padding: 10px 16px;
+  background: var(--warn-soft); color: var(--warn); border-bottom: 1px solid var(--line-strong);
+  font-size: 13px; line-height: 1.6; text-align: center; }
+.boot-warn[hidden] { display: none; }
