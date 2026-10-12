@@ -200,10 +200,11 @@ function deleteRow(node, id) {
 async function loadSession(id) {
   if (S.sending) return;
   try {
-    const j = await api.session(id);
+    const j = await api.session(id, S.provider || S.active);
     S.sessionId = id;
     S.tokens = { input: 0, output: 0 };
     if (j.budget) S.budget = j.budget;
+    if (j.context) S.context = j.context;
     chat.renderHistory(j.events);
     chat.renderUsage();
     const hit = allSessions.find((s) => s.id === id);
@@ -221,7 +222,7 @@ function newChat() {
   if (S.sending) return;
   S.sessionId = null;
   S.plan = null;
-  S.budget = { chars: 0, tokens: 0, over: false };
+  S.budget = { chars: 0, tokens: 0, limitTokens: 0, windowTokens: 0, pct: 0, over: false };
   S.tokens = { input: 0, output: 0 };
   setTitle("新会话");
   chat.clearStream();

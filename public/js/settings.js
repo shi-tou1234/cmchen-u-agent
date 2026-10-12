@@ -3,7 +3,7 @@
 import { api } from "./api.js";
 import { S, setMode, MODES, ACTION_META, DEFAULT_AUTO_APPROVE } from "./state.js";
 import { $, $$, el, esc, icon, toast } from "./ui.js";
-import { fillProviders } from "./chat.js";
+import { fillProviders, showThinking, setShowThinking } from "./chat.js";
 import { brandChip } from "./picker.js";
 import { notifyOn, setNotifyOn, askPermission, notifyGranted } from "./notify.js";
 import { CATALOG, GROUPS, providerFromPreset, presetById, matchPreset, protocolForModel, normalizeBaseURL } from "./catalog.js";
@@ -181,6 +181,10 @@ function renderProviders() {
           <label class="field"><span class="field-label">模型名</span><input class="input mo" value="${esc(p.model || "")}" spellcheck="false"></label>
           <label class="field"><span class="field-label">钥匙</span><input class="input ky" type="password" placeholder="${p.secret ? "已保存，留空表示不改" : "填进去后加密保存到 U 盘"}" spellcheck="false" autocomplete="off"></label>
         </div>
+        <div class="prov-grid">
+          <label class="field"><span class="field-label">上下文窗口（token）</span><input class="input cw" type="number" min="0" step="1024" value="${p.contextWindow ? Number(p.contextWindow) : ""}" placeholder="留空 = 按模型自动" spellcheck="false"></label>
+          <div class="field"><span class="field-label">这一条的能力</span><p class="field-help cwinfo"></p></div>
+        </div>
         <div class="prov-foot">
           <button class="btn btn-ghost" data-act="test"><svg class="ic ic-sm"><use href="#i-refresh"/></svg>测试连接</button>
           <button class="ghost-btn" data-act="fetch"><svg class="ic ic-sm"><use href="#i-search"/></svg>拉取模型列表</button>
@@ -299,6 +303,13 @@ function renderProviders() {
     moEl.addEventListener("blur", syncProtocol);
     node.querySelector(".ky").addEventListener("input", () => { read(); markDirty(); });
 
+    // 上下文窗口：留空就按模型自动匹配（服务端有 models.dev 的能力表），改了就立刻重算给人看
+    const cwEl = node.querySelector(".cw");
+    const recompute = () => { read(); refreshCwInfo(node, p); markDirty(); };
+    cwEl?.addEventListener("input", recompute);
+    moEl.addEventListener("blur", () => { read(); refreshCwInfo(node, p); });
+    refreshCwInfo(node, p);
+
     const fixBtn = node.querySelector('[data-act="fixproto"]');
     if (fixBtn) {
       fixBtn.onclick = (e) => {
@@ -339,6 +350,29 @@ function readRow(node, p) {
   p.model = node.querySelector(".mo").value.trim();
   const ky = node.querySelector(".ky").value;
   if (ky) p.secret = ky;
+  const cw = Number(node.querySelector(".cw")?.value) || 0;
+  if (cw > 0) p.contextWindow = cw;
+  else delete p.contextWindow; // 留空 = 按模型自动匹配
+}
+
+// 让服务端按模型能力表算出「窗口多大、预算多少、支不支持思考」，卡片上直接显示
+// 序号要按卡片记：每张卡各查各的，别互相把对方的结果作废（之前用全局序号，只有最后一张卡显示出来了）
+async function refreshCwInfo(node, p) {
+  const box = node.querySelector(".cwinfo");
+  if (!box) return;
+  const seq = String((Number(node.dataset.cwSeq) || 0) + 1);
+  node.dataset.cwSeq = seq;
+  box.textContent = "算一下…";
+  try {
+    const info = await api.modelInfo(p);
+    if (node.dataset.cwSeq !== seq || !box.isConnected) return; // 这张卡又改过了，丢弃旧结果
+    const kk = (n) => (n >= 1000 ? Math.round(n / 1000) + "k" : String(n));
+    box.innerHTML =
+      `窗口 <b>${kk(info.windowTokens)}</b> · 可用预算 <b>${kk(info.limitTokens)}</b>` +
+      ` · 思考${info.reasoning ? "支持（会自动开）" : "不支持"}<br><span class="muted">窗口数据：${esc(info.source)}${info.model ? " · " + esc(info.model) : ""}</span>`;
+  } catch (e) {
+    if (box.isConnected) box.textContent = e.message || "算不出来";
+  }
 }
 
 /* 模型名快选条：从厂商拉回来的清单直接点一下就用 */
@@ -783,6 +817,20 @@ export function initSettings() {
     renderNotifyHelp();
     if (notifyOn()) askPermission();
   };
+  // 对话显示：思考过程显隐（只存浏览器本地）
+  const syncThink = () => {
+    $("#thinkOn").checked = showThinking();
+    $("#thinkState").textContent = showThinking() ? "开启" : "关闭";
+  };
+  syncThink();
+  $("#thinkOn").onchange = () => {
+    setShowThinking($("#thinkOn").checked);
+    syncThink();
+    $(".think").forEach((n) => (n.hidden = !showThinking()));
+    window.dispatchEvent(new CustomEvent("ua:thinking-change", { detail: { on: showThinking() } }));
+  };
+  window.addEventListener("ua:thinking-change", syncThink);
+
   $("#notifyTest").onclick = () => {
     askPermission();
     if (notifyGranted()) new Notification("u-agent 的提醒长这样", { body: "跑完、需要你批准或出错时，它就会这样喊你" });

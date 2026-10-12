@@ -8,6 +8,28 @@
 //   {type:"text", delta} {type:"tool_start", id, name} {type:"tool_delta", id, delta}
 //   {type:"error", message} {type:"end", stopReason, toolCalls:[{id,name,args:object}]}
 import { truncate } from "./util.mjs";
+import { modelInfo } from "./model-windows.mjs";
+
+// anthropic 协议的思考是「不开就没有」：按模型能力表判断能不能开，默认开（模型不支持的会给值 0）
+function thinkingBudgetOf(provider) {
+  if (provider?.thinking === false) return 0;
+  try {
+    if (!modelInfo(provider?.model, { contextWindow: provider?.contextWindow }).reasoning) return 0;
+  } catch {
+    return 0;
+  }
+  const custom = Number(provider?.thinkingBudget);
+  return Math.max(1024, Math.min(custom > 0 ? custom : 4096, 32768));
+}
+
+// 认得出模型就按它的真实输出上限来；认不出按 8k
+function outLimitOf(provider) {
+  try {
+    return Math.min(modelInfo(provider?.model, { contextWindow: provider?.contextWindow }).out || 8192, 65536);
+  } catch {
+    return 8192;
+  }
+}
 
 export const UA = "u-agent/1.0"; // 网关（如 OpenCode Go）要求客户端自报家门，别用默认的 HTTP 库名
 
@@ -192,6 +214,8 @@ function bodyOpenaiResponses(provider, messages, tools) {
     model: provider.model,
     input,
     stream: true,
+    // 让它把思考摘要一起流出来（有的网关不认这个字段，见下面的 400 重试）
+    ...(provider.thinking === false ? {} : { reasoning: { summary: "auto" } }),
     ...(tools.length
       ? { tools: tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.params })) }
       : {}),
@@ -218,6 +242,8 @@ function bodyAnthropic(provider, messages, tools) {
       pushBlocks("user", blocks);
     } else if (m.role === "assistant") {
       const blocks = [];
+      // 开了思考就必须把上一步的 thinking 块（含签名）原样带回去，否则 API 会拒；别的协议不用带
+      if (m.thinking?.text) blocks.push({ type: "thinking", thinking: m.thinking.text, signature: m.thinking.signature || "" });
       if (m.text) blocks.push({ type: "text", text: m.text });
       for (const tc of m.toolCalls || []) blocks.push({ type: "tool_use", id: tc.id, name: tc.name, input: tc.args ?? {} });
       msgs.push({ role: "assistant", content: blocks.length ? blocks : [{ type: "text", text: "" }] });
@@ -225,9 +251,12 @@ function bodyAnthropic(provider, messages, tools) {
       pushBlocks("user", [{ type: "tool_result", tool_use_id: m.toolCallId, content: m.text }]);
     }
   }
+  const outLimit = outLimitOf(provider);
+  const thinkBudget = thinkingBudgetOf(provider);
   return {
     model: provider.model,
-    max_tokens: 8192,
+    max_tokens: thinkBudget ? Math.max(outLimit, thinkBudget + 2048) : outLimit,
+    ...(thinkBudget ? { thinking: { type: "enabled", budget_tokens: thinkBudget } } : {}),
     ...(system ? { system } : {}),
     messages: msgs,
     stream: true,
@@ -299,6 +328,11 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
     if (j.usage) yield { type: "usage", input: j.usage.prompt_tokens || 0, output: j.usage.completion_tokens || 0 };
     const ch = j.choices?.[0];
     const d = ch?.delta;
+    // 思考过程：不同网关字段名不一样，能认的全认（DeepSeek/GLM/Kimi 用 reasoning_content，
+    // OpenRouter 系用 reasoning，个别网关叫 thinking）
+    if (d?.reasoning_content) yield { type: "reasoning", delta: d.reasoning_content };
+    else if (typeof d?.reasoning === "string" && d.reasoning) yield { type: "reasoning", delta: d.reasoning };
+    else if (typeof d?.thinking === "string" && d.thinking) yield { type: "reasoning", delta: d.thinking };
     if (d?.content) yield { type: "text", delta: d.content };
     for (const tc of d?.tool_calls || []) {
       const i = tc.index ?? 0;
@@ -330,7 +364,13 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
 
 async function* streamOpenaiResponses(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
-  const res = await postStream(url, headers, bodyOpenaiResponses(provider, messages, tools), signal);
+  const reqBody = bodyOpenaiResponses(provider, messages, tools);
+  let res = await postStream(url, headers, reqBody, signal);
+  if (res.status === 400 && reqBody.reasoning) {
+    // 有的网关不认 reasoning（思考摘要）字段，去掉后重试一次
+    delete reqBody.reasoning;
+    res = await postStream(url, headers, reqBody, signal);
+  }
   await assertOk(res, provider);
   const calls = new Map(); // call_id → {name, args}
   let stop = "stop";
@@ -343,7 +383,9 @@ async function* streamOpenaiResponses(provider, messages, tools, signal) {
     }
     const type = j.type || "";
     if (type === "response.output_text.delta") yield { type: "text", delta: j.delta || "" };
-    else if (type === "response.output_item.added" && j.item?.type === "function_call") {
+    else if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
+      yield { type: "reasoning", delta: j.delta || "" }; // 思考摘要：流给界面看，不必回传
+    } else if (type === "response.output_item.added" && j.item?.type === "function_call") {
       calls.set(j.item.call_id, { name: j.item.name, args: j.item.arguments || "" });
       yield { type: "tool_start", id: j.item.call_id, name: j.item.name };
     } else if (type === "response.output_item.done" && j.item?.type === "function_call") {
@@ -379,6 +421,9 @@ async function* streamAnthropic(provider, messages, tools, signal) {
   const calls = new Map(); // index → {id, name, args}
   let stop = "stop";
   let curTool = null;
+  let thinkText = "";
+  let signature = "";
+  let inThinking = false;
   for await (const data of sseLines(res)) {
     let j;
     try {
@@ -387,18 +432,28 @@ async function* streamAnthropic(provider, messages, tools, signal) {
       continue;
     }
     const type = j.type || "";
-    if (type === "content_block_start" && j.content_block?.type === "tool_use") {
+    if (type === "content_block_start" && j.content_block?.type === "thinking") {
+      inThinking = true;
+      thinkText = "";
+      signature = "";
+    } else if (type === "content_block_start" && j.content_block?.type === "tool_use") {
       curTool = { index: j.index, id: j.content_block.id, name: j.content_block.name, args: "" };
       calls.set(j.index, curTool);
       yield { type: "tool_start", id: curTool.id, name: curTool.name };
     } else if (type === "content_block_delta") {
       if (j.delta?.type === "text_delta") yield { type: "text", delta: j.delta.text };
-      else if (j.delta?.type === "input_json_delta" && curTool) {
+      else if (j.delta?.type === "thinking_delta") {
+        thinkText += j.delta.thinking || "";
+        yield { type: "reasoning", delta: j.delta.thinking || "" };
+      } else if (j.delta?.type === "signature_delta") {
+        signature = j.delta.signature || signature; // 签名要在多轮里原样带回去，不然 API 会拒
+      } else if (j.delta?.type === "input_json_delta" && curTool) {
         curTool.args += j.delta.partial_json || "";
         yield { type: "tool_delta", id: curTool.id, delta: j.delta.partial_json || "" };
       }
     } else if (type === "content_block_stop") {
       curTool = null;
+      inThinking = false;
     } else if (type === "message_delta") {
       if (j.usage) yield { type: "usage", input: 0, output: j.usage.output_tokens || 0 };
       if (j.delta?.stop_reason === "tool_use") stop = "tool_calls";
@@ -421,7 +476,7 @@ async function* streamAnthropic(provider, messages, tools, signal) {
     }
     return { id: a.id, name: a.name, args };
   });
-  yield { type: "end", stopReason: toolCalls.length ? "tool_calls" : stop, toolCalls };
+  yield { type: "end", stopReason: toolCalls.length ? "tool_calls" : stop, toolCalls, thinking: thinkText ? { text: thinkText, signature } : null };
 }
 
 // ---------- Mock provider（离线演示 + 全部测试的确定性脚本） ----------
@@ -448,6 +503,13 @@ async function* streamMock(provider, messages, tools, signal) {
   // 只数「最后一条用户消息之后」的工具步，避免把历史旧轮次的工具算进剧本进度
   const toolCount = messages.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length;
   const rest = script.slice(toolCount);
+  // 剧本里写 think:"…" 就先吐一段思考过程，方便离线演示与测试
+  if (rest.length && rest[0].think) {
+    for (const ch of String(rest[0].think)) {
+      yield { type: "reasoning", delta: ch };
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  }
   if (rest.length && rest[0].tool) {
     const step = rest[0];
     const id = `mock_${Math.random().toString(36).slice(2, 8)}`;

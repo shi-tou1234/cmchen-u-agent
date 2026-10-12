@@ -1,6 +1,6 @@
 // 对话区：消息渲染、SSE 收发、工具/计划卡、高危确认、斜杠命令、附件
 import { api } from "./api.js";
-import { S, setMode, MODES, MODE_HINT, ACTION_META, BUDGET_CHARS } from "./state.js";
+import { S, setMode, MODES, MODE_HINT, ACTION_META } from "./state.js";
 import { $, $$, el, esc, icon, md, toast, kb } from "./ui.js";
 import { renderModelBtn } from "./picker.js";
 import { ping, askPermission } from "./notify.js";
@@ -58,6 +58,16 @@ export async function sendMessage(text) {
     exportSession();
     return;
   }
+  if (clean === "/thinking") {
+    clearComposer();
+    toggleThinking();
+    return;
+  }
+  if (clean === "/details") {
+    clearComposer();
+    toggleDetails();
+    return;
+  }
 
   let body = clean;
   if (S.texts.length) {
@@ -83,6 +93,7 @@ export async function sendMessage(text) {
   let full = "";
   const tools = new Map();
   const subs = new Map();
+  const think = { node: null, text: "", started: 0, timer: null }; // 整轮复用同一个：思考块只该有一个
   const ctrl = new AbortController();
   window.__abort = ctrl;
 
@@ -109,7 +120,15 @@ export async function sendMessage(text) {
         if (!line.startsWith("data:")) continue;
         let ev;
         try { ev = JSON.parse(line.slice(5)); } catch { continue; }
-        handleEvent(ev, { tools, subs, getStream: () => streamNode, setStream: (n) => (streamNode = n), getFull: () => full, setFull: (t) => (full = t) });
+        handleEvent(ev, {
+          tools,
+          subs,
+          think,
+          getStream: () => streamNode,
+          setStream: (n) => (streamNode = n),
+          getFull: () => full,
+          setFull: (t) => (full = t),
+        });
       }
     }
   } catch (e) {
@@ -136,21 +155,67 @@ function handleEvent(ev, c) {
     case "session":
       S.sessionId = ev.sessionId;
       if (ev.budget) { S.budget = ev.budget; }
+      if (ev.context) S.context = ev.context; // 这个模型的窗口多大、数据从哪来
       if (ev.provider) S.provider = ev.provider;
       S.onSessionTouched && S.onSessionTouched();
       break;
     case "usage": S.tokens = { input: ev.input, output: ev.output }; break;
-    case "budget": if (ev.budget) S.budget = ev.budget; break;
+    case "budget": if (ev.budget) S.budget = ev.budget; if (ev.context) S.context = ev.context; break;
     case "plan": renderPlan(ev.items); break;
     case "assistant_delta": {
+      // 开始出正文了：把这一轮的思考块收起来，并让下一轮可以再开一块（mutate，不能整个替换，否则共享状态断了）
+      if (c.think.node) {
+        finishThink(c.think.node, c.think.text, Date.now() - c.think.started);
+        clearInterval(c.think.timer);
+        c.think.node = null;
+        c.think.text = "";
+        c.think.started = 0;
+        c.think.timer = null;
+      }
       c.setFull(c.getFull() + ev.delta);
       c.getStream().querySelector(".text").textContent = c.getFull();
       scrollEnd();
       break;
     }
+    // 思考过程：流式展开，等正文一来就收成一行「已思考 N 秒」
+    case "reasoning_delta": {
+      if (!showThinking()) break;
+      if (!c.think.node) {
+        c.think.node = addThink(c.getStream());
+        c.think.started = Date.now();
+        c.think.text = "";
+        const node = c.think.node;
+        c.think.timer = setInterval(() => tickThink(node), 500);
+      }
+      c.think.text += ev.delta;
+      c.think.node.querySelector(".th-body").textContent = c.think.text;
+      if (c.think.text.length > 40000) c.think.text = c.think.text.slice(-40000);
+      scrollEnd();
+      break;
+    }
+    case "reasoning": {
+      if (c.think.node) {
+        finishThink(c.think.node, ev.text || c.think.text, ev.ms || Date.now() - c.think.started);
+        clearInterval(c.think.timer);
+        c.think.node = null;
+        c.think.text = "";
+        c.think.started = 0;
+        c.think.timer = null;
+      }
+      break;
+    }
     case "assistant_message": {
+      if (c.think.node) {
+        finishThink(c.think.node, c.think.text, Date.now() - c.think.started);
+        clearInterval(c.think.timer);
+        c.think.node = null;
+        c.think.text = "";
+        c.think.started = 0;
+        c.think.timer = null;
+      }
       c.setFull(ev.text);
-      finishAi(c.getStream(), c.getFull());
+      if (c.getFull().trim()) finishAi(c.getStream(), c.getFull());
+      else c.getStream().remove(); // 只思考没正文（罕见）：别留个空气泡
       const next = addStream();
       c.setStream(next);
       c.setFull("");
@@ -233,7 +298,7 @@ export function renderWelcome(info) {
 }
 
 function addUser(text, images) {
-  if ($("#welcome")) clearStream();
+  if ($(".welcome")) clearStream();
   const imgs = (images || []).map((i) => `<img class="att-img" src="data:${i.mediaType};base64,${i.data}">`).join("");
   const node = el(`<div class="msg msg-user"><div class="bubble">${md(text)}${imgs}</div>
     <button class="rw-btn" title="从这里重来：后面这段不再进上下文，这条消息放回输入框">${icon("refresh", "ic ic-sm")}从这儿重来</button></div>`);
@@ -333,24 +398,108 @@ export function refreshWelcomeNote() {
   n.textContent = S.workspace ? "工作区：" + S.workspace : "还没设置工作区，点左下角「设置」挑一个文件夹";
 }
 
-/* ---- 工具卡 ---- */
+/* ---- 思考块：先流式展开，正文一来就收成「已思考 N 秒」（点开还能看） ---- */
+const THINK_KEY = "ua_show_thinking";
+export function showThinking() {
+  return localStorage.getItem(THINK_KEY) !== "off";
+}
+export function setShowThinking(on) {
+  localStorage.setItem(THINK_KEY, on ? "on" : "off");
+}
+
+function addThink(before) {
+  const node = el(`<details class="think" open><summary>
+      <span class="th-mark">✻</span>
+      <span class="th-head">思考中…</span>
+      ${icon("chevron-down", "ic ic-sm chev")}
+    </summary><div class="th-body"></div></details>`);
+  // 回复气泡在发送时就建好了，思考块要插在它前面才读得顺
+  if (before?.isConnected) before.parentNode.insertBefore(node, before);
+  else colEl().appendChild(node);
+  scrollEnd();
+  return node;
+}
+function tickThink(node) {
+  if (!node?.isConnected) return;
+  const started = Number(node.dataset.started || 0);
+  const sec = started ? Math.max(1, Math.round((Date.now() - started) / 1000)) : 0;
+  node.querySelector(".th-head").textContent = sec ? `思考中… ${sec} 秒` : "思考中…";
+}
+function finishThink(node, text, ms) {
+  if (!node || !node.isConnected) return;
+  node.open = false; // 正文来了就收起来，想看再点开
+  const sec = ms ? Math.max(1, Math.round(ms / 1000)) : 0;
+  node.querySelector(".th-head").textContent = sec ? `已思考 ${sec} 秒` : "思考过程";
+  const body = node.querySelector(".th-body");
+  if (text) body.textContent = text;
+  body.classList.add("done");
+  scrollEnd();
+}
+// 历史回放里的思考块：直接就是收起来的状态
+function addThinkStatic(text, ms) {
+  if (!text) return null;
+  const node = addThink();
+  finishThink(node, text, ms || 0);
+  return node;
+}
+
+// /thinking：显隐思考过程（跟 OpenCode 的 /thinking 一个意思，只影响显示，不改模型行为）
+export function toggleThinking() {
+  const on = !showThinking();
+  setShowThinking(on);
+  $$(".think").forEach((n) => (n.hidden = !on)); // 已经渲染出来的就地显隐，不必重刷会话
+  toast(on ? "已显示思考过程（之后的回复会出现「已思考 N 秒」的小块）" : "已隐藏思考过程", "ok");
+  window.dispatchEvent(new CustomEvent("ua:thinking-change", { detail: { on } }));
+}
+// /details：把所有工具调用条一起展开 / 收起
+export function toggleDetails() {
+  const all = $$(".tools .tool");
+  if (!all.length) return toast("这条会话里还没有工具调用", "err");
+  const anyClosed = all.some((d) => !d.open);
+  all.forEach((d) => (d.open = anyClosed));
+  toast(anyClosed ? `已展开 ${all.length} 条工具调用` : "已收起全部工具调用", "ok");
+}
+
+/* ---- 工具调用条：单行、连续调用归一组、点开看参数与结果（对标 codex 的 • Ran …） ---- */
+function summaryOf(ev) {
+  const a = ev.args || {};
+  return String(a.path || a.command || a.query || a.task || a.message || a.url || a.name || "").slice(0, 100);
+}
+function toolGroup() {
+  const last = colEl().lastElementChild;
+  if (last && last.classList.contains("tools")) return last;
+  const box = el('<div class="tools"></div>');
+  colEl().appendChild(box);
+  return box;
+}
 function addTool(ev) {
   const [label, cls] = T_STATE[ev._state || "pending"] || T_STATE.pending;
   const a = ev.args || {};
-  const summary = a.path || a.command || a.query || a.task || a.message || a.url || "";
-  const node = el(`<details class="tool"><summary>
+  const node = el(`<details class="tool" data-id="${esc(ev.id || "")}"><summary>
+      <span class="t-run"></span>
       ${icon(T_ICON[ev.name] || "info", "ic ic-sm t-ic")}
       <span class="t-name">${esc(ev.name)}</span>
-      <span class="t-sum">${esc(String(summary).slice(0, 90))}</span>
+      <span class="t-sum">${esc(summaryOf(ev))}</span>
+      <span class="t-res"></span>
       <span class="badge ${cls}">${label}</span>
       ${icon("chevron-down", "ic ic-sm chev")}
     </summary><div class="t-body">
       <div><div class="t-lb">参数</div><pre>${esc(JSON.stringify(a, null, 2))}</pre></div>
       <div><div class="t-lb">结果</div><pre class="rres">执行中…</pre></div>
     </div></details>`);
-  colEl().appendChild(node);
+  node.dataset.started = Date.now();
+  toolGroup().appendChild(node);
   scrollEnd();
   return node;
+}
+
+// 结果不长就把它的一行摘要直接摆在条上（codex 就是这样：• Ran … 下面跟两行输出）
+function inlineResult(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+  const first = t.split("\n")[0].trim();
+  if (t.length <= 90 && !t.includes("\n")) return { inline: first, more: 0 };
+  return { inline: first.slice(0, 90), more: t.split("\n").length };
 }
 
 function finishTool(node, ev) {
@@ -359,6 +508,14 @@ function finishTool(node, ev) {
   b.textContent = label + (ev.ms ? ` · ${ev.ms}ms` : "");
   b.className = "badge " + cls;
   node.querySelector(".rres").textContent = ev.text || "";
+  const { inline, more } = inlineResult(ev.text);
+  const res = node.querySelector(".t-res");
+  if (res) {
+    res.textContent = inline ? (more > 1 ? `${inline} …（${more} 行）` : inline) : "";
+    res.className = "t-res" + (ev.ok === false || ev.denied ? " bad" : "");
+  }
+  node.querySelector(".t-run")?.remove();
+  node.classList.add("done");
   node.open = ev.ok === false || !!ev.denied;
   scrollEnd();
 }
@@ -539,6 +696,7 @@ export function renderHistory(events) {
     switch (ev.type) {
       case "plan": renderPlan(ev.items); break;
       case "compact": break;
+      case "reasoning": if (showThinking()) addThinkStatic(ev.text, ev.ms); break;
       case "rewind": colEl().appendChild(el(rewindLine({ dropped: ev.dropped }))); break;
       case "user": addUser(ev.text, ev.images); break;
       case "assistant_message": { const n = addStream(); finishAi(n, ev.text); break; }
@@ -555,32 +713,33 @@ export function renderHistory(events) {
 }
 
 /* ================= 用量 / 提示 ================= */
-const KBUDGET = Math.round(BUDGET_CHARS / 1000);
+// 上下文占用按「这个模型真实能吃多少 token」显示（窗口数据来自 models.dev），不再拿写死的字数吓人
+const kTok = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n || 0));
 
-// 输入区上方那条状态栏：左边是权限模式与「自动放行了几项」，右边是上下文占用
 export function renderUsage() {
-  const chars = S.budget.chars || 0;
-  const pct = chars ? Math.min(100, Math.round((chars / BUDGET_CHARS) * 100)) : 0;
+  const b = S.budget || {};
+  const tokens = b.tokens || 0;
+  const limit = b.limitTokens || 0;
+  const pct = limit ? Math.min(100, Math.round((tokens / limit) * 100)) : b.pct || 0;
   const wrap = $("#ctxWrap");
-  wrap.classList.toggle("empty", !chars);
-  $("#ctxFill").style.width = (chars ? Math.max(4, pct) : 0) + "%";
+  wrap.classList.toggle("empty", !tokens);
+  $("#ctxFill").style.width = (tokens && limit ? Math.max(2, pct) : 0) + "%";
   wrap.classList.toggle("warn", pct >= 70 && pct < 90);
-  wrap.classList.toggle("over", pct >= 90 || !!S.budget.over);
-  wrap.title = chars
-    ? `本轮上下文约 ${chars} 字（估算 ${S.budget.tokens || 0} tokens），预算 ${KBUDGET}k 字${pct >= 90 ? " —— 建议点「压缩」" : ""}`
+  wrap.classList.toggle("over", pct >= 90 || (limit && tokens > limit));
+  const win = S.context?.windowTokens || b.windowTokens || 0;
+  wrap.title = tokens
+    ? `本轮上下文约 ${tokens.toLocaleString()} tokens，可用预算 ${limit.toLocaleString()}（模型窗口 ${win.toLocaleString()}${
+        S.context?.source ? " · " + S.context.source : ""
+      }）${pct >= 90 ? " —— 建议点「压缩」" : ""}`
     : "还没有对话内容";
 
   const bar = $("#ctxText");
-  if (!chars) {
-    bar.textContent = "上下文空";
-  } else if (pct >= 90) {
-    bar.textContent = `${(chars / 1000).toFixed(1)}k / ${KBUDGET}k · 该压缩了`;
-  } else {
-    bar.textContent = `${(chars / 1000).toFixed(1)}k / ${KBUDGET}k · ${pct}%`;
-  }
+  if (!tokens) bar.textContent = "上下文空";
+  else if (pct >= 90) bar.textContent = `${kTok(tokens)} / ${kTok(limit)} · 该压缩了`;
+  else bar.textContent = `${kTok(tokens)} / ${kTok(limit)} · ${pct}%`;
   const compact = $("#ctxCompact");
   compact.classList.toggle("hot", wrap.classList.contains("over"));
-  compact.disabled = !chars;
+  compact.disabled = !tokens;
 
   const total = S.tokens.input + S.tokens.output;
   $("#usage").textContent = total ? `本轮 ${total} tokens` : "";
@@ -615,8 +774,32 @@ export function renderAutoApproveBar() {
   }
 }
 
+let runTimer = null;
+let runStart = 0;
+// 顶栏「运行中 N 秒」+ 停止：长任务时不用翻到底部输入框才知道它还在跑
+function renderRunChip() {
+  const chip = $("#runChip");
+  if (!chip) return;
+  chip.hidden = !S.sending;
+  if (!S.sending) {
+    clearInterval(runTimer);
+    runTimer = null;
+    runStart = 0;
+    return;
+  }
+  if (!runStart) runStart = Date.now();
+  clearInterval(runTimer);
+  const tick = () => {
+    const s = Math.round((Date.now() - runStart) / 1000);
+    $("#runText").textContent = "运行中 " + (s >= 60 ? Math.floor(s / 60) + " 分 " + (s % 60) + " 秒" : s + " 秒");
+  };
+  tick();
+  runTimer = setInterval(tick, 1000);
+}
+
 export function setSendUI() {
   const btn = $("#send");
+  renderRunChip();
   btn.classList.toggle("busy", S.sending);
   btn.innerHTML = S.sending ? icon("stop") : icon("send");
   btn.title = S.sending ? "停止" : "发送（Enter）";
@@ -669,6 +852,8 @@ const CMDS = [
   { cmd: "/model", desc: "切换模型通道", sub: "model" },
   { cmd: "/compact", desc: "压缩上下文；后面可以接要求，如「/compact 保留接口细节」" },
   { cmd: "/export", desc: "把这次会话导出成 Markdown 文件" },
+  { cmd: "/thinking", desc: "显示 / 隐藏模型的思考过程" },
+  { cmd: "/details", desc: "展开 / 收起所有工具调用的参数与结果" },
   { cmd: "/init", desc: "让 agent 通读工作区，生成 AGENTS.md" },
   { cmd: "/status", desc: "查看当前状态" },
   { cmd: "/remember", desc: "写入跨会话记忆（空格后接内容）" },
@@ -795,6 +980,8 @@ function palPick() {
     case "/new": clearComposer(); $("#newChat").click(); return;
     case "/compact": clearComposer(); doCompact(); return;
     case "/export": clearComposer(); exportSession(); return;
+    case "/thinking": clearComposer(); toggleThinking(); return;
+    case "/details": clearComposer(); toggleDetails(); return;
     case "/remember": $("#txt").value = "/remember "; focusInput(); return;
     case "/init": setInput("请通读工作区（用 fs_list / fs_search / fs_read），在工作区根目录生成一份 AGENTS.md：说明这个文件夹的用途、关键文件、常用命令和注意事项，精炼实用。"); return;
     default: clearComposer(); showStatus(true);
@@ -1034,6 +1221,7 @@ export function initChat() {
     toast(`粘贴内容里有 ${dirty} 个不可见字符，已清掉（防提示词走私）`, "err");
   });
   $("#send").onclick = () => (S.sending ? abortRun() : sendMessage(txtEl().value));
+  $("#runStop").onclick = () => abortRun();
   $("#ctxCompact").onclick = () => doCompact();
   $("#attach").onclick = () => $("#file").click();
   $("#file").onchange = (e) => { addFiles([...e.target.files]); e.target.value = ""; };

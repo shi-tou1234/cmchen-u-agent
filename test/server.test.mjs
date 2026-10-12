@@ -1008,3 +1008,43 @@ test("v8.2 新增：连不上时对话里也给人话报错（不是 fetch faile
   assert.ok(!/^fetch failed$/.test(err.message), "不许只甩一句 fetch failed");
   await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
 });
+
+/* ===== v0.9：按模型真实窗口算预算 + 思考过程进流与日志 ===== */
+test("v9 新增：预算按模型窗口算（不是写死的字数），Mock 的思考过程能流出来并落盘", async () => {
+  // 用一条认得出的通道：窗口应该有几十万 token 级
+  const big = { name: "BigCtx", protocol: "openai-chat", baseURL: "https://api.deepseek.com", model: "deepseek-v4-pro", secret: "sk-x" };
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, big], active: "BigCtx", workspace: wsDir });
+  const r = await chat({ sessionId: "s-ctx-window", mode: "confirm", provider: "BigCtx", message: { text: "你好" } });
+  const sess = r.events.find((e) => e.type === "session");
+  assert.ok(sess, "应有 session 事件");
+  assert.ok(sess.budget.limitTokens >= 200000, `预算应按真实窗口给，实际 ${sess.budget.limitTokens}`);
+  assert.ok(sess.context.windowTokens >= 500000, `deepseek-v4 窗口应百万级，实际 ${sess.context.windowTokens}`);
+  assert.match(sess.context.source, /models.dev/);
+
+  // 思考过程：Mock 剧本里写 think → reasoning_delta 流式 + 一条 reasoning 事件落盘
+  const sid = "s-think";
+  const script = [{ think: "先数一下文件。", say: "看完了。" }];
+  const t = await chat({ sessionId: sid, mode: "confirm", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } });
+  const deltas = t.events.filter((e) => e.type === "reasoning_delta").map((e) => e.delta).join("");
+  assert.equal(deltas, "先数一下文件。", "思考过程要流给界面");
+  const one = t.events.find((e) => e.type === "reasoning");
+  assert.ok(one && one.text.includes("先数一下文件"), "收尾要有一条完整思考事件");
+  assert.match(sessionLog(sid), /"type":"reasoning"/, "思考过程要进会话日志（回放还能看到）");
+
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+});
+
+test("v9 新增：通道可手动指定上下文窗口，覆盖自动匹配", async () => {
+  const small = { name: "SmallWin", protocol: "openai-chat", baseURL: "https://api.deepseek.com", model: "deepseek-v4-pro", secret: "sk-x", contextWindow: 32000 };
+  const info = await jjson("/api/model-info", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: small }) });
+  assert.equal(info.status, 200);
+  assert.equal(info.json.windowTokens, 32000, "手填的窗口优先");
+  assert.equal(info.json.limitTokens, 24000);
+  assert.equal(info.json.source, "手动设置");
+  // 不带 contextWindow 时按模型自动匹配
+  const auto = await jjson("/api/model-info", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: { ...small, contextWindow: 0 } }) });
+  assert.ok(auto.json.windowTokens >= 500000);
+  // 本机通道按小窗口算，别照着云端数字塞爆
+  const local = await jjson("/api/model-info", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: { name: "Ollama", protocol: "openai-chat", baseURL: "http://127.0.0.1:11434/v1", model: "qwen3:8b", secret: "" } }) });
+  assert.ok(local.json.windowTokens <= 65536, `本机模型窗口应打折，实际 ${local.json.windowTokens}`);
+});

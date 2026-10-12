@@ -27,6 +27,7 @@ G:\agent\                     ← 仓库根 = U 盘目录 (github.com/shi-tou123
 ├── core\sandbox.mjs          ← 路径白名单解析与拒绝
 ├── core\confirm.mjs          ← 高危操作 pending 表：创建→等网页确认→放行/取消（带超时60s，可附一句话理由）
 ├── core\checkpoints.mjs      ← 改动前文件快照 + 冲突检测 + 一键回滚（不依赖 git）
+├── core\model-windows.mjs    ← 模型能力表：上下文窗口 / 输出上限 / 是否带思考（数据源自 models.dev）
 ├── core\sessions.mjs         ← 会话 JSONL 追加日志（data/sessions/<id>.jsonl）
 ├── tools\                    ← 每个工具一个 .mjs，export {name,description,params,risk,run}
 ├── public\                   ← 网页（index.html + css + js 模块，原生零依赖）
@@ -358,6 +359,31 @@ v 回退对话: 回退后新请求里不再出现被丢的那句、回退点之�
 - **网络层失败也不许甩「fetch failed」**：`describeFetchError()` 按 `cause.code` 分辨 —— `ENOTFOUND` 说"域名解析不了（没网/DNS/需要代理）"、`ECONNREFUSED` 说"对方端口没在听（地址端口写错或本机服务没启动）"、`ECONNRESET` 说"连上又被掐断（需要代理/地址错/网关不认这个客户端）"、超时与证书问题各自单说；流跑到一半被切断另有说法（"回复中断…可以重发这一条"），别和"连不上"混为一谈。对话、连通测试、拉清单三条路都用它
 - **测试必须离线**：不许在测试里打真实公网（换个网络环境就假失败）—— 网关行为用本地假网关复刻（照 Go 的规则：不带 `x-opencode-session` 就 400、钥匙不对就 401），纯字符串的指路逻辑放 `providers.test.mjs` 直测函数
 - 验收：`test/providers.test.mjs`（地址纠偏、路径拼装、请求头、报错翻译）+ `test/catalog.test.mjs`（预设数、分协议映射、避重名）+ `test/server.test.mjs`（照 Go 规则搭的假网关：清单/连通/真跑一轮都通，且同一会话的会话标识稳定）+ 无头浏览器实测（搜得到两家、选 Claude 自动切 Anthropic、地址纠偏、不匹配徽标一键修），共 116 用例全绿、零 JS 报错
+
+## v9 追加规格（2026-10-12 领导实测反馈：上下文太短 / 看不到思考过程 / 工具调用条与页面布局）
+
+四个问题都是真的，先查业界现状再动手。**上下文太短**的根因是写死 `BUDGET_CHARS=24000` 字 + 一律按「2.5 字 = 1 token」估；去 models.dev（OpenCode 用的同一套目录，226 家 / 3971 个模型）拉了**当前**真实窗口：Claude 5 系、GLM-5.3、DeepSeek-v4、Kimi-k3、MiniMax-m3、qwen3.8 都是 **1000k 级**，GPT-5.6/6 系 1050k，Gemini-3 系 1049k —— 「128k/200k」那套印象早过时了。
+
+- 新增 `core/model-windows.mjs`：**由 models.dev 数据生成**的家族表（62 条：窗口 / 输出上限 / 是否自带思考）+ 最长前缀匹配（`gpt-5.4` 不被 `gpt-5` 抢先）+ 厂商前缀剥离（`openai/gpt-5.2`）与点号短横两种写法（`claude-sonnet-4.5` = `claude-sonnet-4-5`）
+- 覆盖顺序：通道里手填「上下文窗口」 > `data/model-windows.json`（可选，方便日后同步） > 家族表 > 兜底（云端 200k；**本机小模型 32k、家族值封顶 64k**——本地显存与默认配置远小于云端，按云端数字算会一塞就爆）
+- `core/context.mjs`：token 估算改成**中日韩字符 1 字 1 token、其余 3.6 字符 1 token**，每条消息加固定开销，图片 900 token/张；`budgetOf(msgs, {limitTokens, windowTokens})` 返回 `{tokens, limitTokens, windowTokens, pct, warn, over}`（80% 提醒 / 100% 越界）
+- 预算 = 窗口 × 75%（留 25% 给输出、工具结果与思考）；anthropic 的 `max_tokens` 也按模型真实输出上限（封顶 64k），不再写死 8192
+- 全链路带上窗口信息：`/api/chat` 的 `session`/`budget` 事件、`GET /api/session`、`/api/rollback`、`/api/compact`；新增 `POST /api/model-info` 给设置页显示「窗口多大、预算多少、支不支持思考、数据从哪来」；用量条改成 token 占比（`150 / 25k · 1%`），通道卡新增「上下文窗口」输入（留空=自动）
+
+**模型思考过程**：三协议都解析成独立的 `reasoning` 通道（不混进正文、不回传给模型）——`openai-chat` 认 `reasoning_content`/`reasoning`/`thinking`；`openai-responses` 认 `reasoning_summary_text.delta` 且请求带 `reasoning:{summary:"auto"}`（网关不认就 400 重试去掉）；`anthropic` 认 `thinking_delta`/`signature_delta`，并**默认显式开思考**（budget 取输出上限 1/4、封顶 16k，`thinking:false` 可关）。**多轮合规**：anthropic 开了思考后下一轮必须把 thinking 块连签名原样放回 assistant 消息（`end` → `assistant_message` 事件 → `buildHistory` → `bodyAnthropic` 最前面），否则 API 会拒。界面：`✻ 思考中… N 秒` 流式展开，正文一来收成 `✻ 已思考 N 秒`（可点开），插在回复气泡上方；`/thinking` 与设置 通用→对话显示 可整体显隐（同 OpenCode 的 `/thinking`）；Mock 剧本支持 `think:"…"` 便于离线演示。
+
+**工具调用条**：从带边框大卡片改成 codex 风格**单行条**（`• 工具名 参数摘要 结果首行 状态·耗时`），连续调用归进同一个带左竖线的组（对标 Claude Code 把 MCP 调用收成 `Called slack 3 times` 一行），点开才看参数与完整结果；运行中显示跳动圆点，失败/被拒自动展开；`/details` 一键展开或收起。
+
+**页面布局**：内容列 780 → **940px**（输入区、状态条同宽），底部留 140px 不让最后一条被输入框压住，消息间距收紧；顶栏新增**运行中胶囊**（`● 运行中 12 秒` + 停止按钮）；顺手修了「发第一条消息后欢迎页赖着不走」（选择器 `#welcome` 应为 `.welcome`）。
+
+### v9 验收
+
+```
+w 窗口表: 认得出的模型给真实窗口（Claude/GPT/GLM/DeepSeek 几十万到百万级）；gpt-5.4 不被 gpt-5 抢先；厂商前缀与两种写法都能命中；认不出 200k、本机 ≤64k、手填优先
+x token 估算: 中日韩 1 字 1 token；预算按传入额度算，80% warn / 100% over
+y 思考流: 三协议各自字段都解析成 reasoning；anthropic 请求带 thinking 且 max_tokens > budget、关掉后不带、下一轮 thinking（含签名）原样回传
+z 工具条与布局: 单行渲染 + 左竖线分组 + 展开看细节；内容列 940px；运行中胶囊在等待批准时可见、结束后隐藏
+```
 
 ## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）
 

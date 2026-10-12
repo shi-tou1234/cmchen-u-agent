@@ -13,6 +13,7 @@ import { Sessions } from "./core/sessions.mjs";
 import { ConfirmGate } from "./core/confirm.mjs";
 import { Checkpoints, SNAP_PATHS } from "./core/checkpoints.mjs";
 import { resolveInside } from "./core/sandbox.mjs";
+import { modelInfo, budgetOfModel } from "./core/model-windows.mjs";
 import { MODES, DEFAULT_AUTO_APPROVE } from "./core/modes.mjs";
 import { readJson, writeJson, genId, truncate } from "./core/util.mjs";
 
@@ -23,7 +24,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.8.3";
+const VERSION = "0.9.0";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -206,6 +207,21 @@ function settingsReady(st) {
   return !!st.workspace;
 }
 
+// 通道 → 上下文预算：按模型真实窗口算（数据来自 models.dev 的能力表），
+// 通道里手填了「上下文窗口」就听手填的；本机小模型（Ollama 等）按 32k 兜底，别按 200k 算爆
+function isLocalProvider(p) {
+  return p?.protocol === "mock" || /^(https?:\/\/)?(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0|host\.docker\.internal)(:|\/|$)/i.test(String(p?.baseURL || ""));
+}
+function limitsOf(p) {
+  const info = modelInfo(p?.model, { contextWindow: p?.contextWindow, local: isLocalProvider(p) });
+  return budgetOfModel(info);
+}
+// 给网页看的一行摘要：窗口多大、预算多少、数据从哪来
+function contextInfoOf(p) {
+  const l = limitsOf(p);
+  return { windowTokens: l.windowTokens, limitTokens: l.limitTokens, outputTokens: l.outputTokens, reasoning: l.reasoning, source: l.source, model: p?.model || "" };
+}
+
 function sseHead(res) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -217,7 +233,7 @@ function sseHead(res) {
 }
 const sse = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-const LOG_TYPES = new Set(["user", "assistant_message", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan", "change", "change_revert", "rewind"]);
+const LOG_TYPES = new Set(["user", "assistant_message", "reasoning", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan", "change", "change_revert", "rewind"]);
 
 /* ---------- 检查点快照的路径解析与容量收拾 ---------- */
 // 哪些工具动了哪些路径 → 交给 checkpoints 拍快照；只快照工作区/U盘目录内的路径
@@ -344,12 +360,14 @@ async function handleChat(req, res, body) {
   const history = buildHistory(pastEvents);
   const turnSeq = pastEvents.filter((e) => e.type === "user").length + 1; // 第几轮：写进快照清单，回滚时看得懂
   const messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
-  const budget = budgetOf(messages);
+  const limits = limitsOf(provider); // 这个模型真实能吃多少：按窗口算，不再用写死的字数
+  const budget = budgetOf(messages, limits);
+  const context = contextInfoOf(provider);
   sessions.append(sessionId, { type: "mode", mode });
   sessions.append(sessionId, { type: "user", text, images });
 
   sseHead(res);
-  sse(res, { type: "session", sessionId, provider: provider.name, mode, budget });
+  sse(res, { type: "session", sessionId, provider: provider.name, mode, budget, context });
 
   const ctx = {
     uaHome: UA_HOME,
@@ -414,7 +432,7 @@ async function handleChat(req, res, body) {
     running.delete(sessionId);
     // 一轮跑完上下文又长了：把最新的预算推回去，前端那根用量条才是活的
     try {
-      sse(res, { type: "budget", budget: budgetOf(buildHistory(sessions.read(sessionId))) });
+      sse(res, { type: "budget", budget: budgetOf(buildHistory(sessions.read(sessionId)), limits), context });
     } catch {}
     sse(res, { type: "stream_end", sessionId });
     res.end();
@@ -663,6 +681,16 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { path: rel, text: buf.toString("utf8"), truncated: stt.size > MAXTEXT, bytes: stt.size });
     }
 
+    // 这条通道的能力（窗口多大、可用预算多少、支不支持思考）：设置页卡片直接展示
+    if (req.method === "POST" && u.pathname === "/api/model-info") {
+      const b = await readBody(req);
+      const p = b.provider || {};
+      const st = loadState();
+      const cur = st.providers.find((o) => o.name === p.name);
+      const merged = { ...(cur || {}), ...p, baseURL: normalizeBase(p.baseURL || cur?.baseURL || "") };
+      return sendJson(res, 200, contextInfoOf(merged));
+    }
+
     // 通道连通测试：用一条极短的请求验证地址/协议/钥匙是否可用
     if (req.method === "POST" && u.pathname === "/api/test-provider") {
       const b = await readBody(req);
@@ -759,6 +787,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/rewind") {
       const b = await readBody(req);
       const sid = String(b.sessionId || "");
+      const st = loadState();
       if (!sid) return sendJson(res, 400, { error: "缺少会话 id" });
       if (running.has(sid)) return sendJson(res, 409, { error: "这一轮还在跑，等它停下来再回退" });
       let events = [];
@@ -773,7 +802,7 @@ const server = http.createServer(async (req, res) => {
       const dropped = events.length - at - 1;
       if (!dropped) return sendJson(res, 400, { error: "这条就是最新的，没什么可回退的" });
       sessions.append(sid, { type: "rewind", atIndex: at, dropped });
-      const budget = budgetOf(buildHistory(sessions.read(sid)));
+      const budget = budgetOf(buildHistory(sessions.read(sid)), limitsOf(st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]));
       return sendJson(res, 200, { ok: true, atIndex: at, dropped, budget });
     }
     if (req.method === "POST" && u.pathname === "/api/compact") {
@@ -792,7 +821,8 @@ const server = http.createServer(async (req, res) => {
       const msgs = buildHistory(events);
       const keepTail = Math.max(0, Math.min(6, msgs.length - 2));
       if (msgs.length < 4 || msgs.length - keepTail < 2) return sendJson(res, 400, { error: "对话还太短，无需压缩" });
-      const before = budgetOf(msgs);
+      const limits = limitsOf(provider);
+      const before = budgetOf(msgs, limits);
       let summary = "";
       try {
         for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail, b.instruction) }], [], AbortSignal.timeout(90000))) {
@@ -805,7 +835,7 @@ const server = http.createServer(async (req, res) => {
       summary = summary.trim();
       if (!summary) return sendJson(res, 500, { error: "压缩失败：模型没有返回摘要" });
       sessions.append(sid, { type: "compact", summary, atIndex: events.length, keepTail });
-      const after = budgetOf(buildHistory(sessions.read(sid)));
+      const after = budgetOf(buildHistory(sessions.read(sid)), limits);
       return sendJson(res, 200, { ok: true, summary, before, after });
     }
     /* ---------- 检查点 / 一键回滚 ---------- */
@@ -856,17 +886,20 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
+      const st = loadState();
+      const forProv = st.providers.find((p) => p.name === (u.searchParams.get("provider") || st.active)) || st.providers[0];
+      const limits = limitsOf(forProv);
       let events = [];
       let budget = { chars: 0, tokens: 0, over: false };
       try {
         const all = sessions.read(id);
         events = all.filter((e) => LOG_TYPES.has(e.type) || e.type === "user");
         // 切回旧会话时，用量条要立刻反映这个会话已有的体量
-        budget = budgetOf(buildHistory(all));
+        budget = budgetOf(buildHistory(all), limits);
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
-      return sendJson(res, 200, { id, events, budget });
+      return sendJson(res, 200, { id, events, budget, context: contextInfoOf(forProv) });
     }
     if (req.method === "GET") {
       let p = u.pathname === "/" ? "/index.html" : u.pathname;

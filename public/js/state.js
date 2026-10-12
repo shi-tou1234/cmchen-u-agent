@@ -33,8 +33,7 @@ export const DEFAULT_AUTO_APPROVE = {
   maxRequests: 20,
 };
 
-// 上下文预算：与 core/context.mjs 的 BUDGET_CHARS 保持一致，超出即提示压缩
-export const BUDGET_CHARS = 24000;
+// 上下文预算由服务端按「模型真实窗口」算好推过来（见 core/model-windows.mjs），前端只负责显示
 
 export const S = {
   ready: false,          // 是否已解锁并完成初始化
@@ -46,7 +45,8 @@ export const S = {
   active: "",         // 当前使用的通道名
   provider: "",
   workspace: "",
-  budget: { chars: 0, tokens: 0, over: false },
+  budget: { chars: 0, tokens: 0, limitTokens: 0, windowTokens: 0, pct: 0, over: false, warn: false },
+  context: null,         // 当前通道的模型窗口信息 {windowTokens, limitTokens, source, model}
   tokens: { input: 0, output: 0 },
   plan: null,
   lastSent: null,
