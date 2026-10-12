@@ -14,8 +14,11 @@ import { ConfirmGate } from "./core/confirm.mjs";
 import { Checkpoints, SNAP_PATHS } from "./core/checkpoints.mjs";
 import { resolveInside } from "./core/sandbox.mjs";
 import { modelInfo, budgetOfModel } from "./core/model-windows.mjs";
+import { loadCommands, loadSkills, skillsPromptSection, expandCommand } from "./core/skills.mjs";
 import { MODES, DEFAULT_AUTO_APPROVE } from "./core/modes.mjs";
 import { readJson, writeJson, genId, truncate } from "./core/util.mjs";
+import { runChecks, fixPrompt, checkSummary, CHECKS_MAX_FIX } from "./core/checks.mjs";
+import { listJobs, jobLog, stopJob, runningCount, killAllJobs } from "./core/jobs.mjs";
 
 const UA_HOME = process.env.UA_HOME || path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.join(UA_HOME, "data");
@@ -24,7 +27,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.9.2";
+const VERSION = "0.9.3";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -32,6 +35,8 @@ const checkpoints = new Checkpoints(path.join(DATA, "checkpoints")); // 改动�
 const confirmGate = new ConfirmGate();
 const registry = new Registry(path.join(UA_HOME, "tools"));
 await registry.load();
+
+process.on("exit", () => { try { killAllJobs(); } catch {} });
 
 // 兜底：单个未处理拒绝不许炸掉整个常驻服务
 process.on("unhandledRejection", (e) => console.error("[u-agent] 未处理的 Promise 拒绝（已拦截）：", e?.stack || e));
@@ -78,6 +83,8 @@ function loadState() {
     autoApprove: { ...DEFAULT_AUTO_APPROVE, ...(settings.autoApprove || {}), actions: { ...DEFAULT_AUTO_APPROVE.actions, ...((settings.autoApprove || {}).actions || {}) } },
     assist: settings.assist || "", // 轻量通道：起名/压缩这类杂活用，留空=跟随当前通道
     autoCompactAt: settings.autoCompactAt === 0 ? 0 : Number(settings.autoCompactAt) > 0 ? Number(settings.autoCompactAt) : 0.8, // 上下文涨到这个比例就自动压缩（0=关）
+    // 改动后的自动检查：test / lint 命令行（在工作区里跑；auto=改过文件就自动跑，失败回喂模型自修）
+    checks: { test: settings.checks?.test || "", lint: settings.checks?.lint || "", auto: settings.checks?.auto !== false },
   };
 }
 function saveState(patch) {
@@ -89,11 +96,14 @@ function saveState(patch) {
   const autoApprove = patch.autoApprove ?? cur.autoApprove;
   const assist = patch.assist ?? cur.assist;
   const autoCompactAt = patch.autoCompactAt ?? cur.autoCompactAt;
+  const checks = patch.checks
+    ? { test: String(patch.checks.test || "").slice(0, 300), lint: String(patch.checks.lint || "").slice(0, 300), auto: patch.checks.auto !== false }
+    : cur.checks;
   writeJson(CONFIG, { providers: providers.map((p) => ({ ...p, secret: "" })), active });
   const vault = { providers: {}, searchKeys: searchKeys || {} };
   for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
   vaultSave(vault);
-  writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt });
+  writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt, checks });
   return loadState();
 }
 if (!fs.existsSync(CONFIG)) saveState({});
@@ -262,7 +272,7 @@ function sseHead(res) {
 }
 const sse = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-const LOG_TYPES = new Set(["user", "assistant_message", "reasoning", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan", "change", "change_revert", "rewind"]);
+const LOG_TYPES = new Set(["user", "assistant_message", "reasoning", "tool_call", "tool_result", "confirm_request", "confirm_result", "error", "done", "mode", "subagent_start", "subagent_summary", "plan", "change", "change_revert", "rewind", "check", "goal", "goal_check"]);
 
 /* ---------- 检查点快照的路径解析与容量收拾 ---------- */
 // 哪些工具动了哪些路径 → 交给 checkpoints 拍快照；只快照工作区/U盘目录内的路径
@@ -311,6 +321,42 @@ async function askOnce(provider, prompt, timeoutMs = 30000) {
     else if (ev.type === "error") throw new Error(ev.message);
   }
   return out.trim();
+}
+
+// 完成标准（对标 MiMo 的 /goal 与 ZCode 的目标模式）：用户把「什么算做完」写下来，
+// 每轮结束时用一个便宜模型判定是否真有实据（命令输出/测试结果/文件内容），没达成就在这一轮里继续催。
+const GOAL_MAX_JUDGE = 2; // 一个用户轮次里最多自动催 2 次
+
+function lastGoal(sessionId) {
+  const evs = sessions.read(sessionId);
+  const dropped = rewindRanges(evs);
+  for (let i = evs.length - 1; i >= 0; i--) {
+    if (evs[i].type === "goal" && !isDropped(dropped, i)) return String(evs[i].text || "");
+  }
+  return "";
+}
+
+async function judgeGoal(provider, st, goal, lastReply, changedRels) {
+  const p = pickAssist(st, provider);
+  if (!p || !goal) return null; // 没有便宜通道就不判（离线演示不该给自己打分）
+  const out = await askOnce(
+    { ...p, baseURL: normalizeBase(p.baseURL), sessionId: "u-agent-goal-judge", userAgent: `u-agent/${VERSION}` },
+    [
+      "判断下面这个任务是否已经达成「完成标准」。",
+      "完成标准：" + goal,
+      changedRels.length ? "这一轮改动过的文件：" + changedRels.slice(0, 12).join("、") : "这一轮没有改动任何文件",
+      "助手最后的回复：" + String(lastReply || "").slice(0, 1500),
+      "",
+      "判定要求：光说「已完成」不算，要能从回复或改动里看出实据（命令输出、测试结果、文件内容）；标准里要求跑测试/命令而回复中没有实际输出时，判未达成。",
+      "只输出两行：第一行「达成」或「未达成」；第二行一句话理由。",
+    ].join("\n"),
+    25000
+  );
+  const t = String(out || "").trim();
+  const first = t.split("\n")[0] || "";
+  const met = /^达成/.test(t) || (first.includes("达成") && !first.includes("未达成"));
+  const reason = (t.split("\n")[1] || t).slice(0, 200);
+  return { met, reason };
 }
 
 // 把「旧轮次摘要成一条 compact 事件」抽出来：手动 /api/compact 与自动压缩共用同一套
@@ -466,6 +512,11 @@ async function handleChat(req, res, body) {
     autoCount: 0, // 本轮连续自动放行的次数（上限到了就回来问）
     memory: readMemory(),
     agentsMd: agentsMdOf(st.workspace),
+    skillsText: skillsPromptSection(loadSkills({ workspace: st.workspace, uaHome: UA_HOME })), // 技能清单：只有名字与说明
+    checks: st.checks, // test / lint 命令（run_checks 工具与轮末自动检查共用）
+    goal: lastGoal(sessionId), // 本次任务的完成标准（/goal 设的）
+    jobLogDir: path.join(DATA, "jobs"), // 后台任务的输出落这里
+
     sessionId,
     cmdPrefixes: [...(sessionCmdAllow.get(sessionId) || [])],
     loopGuard: (() => { const g = sessionLoopGuard.get(sessionId) || { lastSig: "", count: 0 }; sessionLoopGuard.set(sessionId, g); return g; })(),
@@ -498,21 +549,78 @@ async function handleChat(req, res, body) {
 
   let usageTotal = { input: 0, output: 0 };
   let replyText = ""; // 本轮最后一段助手正文，起标题时当素材
+  let runMessages = messages;
+  let fixRounds = 0;
+  let judgeRounds = 0; // 完成标准催了几次
   try {
-    for await (const ev of runAgent({ provider, messages, registry, ctx })) {
-      if (ev.type === "usage") {
-        usageTotal.input += ev.input || 0;
-        usageTotal.output += ev.output || 0;
-        sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output });
+    // 一轮对话可能跑多趟：模型跑完 → 自动检查 → 没过就把输出交给它接着修（最多 CHECKS_MAX_FIX 轮）
+    for (;;) {
+      let changedThisPass = false;
+      for await (const ev of runAgent({ provider, messages: runMessages, registry, ctx })) {
+        if (ev.type === "usage") {
+          usageTotal.input += ev.input || 0;
+          usageTotal.output += ev.output || 0;
+          sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output });
+          continue;
+        }
+        if (ev.type === "assistant_message") replyText = ev.text || replyText;
+        if (ev.type === "change") changedThisPass = true;
+        if (LOG_TYPES.has(ev.type)) sessions.append(sessionId, ev);
+        // 子 agent 改的文件也算这一轮的改动，但它是包在 subagent_event 里的，得拆出来记
+        else if (ev.type === "subagent_event" && ev.event?.type === "change") {
+          sessions.append(sessionId, { ...ev.event, sub: ev.name });
+          changedThisPass = true;
+        }
+        sse(res, ev);
+      }
+      // 改动后自动检查（对标 Aider /test、Kiro PostFileSave hook）：只在改过东西且配了命令时跑
+      let autoFix = "";
+      const checksOn = st.checks?.auto !== false && (st.checks?.test || st.checks?.lint);
+      if (checksOn && changedThisPass && !abort.signal.aborted) {
+        const check = await runChecks(st.checks, st.workspace);
+        sessions.append(sessionId, { type: "check", ...check });
+        sse(res, { type: "check", ...check, summary: checkSummary(check) });
+        if (!check.skipped && !check.ok) {
+          if (fixRounds >= CHECKS_MAX_FIX) {
+            const msg = "自动检查连续 " + CHECKS_MAX_FIX + " 次没过，先停在这里，你来看看";
+            sessions.append(sessionId, { type: "error", message: msg });
+            sse(res, { type: "error", message: msg });
+          } else {
+            fixRounds++;
+            autoFix = fixPrompt(check);
+          }
+        }
+      }
+      if (autoFix) {
+        sessions.append(sessionId, { type: "user", text: autoFix, auto: true });
+        sse(res, { type: "auto_fix", round: fixRounds, message: autoFix.slice(0, 300) });
+        runMessages = [...buildHistory(sessions.read(sessionId)), { role: "user", text: autoFix }];
         continue;
       }
-      if (ev.type === "assistant_message") replyText = ev.text || replyText;
-      if (LOG_TYPES.has(ev.type)) sessions.append(sessionId, ev);
-      // 子 agent 改的文件也算这一轮的改动，但它是包在 subagent_event 里的，得拆出来记
-      else if (ev.type === "subagent_event" && ev.event?.type === "change") {
-        sessions.append(sessionId, { ...ev.event, sub: ev.name });
+      // 完成标准判定（对标 MiMo /goal）：没达成就在这一轮里继续催，最多 GOAL_MAX_JUDGE 次
+      const goal = ctx.goal || "";
+      if (!goal || judgeRounds >= GOAL_MAX_JUDGE || abort.signal.aborted) break;
+      let verdict = null;
+      try {
+        const rels = sessions
+          .read(sessionId)
+          .filter((e) => e.type === "change")
+          .map((e) => e.rel)
+          .filter(Boolean);
+        verdict = await judgeGoal(provider, st, goal, replyText, [...new Set(rels)]);
+      } catch {
+        verdict = null;
       }
-      sse(res, ev);
+      if (!verdict) break;
+      sessions.append(sessionId, { type: "goal_check", met: verdict.met, reason: verdict.reason });
+      sse(res, { type: "goal_check", met: verdict.met, reason: verdict.reason, text: goal });
+      if (verdict.met) break;
+      judgeRounds++;
+      const nudge =
+        "完成标准还没达成（判定意见：" + (verdict.reason || "缺少实据") + "）。\n完成标准：" + goal + "\n请继续做，直到真有实据（命令输出/测试结果/文件内容）能证明达成；别只是说'已完成'。";
+      sessions.append(sessionId, { type: "user", text: nudge, auto: true });
+      sse(res, { type: "auto_fix", round: judgeRounds, goal: true, message: nudge.slice(0, 300) });
+      runMessages = [...buildHistory(sessions.read(sessionId)), { role: "user", text: nudge }];
     }
   } catch (e) {
     sessions.append(sessionId, { type: "error", message: e.message });
@@ -669,6 +777,7 @@ const server = http.createServer(async (req, res) => {
       if (b.autoApprove !== undefined) patch.autoApprove = b.autoApprove;
       if (b.assist !== undefined) patch.assist = String(b.assist || "");
       if (b.autoCompactAt !== undefined) patch.autoCompactAt = Math.max(0, Math.min(0.95, Number(b.autoCompactAt) || 0));
+      if (b.checks !== undefined) patch.checks = b.checks;
       const st = saveState(patch);
       return sendJson(res, 200, maskState(st));
     }
@@ -790,6 +899,75 @@ const server = http.createServer(async (req, res) => {
       const cur = st.providers.find((o) => o.name === p.name);
       const merged = { ...(cur || {}), ...p, baseURL: normalizeBase(p.baseURL || cur?.baseURL || "") };
       return sendJson(res, 200, contextInfoOf(merged));
+    }
+
+    // 后台任务：列表 / 停掉 / 看日志
+    if (req.method === "GET" && u.pathname === "/api/jobs") {
+      return sendJson(res, 200, { jobs: listJobs(), running: runningCount() });
+    }
+    if (req.method === "POST" && u.pathname === "/api/jobs-stop") {
+      const b = await readBody(req);
+      return sendJson(res, 200, stopJob(b.id));
+    }
+    if (req.method === "GET" && u.pathname === "/api/jobs-log") {
+      const id = u.searchParams.get("id") || "";
+      const tail = Math.min(50000, Math.max(500, Number(u.searchParams.get("tail")) || 8000));
+      return sendJson(res, 200, { id, text: jobLog(id, tail) });
+    }
+
+    // 完成标准：设置 / 查看 / 清除
+    if (req.method === "POST" && u.pathname === "/api/goal") {
+      const b = await readBody(req);
+      const sid = String(b.sessionId || "");
+      if (!sid) return sendJson(res, 400, { error: "缺少会话 id" });
+      try { sessions.fileOf(sid); } catch { return sendJson(res, 400, { error: "非法会话 id" }); }
+      const text = String(b.text || "").trim().slice(0, 500);
+      if (!text) {
+        const cur = lastGoal(sid);
+        sessions.append(sid, { type: "goal", text: "" });
+        return sendJson(res, 200, { ok: true, goal: "", cleared: !!cur });
+      }
+      sessions.append(sid, { type: "goal", text });
+      return sendJson(res, 200, { ok: true, goal: text });
+    }
+    if (req.method === "GET" && u.pathname === "/api/goal") {
+      const sid = u.searchParams.get("sessionId") || "";
+      try { sessions.fileOf(sid); } catch { return sendJson(res, 400, { error: "非法会话 id" }); }
+      return sendJson(res, 200, { goal: lastGoal(sid) });
+    }
+
+    // 手动跑一次检查（对话里输入 /check）
+    if (req.method === "POST" && u.pathname === "/api/check") {
+      const b = await readBody(req);
+      const st = loadState();
+      if (!settingsReady(st)) return sendJson(res, 400, { error: "还没设置工作区" });
+      const check = await runChecks(st.checks, st.workspace, b.only || "");
+      const sid = String(b.sessionId || "");
+      if (sid && !check.skipped) {
+        try { sessions.append(sid, { type: "check", ...check, manual: true }); } catch {}
+      }
+      return sendJson(res, 200, { ...check, summary: checkSummary(check) });
+    }
+
+    // 自定义命令与技能清单（都来自 <根>/.agent 下的 Markdown，跟 U 盘/工作区走）
+    if (req.method === "GET" && u.pathname === "/api/commands") {
+      const st = loadState();
+      const roots = { workspace: st.workspace, uaHome: UA_HOME };
+      return sendJson(res, 200, {
+        commands: loadCommands(roots).map(({ name, description, argumentHint, kind }) => ({ name, description, argumentHint, kind })),
+        skills: loadSkills(roots).map(({ name, description, kind }) => ({ name, description, kind })),
+      });
+    }
+    if (req.method === "POST" && u.pathname === "/api/command-expand") {
+      const b = await readBody(req);
+      const st = loadState();
+      const roots = { workspace: st.workspace, uaHome: UA_HOME };
+      const cmd = loadCommands(roots).find((c) => c.name === String(b.name || "").trim());
+      if (!cmd) return sendJson(res, 404, { error: "没有这条自定义命令" });
+      const text = expandCommand(cmd, b.args, roots);
+      if (!text) return sendJson(res, 400, { error: "这条命令展开后是空的" });
+      if (text.length > 60000) return sendJson(res, 400, { error: "展开后太长了（超过 6 万字符），把命令写短一点" });
+      return sendJson(res, 200, { text, name: cmd.name, kind: cmd.kind });
     }
 
     // 通道连通测试：用一条极短的请求验证地址/协议/钥匙是否可用

@@ -244,6 +244,7 @@ async function bootMain() {
   let info = null;
   try { info = await api.info(); } catch {}
   if (info) $("#sideMeta").innerHTML = `<span class="dot"></span>${esc(info.hostname)} · ${info.tools} 个工具`;
+  chat.refreshCustomCommands(); // 自定义命令与技能（开机拉一次）
   try {
     const st = await api.settings();
     chat.fillProviders(st);

@@ -1199,3 +1199,195 @@ test("v9.2 新增：同一个调用重复第 3 次就不再自动放行（防死
   assert.equal(g3.doom, 3, "事件里要标出重复了几次");
   assert.ok(r3.events.some((e) => e.type === "confirm_request"), "应弹确认");
 });
+
+/* ===== v0.9.3：改完自己验（自动检查 + 失败催修） ===== */
+test("v9.3 新增：改过文件后自动跑检查；通过就收工，没过就把输出交给它接着修", async () => {
+  const sid = "s-autocheck";
+  const write = (name) => "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: name, content: "x" } }, { say: "写好了" }]);
+  const post = (body) => jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+  // ① 通过：检查命令 echo ok → 有 check 事件、ok=true、不该有催修
+  await post({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, checks: { test: "echo ok", lint: "", auto: true } });
+  const pass = await chat({ sessionId: sid + "-pass", mode: "full", provider: "Mock", message: { text: write("chk1.txt") } });
+  const c1 = pass.events.find((e) => e.type === "check");
+  assert.ok(c1, "改过文件后要自动跑检查：" + JSON.stringify(pass.events.map((e) => e.type)));
+  assert.equal(c1.ok, true);
+  assert.equal(c1.results[0].name, "test");
+  assert.ok(!pass.events.some((e) => e.type === "auto_fix"), "通过了就不该催修");
+
+  // ② 失败：检查命令 exit 1 → check(ok=false) + auto_fix + 第二轮跑起来
+  await post({ checks: { test: "exit 1", lint: "", auto: true } });
+  const fail = await chat({ sessionId: sid + "-fail", mode: "full", provider: "Mock", message: { text: write("chk2.txt") } });
+  const c2 = fail.events.find((e) => e.type === "check");
+  assert.ok(c2 && c2.ok === false, "失败要如实报");
+  const fix = fail.events.find((e) => e.type === "auto_fix");
+  assert.ok(fix, "没过要催它修：" + JSON.stringify(fail.events.map((e) => e.type)));
+  assert.equal(fix.round, 1);
+  assert.match(sessionLog(sid + "-fail"), /"type":"check"/, "检查结果要落盘");
+  assert.match(sessionLog(sid + "-fail"), /"auto":true/, "催修提示要落盘（标 auto）");
+
+  // ③ 手动 /check：不依赖对话改动
+  const manual = await jjson("/api/check", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid + "-fail", only: "test" }) });
+  assert.equal(manual.status, 200, JSON.stringify(manual.json));
+  assert.equal(manual.json.ok, false);
+  assert.match(manual.json.summary, /失败/);
+
+  // ④ 关掉自动：改文件也不跑
+  await post({ checks: { test: "exit 1", lint: "", auto: false } });
+  const off = await chat({ sessionId: sid + "-off", mode: "full", provider: "Mock", message: { text: write("chk3.txt") } });
+  assert.ok(!off.events.some((e) => e.type === "check"), "关掉后不该自动跑");
+
+  await post({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, checks: { test: "", lint: "", auto: true } });
+});
+
+test("v9.3 新增：技能与自定义命令经服务器可见、可展开，并进系统提示", async () => {
+  const skDir = path.join(wsDir, ".agent", "skills", "greet");
+  fs.mkdirSync(skDir, { recursive: true });
+  fs.writeFileSync(path.join(skDir, "SKILL.md"), "---\nname: greet\ndescription: 打招呼的标准姿势\n---\n先说你好，再说正事\n", "utf8");
+  fs.mkdirSync(path.join(wsDir, ".agent", "commands"), { recursive: true });
+  fs.writeFileSync(path.join(wsDir, ".agent", "commands", "hello.md"), "向 $1 打招呼，语气：$ARGUMENTS\n", "utf8");
+
+  const list = await jjson("/api/commands");
+  assert.equal(list.status, 200);
+  assert.ok(list.json.skills.some((s) => s.name === "greet"), "技能要能列出来");
+  assert.ok(list.json.commands.some((c) => c.name === "hello"), "自定义命令要能列出来");
+
+  const exp = await jjson("/api/command-expand", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "hello", args: "张三 客气一点" }) });
+  assert.equal(exp.status, 200);
+  assert.match(exp.json.text, /向 张三 打招呼/, "$1 要替换");
+  assert.match(exp.json.text, /语气：张三 客气一点/, "$ARGUMENTS 要替换");
+
+  // 技能清单进系统提示（渐进披露：只有名字与说明）
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Up", workspace: wsDir, assist: "" });
+  await chat({ sessionId: "s-skills", mode: "confirm", provider: "Up", message: { text: "你好" } });
+  const body = JSON.stringify(UP.requests[UP.requests.length - 1]);
+  assert.match(body, /greet/, "技能清单要进系统提示");
+  assert.match(body, /打招呼的标准姿势/, "带上说明");
+  assert.ok(!/先说你好，再说正事/.test(body), "渐进披露：正文不该常驻上下文");
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+});
+
+/* ===== v0.9.3：计划评审（plan → 批准执行）+ 完成标准（Goal） ===== */
+test("v9.3 新增：计划模式交上计划会先问你批不批；不批就把意见带回去接着改", async () => {
+  const sid = "s-plan-review";
+  const items = [{ step: "读配置", status: "done" }, { step: "改端口", status: "pending" }];
+  const r = await chat({ sessionId: sid, mode: "plan", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "update_plan", args: { items } }, { say: "计划如上" }]) } });
+  assert.ok(r.events.some((e) => e.type === "plan"), "计划卡要先出来");
+  const req = r.events.find((e) => e.type === "confirm_request");
+  assert.ok(req, "计划模式立计划 = 请求开工，要弹出来问：" + JSON.stringify(r.events.map((e) => e.type)));
+  assert.match(req.name, /开始执行这份计划/, "弹窗标题要说清是在问什么");
+  assert.deepEqual(req.plan.map((x) => x.step), ["读配置", "改端口"], "计划步骤要带上（界面据此列清单）");
+  // 没人点 → 超时按「继续改计划」处理，并且不能动手改文件
+  const tr = r.events.find((e) => e.type === "tool_result" && e.name === "update_plan");
+  assert.match(tr?.text || "", /继续完善计划/, "超时/拒绝要回一句「继续改计划」");
+  assert.ok(!r.events.some((e) => e.type === "change"), "没批之前不许动手");
+});
+
+test("v9.3 新增：批准计划后自动切到谨慎档开始动手", async () => {
+  const sid = "s-plan-approve";
+  const items = [{ step: "建一个文件", status: "pending" }];
+  const events = await new Promise(async (resolve, reject) => {
+    try {
+      const res = await jfetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: sid, mode: "plan", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "update_plan", args: { items } }, { say: "计划如上" }]) } }),
+      });
+      const rd = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      const got = [];
+      let approved = false;
+      for (;;) {
+        const { done, value } = await rd.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 2);
+          const m = /^data: (.*)$/.exec(line);
+          if (!m) continue;
+          let ev;
+          try { ev = JSON.parse(m[1]); } catch { continue; }
+          got.push(ev);
+          if (ev.type === "confirm_request" && !approved) {
+            approved = true;
+            await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId: ev.confirmId, approve: true }) });
+          }
+        }
+      }
+      resolve(got);
+    } catch (e) {
+      reject(e);
+    }
+  });
+  const mode = events.find((e) => e.type === "mode" && e.mode === "confirm");
+  assert.ok(mode, "批准后要切到谨慎档：" + JSON.stringify(events.map((e) => e.type)));
+  assert.match(mode.note || "", /开始动手/);
+  const tr = events.find((e) => e.type === "tool_result" && e.name === "update_plan");
+  assert.match(tr?.text || "", /用户批准了这份计划/);
+});
+
+test("v9.3 新增：完成标准——存得住、进系统提示、没达成会自动接着催", async () => {
+  const sid = "s-goal";
+  const set = await jjson("/api/goal", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, text: "工作区里必须有个 done.txt" }) });
+  assert.equal(set.status, 200);
+  assert.equal((await jjson("/api/goal?sessionId=" + sid)).json.goal, "工作区里必须有个 done.txt", "要能读回来");
+
+  // 进系统提示
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "Up", workspace: wsDir, assist: "Up" });
+  const r = await chat({ sessionId: sid, mode: "confirm", provider: "Up", message: { text: "我做好了" } });
+  const body = JSON.stringify(UP.requests[UP.requests.length - 1]);
+  assert.match(body, /完成标准/, "系统提示要带上完成标准");
+  assert.match(body, /done\.txt/);
+  // 假上游只会回「好的，我记住了。」→ 判定必然是未达成 → 要出现 goal_check 与自动催
+  const checks = r.events.filter((e) => e.type === "goal_check");
+  assert.ok(checks.length >= 1, "要有判定事件：" + JSON.stringify(r.events.map((e) => e.type)));
+  assert.equal(checks[0].met, false);
+  assert.ok(r.events.some((e) => e.type === "auto_fix" && e.goal), "未达成要自动催");
+  assert.ok(checks.length <= 2, "催的次数要有上限（最多 2 次）");
+
+  // 清除
+  await jjson("/api/goal", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, text: "" }) });
+  assert.equal((await jjson("/api/goal?sessionId=" + sid)).json.goal, "", "清得掉");
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "" });
+});
+
+/* ===== v0.9.3：后台任务 ===== */
+test("v9.3 新增：后台任务——起得来、看得到输出、停得掉、退出时不留孤儿", async () => {
+  const sid = "s-bg";
+  // 起一个能跑一会儿的后台任务（Mock 剧本让 agent 自己调 shell_bg）
+  const script = [{ tool: "shell_bg", args: { command: "echo 后台开始 & timeout /t 30 /nobreak >nul & echo 后台结束" } }, { say: "已经放后台了" }];
+  const r = await chat({ sessionId: sid, mode: "full", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } });
+  const tr = r.events.find((e) => e.type === "tool_result" && e.name === "shell_bg");
+  assert.ok(tr && tr.ok, "shell_bg 要跑通：" + JSON.stringify(r.events.filter((e) => e.type === "tool_result").map((e) => e.text)));
+  const id = /job-[a-z0-9-]+/.exec(tr.text)[0];
+
+  const list = await jjson("/api/jobs");
+  assert.equal(list.status, 200);
+  const job = list.json.jobs.find((j) => j.id === id);
+  assert.ok(job, "列表里要有这个任务");
+  assert.ok(["running", "exited"].includes(job.status), "状态要么跑着要么已结束");
+  assert.ok(list.json.running >= 0);
+
+  // 输出尾巴：至少包含我们自己写的头部
+  const log = await jjson("/api/jobs-log?id=" + id + "&tail=4000");
+  assert.match(log.json.text, /后台任务/, "日志里要能看到内容");
+
+  // 停掉（可能已经自己结束了，两种结果都算对）
+  const stop = await jjson("/api/jobs-stop", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) });
+  assert.equal(stop.status, 200);
+  assert.ok(stop.json.ok === true || /已经结束/.test(stop.json.error || ""), "停止要么成功要么说已结束：" + JSON.stringify(stop.json));
+
+  // 停完之后不该还在跑
+  const after = await jjson("/api/jobs");
+  const j2 = after.json.jobs.find((j) => j.id === id);
+  assert.notEqual(j2.status, "running", "停过之后不应还在 running");
+
+  // agent 也能自己看一眼（shell_jobs）
+  const look = "MOCKSCRIPT:" + JSON.stringify([{ tool: "shell_jobs", args: {} }, { say: "看过了" }]);
+  const r2 = await chat({ sessionId: sid, mode: "full", provider: "Mock", message: { text: look } });
+  const tr2 = r2.events.find((e) => e.type === "tool_result" && e.name === "shell_jobs");
+  assert.match(tr2?.text || "", /job-/, "shell_jobs 要能看到任务");
+});
