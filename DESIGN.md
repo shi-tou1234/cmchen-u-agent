@@ -545,6 +545,28 @@ U AGENTS: 项目根→工作区两级注入、顺序根在前、AGENTS.override.
 V 回归: 全量 164 用例全绿（本版新增 16 个）；无头 Edge 冒烟照旧（启动→解锁→清 cookie 发消息→锁屏弹出→重解锁）
 ```
 
+## v9.9 追加规格（2026-10-13 调研队列大件落地：MCP 扩展 / 用户 hooks / 分叉与统一回退 / 提问表单 / 权限存盘）
+
+**来由**：上一轮三路调研（codex / ZCode / opencode）排队的能力缺口，本版一次落地。版本提到 0.9.9。
+
+1. **MCP 扩展**（core/mcp.mjs + 设置「扩展」页）：stdio + 换行分隔 JSON-RPC，零依赖。配置存 `data/mcp.json`（`{ "servers": { 名字: { command, args, env, cwd, risk } } }`），保存即重连；工具以 `mcp__名字__工具` 动态注册进工具表（描述与 schema 原样带过来），**默认风险 high（每次调用都要确认）**、一律不并行；信任的服务器可在条目里写 `"risk": "medium"`。服务器起不来不炸：状态里说清错误与 stderr 尾巴
+2. **用户 hooks**（core/hooks.mjs）：`<根>/.agent/hooks.json`，三个事件 UserPromptSubmit / PreToolUse / PostToolUse；事件 JSON 走 stdin，stdout 最后一行可回 `{"decision":"block","reason"}` 或 `{"additionalContext"}`，退出码 2 = 拦截；matcher 大小写敏感正则（留空全匹配）；command/args 直接 spawn（不经 shell）。**信任闸**：U 盘那份视为盘主人的声明直接生效；工作区那份先弹一次复核（按「文件 + 内容哈希」记在 data/hook-trust.json，内容改了会重新问），拦截/通过事件在对话里留 ⚙ 提示
+3. **会话分叉 + 统一回退**：每条你说的话旁多了「分叉」——从这条复制出一份新会话（`（分支）`，原会话不动，原话放回输入框）；「从这儿重来」升级为**对话+文件一起回退**（按住 Alt 只回退对话）；文件撞车（回退范围之后又被改过）先问一句再强制
+4. **ask_user 提问表单**（tools/ask_user.mjs + 确认弹窗新形态）：执行中向用户提 ≤4 个问题（单选/多选/自定义答案；跳过=不作答，模型按最稳妥方案继续）；作答数组回给模型。复用确认闸：弹窗、超时、审计同一条路
+5. **权限存盘**：「不再问这类命令」两档——本会话 / **总是允许（存盘）**（写 data/perm-saved.json，换会话、重启后仍有效），设置「安全」页可查可删
+
+### v9.9 验收
+
+```
+W MCP: /api/mcp 存配置——坏命令不炸（状态带错误）；假服务器接上后工具进工具表（mcp__fake__echo 可调用）；清空配置撤掉工具
+X hooks: 工作区 hooks.json 未信任先弹复核 → 批准后 PreToolUse 拦下 fs_delete（文件原样、事件到界面）；U 盘 hooks 免闸；超时被杀
+Y 分叉: /api/fork 复制到指定消息、fork 标记落盘、原会话不动（第二句还在）
+Z 统一回退: withFiles 把区间内的文件改动一起回滚（新建的被删）；只回退对话时文件不受影响
+AA ask_user: 弹表单、作答数组回给模型；跳过有兜底话术
+AB 权限存盘: scope=always 写进 perm-saved、可删
+AC 回归: 全量 177 用例全绿（本版新增 13 个）；无头 Edge 冒烟照旧（启动→解锁→清 cookie 发消息→锁屏弹出→重解锁）
+```
+
 ## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）
 
 ### P0

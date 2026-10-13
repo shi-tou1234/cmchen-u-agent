@@ -1073,9 +1073,11 @@ test("v9.1 新增：一轮里的多个工具调用并行执行，结果按原顺
   assert.ok(results.every((x) => x.ok), "都该成功");
   assert.ok(fs.existsSync(path.join(wsDir, "par-a.txt")) && fs.existsSync(path.join(wsDir, "par-b.txt")), "两个文件都要真的建出来");
   // 顺序对齐还体现在落盘：tool 消息必须按 tool_calls 顺序
+  // （只取「最后一条 user 之后」的区间——同 id 会话若被连续多次跑测试读过，文件里会有旧轮次残留）
   const log = JSON.parse("[" + sessionLog(sid).trim().split("\n").join(",") + "]");
-  const tcs = log.filter((e) => e.type === "tool_call").map((e) => e.name);
-  const trs = log.filter((e) => e.type === "tool_result").map((e) => e.name);
+  const lastUser = log.map((e) => e.type).lastIndexOf("user");
+  const tcs = log.slice(lastUser).filter((e) => e.type === "tool_call").map((e) => e.name);
+  const trs = log.slice(lastUser).filter((e) => e.type === "tool_result").map((e) => e.name);
   assert.deepEqual(tcs, trs, "日志里调用与结果的顺序要对齐");
 });
 
@@ -1443,4 +1445,148 @@ test("v9.8 AGENTS.md 层级发现：项目根→工作区逐级拼接、override
   assert.ok(lastSys().includes("覆盖版约定"), "同层有 override 就优先用");
   assert.ok(!lastSys().includes("根约定：提交信息用中文"), "override 让原文件让位");
   await postSettings({ workspace: wsDir }); // 收尾：工作区还原
+});
+
+/* ===== v0.9.9：MCP / hooks / 分叉 / 统一回退 / ask_user / 权限存盘 ===== */
+// 走流读事件、遇到指定确认单就裁决的公共小工具（确认流测试同款模式）
+async function chatResolving(body, resolve) {
+  const res = await jfetch("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const rd = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  const events = [];
+  for (;;) {
+    const { done, value } = await rd.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 2);
+      const m = /^data: (.*)$/.exec(line);
+      if (!m) continue;
+      let ev;
+      try {
+        ev = JSON.parse(m[1]);
+      } catch {
+        continue;
+      }
+      events.push(ev);
+      if (ev.type === "confirm_request" && !ev.__done) {
+        ev.__done = true; // 同一条只裁决一次
+        const payload = await resolve(ev).catch(() => null);
+        if (payload) {
+          await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId: ev.confirmId, approve: true, ...payload }) });
+        }
+      }
+    }
+  }
+  return events;
+}
+
+const FAKE_MCP = [
+  'const readline = require("node:readline");',
+  'const rl = readline.createInterface({ input: process.stdin });',
+  'rl.on("line", (line) => {',
+  "  let msg;",
+  "  try { msg = JSON.parse(line); } catch { return; }",
+  '  const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\\n");',
+  '  if (msg.method === "initialize") reply({ protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake", version: "1" } });',
+  '  else if (msg.method === "tools/list") reply({ tools: [{ name: "echo", description: "回显", inputSchema: { type: "object", properties: { text: { type: "string" } } } }] });',
+  '  else if (msg.method === "tools/call") reply({ content: [{ type: "text", text: "echo: " + (msg.params.arguments?.text || "") }] });',
+  "});",
+].join("\n");
+
+test("v9.9 MCP：/api/mcp 存取配置——坏命令不炸、假服务器接上并进工具表", async () => {
+  const before = (await jjson("/api/health")).json.tools;
+  const bad = await jjson("/api/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ raw: '{ "servers": { "b": { "command": "definitely-not-real-xyz" } } }' }) });
+  assert.equal(bad.status, 200);
+  assert.equal(bad.json.servers[0].running, false);
+  assert.ok(bad.json.servers[0].error, "要有错误说明");
+  const script = path.join(tmpDir(), "fake-mcp.cjs");
+  fs.writeFileSync(script, FAKE_MCP, "utf8");
+  const okc = await jjson("/api/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ raw: JSON.stringify({ servers: { fake: { command: process.execPath, args: [script], risk: "low" } } }) }) });
+  assert.equal(okc.json.servers[0].running, true, JSON.stringify(okc.json));
+  const after = (await jjson("/api/health")).json.tools;
+  assert.equal(after, before + 1, "MCP 工具要进工具表");
+  const g = await jjson("/api/mcp");
+  assert.match(g.json.raw, /fake/, "配置能读回来");
+  await jjson("/api/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ raw: '{ "servers": {} }' }) }); // 收尾
+  assert.equal((await jjson("/api/health")).json.tools, before, "清空配置要撤掉工具");
+});
+
+test("v9.9 hooks：信任闸批准后 PreToolUse 拦下删除（端到端）", async () => {
+  const hdir = path.join(wsDir, ".agent");
+  fs.mkdirSync(hdir, { recursive: true });
+  fs.writeFileSync(path.join(hdir, "block.cjs"), "process.exit(2);", "utf8");
+  fs.writeFileSync(path.join(hdir, "hooks.json"), JSON.stringify({ events: { PreToolUse: [{ matcher: "fs_delete", command: process.execPath, args: [".agent/block.cjs"] }] } }), "utf8");
+  fs.writeFileSync(path.join(wsDir, "hook-del.txt"), "x");
+  try {
+    const events = await chatResolving(
+      { sessionId: "s-hook-" + Math.random().toString(36).slice(2, 7), mode: "full", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_delete", args: { path: "hook-del.txt" } }, { say: "算了" }]) } },
+      async (ev) => (ev.name === "hook_review" ? {} : null)
+    );
+    assert.ok(events.some((e) => e.type === "hook" && e.block), "要有 hook 拦截事件：" + JSON.stringify(events.map((e) => e.type)));
+    const tr = events.find((e) => e.type === "tool_result" && e.name === "fs_delete");
+    assert.equal(tr.denied, true);
+    assert.ok(fs.existsSync(path.join(wsDir, "hook-del.txt")), "文件必须还在");
+  } finally {
+    fs.rmSync(path.join(hdir, "hooks.json"), { force: true }); // 别影响后续用例
+  }
+});
+
+test("v9.9 分叉：/api/fork 复制到指定消息；原会话不动", async () => {
+  const sid = "s-fork-" + Math.random().toString(36).slice(2, 7);
+  await chat({ sessionId: sid, provider: "Mock", mode: "confirm", message: { text: "第一句" } });
+  await chat({ sessionId: sid, provider: "Mock", mode: "confirm", message: { text: "第二句" } });
+  const j = await jjson("/api/session?id=" + sid);
+  const at = j.json.events.map((e) => (e.type === "user" && e.text === "第一句" ? 1 : 0)).lastIndexOf(1);
+  assert.ok(at >= 0);
+  const f = await jjson("/api/fork", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, atIndex: at }) });
+  assert.equal(f.status, 200, JSON.stringify(f.json));
+  assert.notEqual(f.json.id, sid);
+  const raw = fs.readFileSync(path.join(REPO, "data", "sessions", f.json.id + ".jsonl"), "utf8");
+  assert.match(raw, /"type":"fork"/, "分叉标记要落盘");
+  assert.match(raw, /第一句/);
+  assert.ok(!raw.includes("第二句"), "分叉点之后的不要");
+  const orig = await jjson("/api/session?id=" + sid);
+  assert.ok(orig.json.events.some((e) => e.text === "第二句"), "原会话必须完好");
+});
+
+test("v9.9 统一回退：withFiles 把这段区间的文件改动一起回滚", async () => {
+  const sid = "s-urewind-" + Math.random().toString(36).slice(2, 7);
+  const script = [{ tool: "fs_write", args: { path: "ur.txt", content: "v1" }, say: "建" }, { say: "好" }];
+  await chat({ sessionId: sid, mode: "confirm", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } });
+  assert.ok(fs.existsSync(path.join(wsDir, "ur.txt")));
+  const j = await jjson("/api/session?id=" + sid);
+  const at = j.json.events.findIndex((e) => e.type === "user");
+  const r = await jjson("/api/rewind", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, atIndex: at, withFiles: true }) });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.ok(!fs.existsSync(path.join(wsDir, "ur.txt")), "新建的文件应被回滚删掉");
+  assert.ok((r.json.files?.reverted || []).length >= 1, JSON.stringify(r.json.files));
+});
+
+test("v9.9 ask_user：弹表单、作答数组回给模型", async () => {
+  const qs = [{ header: "选目录", question: "要删哪个目录？", options: [{ label: "tmp" }, { label: "build" }] }];
+  const script = [{ tool: "ask_user", args: { questions: qs } }, { say: "按你说的办" }];
+  const events = await chatResolving(
+    { sessionId: "s-ask-" + Math.random().toString(36).slice(2, 7), mode: "confirm", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } },
+    async (ev) => (ev.name === "ask_user" ? { value: { answers: ["build"] } } : null)
+  );
+  const tr = events.find((e) => e.type === "tool_result" && e.name === "ask_user");
+  assert.ok(tr, "要有 ask_user 的结果：" + JSON.stringify(events.map((e) => e.type)));
+  assert.match(tr.text, /build/, "作答要回给模型：" + tr.text);
+});
+
+test("v9.9 权限存盘：总是允许（存盘）→ 进清单、可删", async () => {
+  const script = [{ tool: "shell_run", args: { command: "git status" } }, { say: "好" }];
+  await chatResolving(
+    { sessionId: "s-perm-" + Math.random().toString(36).slice(2, 7), mode: "confirm", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } },
+    async (ev) => (ev.name === "shell_run" ? { rememberPrefix: ev.prefix, scope: "always" } : null)
+  );
+  const list = await jjson("/api/perm-saved");
+  assert.ok(list.json.commands.includes("git status"), JSON.stringify(list.json));
+  const del = await jfetch("/api/perm-saved?prefix=" + encodeURIComponent("git status"), { method: "DELETE" });
+  assert.equal(del.status, 200);
+  assert.ok(!(await jjson("/api/perm-saved")).json.commands.includes("git status"));
 });

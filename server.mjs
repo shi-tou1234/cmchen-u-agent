@@ -16,6 +16,8 @@ import { resolveInside } from "./core/sandbox.mjs";
 import { modelInfo, budgetOfModel } from "./core/model-windows.mjs";
 import { loadCommands, loadSkills, skillsPromptSection, expandCommand } from "./core/skills.mjs";
 import { MODES, DEFAULT_AUTO_APPROVE } from "./core/modes.mjs";
+import { McpHub } from "./core/mcp.mjs";
+import { loadHookSources, matchHooks, runHookBatch } from "./core/hooks.mjs";
 import { readJson, writeJson, writeFileAtomic, genId, truncate } from "./core/util.mjs";
 import { runChecks, fixPrompt, checkSummary, CHECKS_MAX_FIX } from "./core/checks.mjs";
 import { listJobs, jobLog, stopJob, runningCount, killAllJobs } from "./core/jobs.mjs";
@@ -27,7 +29,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.9.8";
+const VERSION = "0.9.9";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -36,7 +38,25 @@ const confirmGate = new ConfirmGate();
 const registry = new Registry(path.join(UA_HOME, "tools"));
 await registry.load();
 
-process.on("exit", () => { try { killAllJobs(); } catch {} });
+/* ---------- MCP 扩展：外部工具服务器（配置在 data/mcp.json） ---------- */
+const mcpHub = new McpHub({ version: VERSION });
+function readMcpRaw() {
+  try {
+    return fs.readFileSync(path.join(DATA, "mcp.json"), "utf8");
+  } catch {
+    return '{ "servers": {} }';
+  }
+}
+// 应用配置：重启所有服务器 + 把它们的工具动态注册进工具表（mcp__ 前缀）
+async function applyMcp(cfg) {
+  const status = await mcpHub.apply(cfg);
+  registry.unregisterPrefix("mcp__");
+  for (const tool of mcpHub.tools()) registry.register(tool);
+  return status;
+}
+applyMcp(readJson(path.join(DATA, "mcp.json"), { servers: {} })).catch(() => {}); // 异步接上，不挡开机
+
+process.on("exit", () => { try { killAllJobs(); } catch {} try { mcpHub.stop(); } catch {} });
 
 // 兜底：单个未处理拒绝不许炸掉整个常驻服务
 process.on("unhandledRejection", (e) => console.error("[u-agent] 未处理的 Promise 拒绝（已拦截）：", e?.stack || e));
@@ -173,6 +193,32 @@ function maskState(st) {
 const running = new Map(); // sessionId → {abort: AbortController, mode}
 // 用户在弹窗里点过「本会话不再问这类命令」的前缀（内存态，服务重启即失效）
 const sessionCmdAllow = new Map(); // sessionId → Set<prefix>
+// 放行规则存盘（v0.9.9）：命令前缀写进 data/perm-saved.json，换会话/重启后仍然有效；界面上可查可删
+let savedPrefixesCache = null;
+function savedPrefixes() {
+  if (!savedPrefixesCache) savedPrefixesCache = readJson(path.join(DATA, "perm-saved.json"), { commands: [] }).commands || [];
+  return savedPrefixesCache;
+}
+function savePermPrefix(pre) {
+  savedPrefixesCache = [...new Set([...savedPrefixes(), pre])];
+  writeJson(path.join(DATA, "perm-saved.json"), { commands: savedPrefixesCache });
+}
+function dropPermPrefix(pre) {
+  savedPrefixesCache = savedPrefixes().filter((p) => p !== pre);
+  writeJson(path.join(DATA, "perm-saved.json"), { commands: savedPrefixesCache });
+}
+// hooks 信任（v0.9.9）：工作区 hooks 按「文件 + 内容哈希」记在盘上；内容改了哈希对不上会重新问
+let hookTrustCache = null;
+function hookIsTrusted(source) {
+  if (!hookTrustCache) hookTrustCache = readJson(path.join(DATA, "hook-trust.json"), {});
+  return hookTrustCache[source.file] === source.digest;
+}
+function approveHook(source) {
+  if (!hookTrustCache) hookTrustCache = readJson(path.join(DATA, "hook-trust.json"), {});
+  hookTrustCache[source.file] = source.digest;
+  writeJson(path.join(DATA, "hook-trust.json"), hookTrustCache);
+}
+const hookPromptDenied = new Set(); // 本进程内被拒过的 hooks 文件：别再反复弹
 const sessionLoopGuard = new Map(); // sessionId → {lastSig, count}：防死循环的连续重复计数（跨轮保持）
 
 const MEMORY = path.join(DATA, "memory.md");
@@ -610,7 +656,7 @@ async function handleChat(req, res, body) {
   if (wasLastTurnAborted(pastEvents)) {
     meta.push("（注意：上一轮是用户主动点了停止。被中断的命令/工具可能已部分执行——先检查现状，别把已完成的事再做一遍；后台可能还有进程。）");
   }
-  const outgoingText = meta.join("\n") + "\n\n" + text;
+  let outgoingText = meta.join("\n") + "\n\n" + text;
   let messages = [...history, { role: "user", text: outgoingText, ...(images.length ? { images } : {}) }];
   const limits = limitsOf(provider); // 这个模型真实能吃多少：按窗口算，不再用写死的字数
   let budget = budgetOf(messages, limits);
@@ -659,7 +705,9 @@ async function handleChat(req, res, body) {
     jobLogDir: path.join(DATA, "jobs"), // 后台任务的输出落这里
 
     sessionId,
-    cmdPrefixes: [...(sessionCmdAllow.get(sessionId) || [])],
+    cmdPrefixes: [...new Set([...savedPrefixes(), ...(sessionCmdAllow.get(sessionId) || [])])],
+    hookTrust: hookIsTrusted,
+    hookApprove: approveHook,
     loopGuard: (() => { const g = sessionLoopGuard.get(sessionId) || { lastSig: "", count: 0 }; sessionLoopGuard.set(sessionId, g); return g; })(),
     // 超长工具输出：落盘 + 掐头去尾 + 给模型一条读回来的路
     spill: (text, tc) => spillResult(sessionId, tc?.id, tc?.name, text),
@@ -711,6 +759,46 @@ async function handleChat(req, res, body) {
     }
   };
   try {
+    // ── v0.9.9 UserPromptSubmit hooks：可以拦下这条消息，也可以往上下文里补一段 ──
+    {
+      const srcs = loadHookSources({ workspace: st.workspace, uaHome: UA_HOME });
+      const matches = matchHooks(srcs, "UserPromptSubmit");
+      if (matches.length) {
+        const allowed = (s) => s.trusted || hookIsTrusted(s);
+        const untrusted = matches.filter((m) => !allowed(m.source) && !hookPromptDenied.has(m.source.file));
+        if (untrusted.length) {
+          const files = [...new Set(untrusted.map((m) => m.source.file))];
+          const lines = untrusted.map((m) => `${m.source.kind}·${m.hook.command} ${m.hook.args.join(" ")}`).slice(0, 6);
+          const reason = "工作区自带的 hooks 会在你电脑上执行命令，先确认一次（按内容哈希记着；改了就再问）";
+          const { id: hid, done: hdone } = ctx.confirm({ tool: "hook_review", args: { 文件: files, 将执行: lines }, risk: "high", reason });
+          sse(res, { type: "confirm_request", confirmId: hid, name: "hook_review", args: { 文件: files, 将执行: lines }, risk: "high", reason });
+          const hv = await hdone;
+          const hok = hv && typeof hv === "object" ? !!hv.ok : !!hv;
+          if (hok) {
+            for (const m of untrusted) approveHook(m.source);
+          } else {
+            for (const f of files) hookPromptDenied.add(f);
+          }
+        }
+        const hookEvents = [];
+        const batch = await runHookBatch(
+          matches,
+          { hook_event_name: "UserPromptSubmit", session_id: sessionId, cwd: st.workspace, prompt: text },
+          { cwd: st.workspace, shouldRun: allowed, onEvent: (e) => hookEvents.push(e) }
+        );
+        for (const e of hookEvents) sse(res, e);
+        if (batch.blocked) {
+          const msg = `被项目 hook 拦下了这条消息：${batch.reason}`;
+          sessions.append(sessionId, { type: "error", message: msg });
+          sse(res, { type: "error", message: msg });
+          return;
+        }
+        if (batch.context) {
+          outgoingText = `${outgoingText}\n\n【hook 补充】\n${batch.context}`;
+          runMessages = patchCurrentUser(messages, outgoingText, images);
+        }
+      }
+    }
     // 一轮对话可能跑多趟：模型跑完 → 自动检查 → 没过就把输出交给它接着修（最多 CHECKS_MAX_FIX 轮）
     for (;;) {
       let changedThisPass = false;
@@ -904,17 +992,23 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/confirm") {
       const b = await readBody(req);
       if (b.approve && b.rememberPrefix) {
-        // 「本会话不再问这类命令」：记下前缀（作用域＝这个会话，服务重启即失效）
+        // 「不再问这类命令」：scope=always 存盘（换会话/重启都算数），否则只作用于本会话
         const info = confirmGate.pending.get(b.confirmId)?.info;
-        const sid = info?.sessionId;
         const pre = String(b.rememberPrefix).trim().slice(0, 80);
-        if (sid && pre) {
-          const set = sessionCmdAllow.get(sid) || new Set();
-          set.add(pre);
-          sessionCmdAllow.set(sid, set);
+        if (pre) {
+          if (b.scope === "always") {
+            savePermPrefix(pre);
+          } else {
+            const sid = info?.sessionId;
+            if (sid) {
+              const set = sessionCmdAllow.get(sid) || new Set();
+              set.add(pre);
+              sessionCmdAllow.set(sid, set);
+            }
+          }
         }
       }
-      const ok = confirmGate.resolve(b.confirmId, !!b.approve, b.note);
+      const ok = confirmGate.resolve(b.confirmId, !!b.approve, b.note, b.value);
       return sendJson(res, 200, { ok });
     }
     if (req.method === "POST" && u.pathname === "/api/abort") {
@@ -1228,7 +1322,8 @@ const server = http.createServer(async (req, res) => {
 
     /* ---------- 只回退对话（不动文件） ---------- */
     // 对标 Claude Code /rewind 的「只还原对话」：日志是追加式的，所以不删旧记录，
-    // 而是写一条 rewind 标记，重建上下文与界面回放都跳过被丢的那一段（可审计、可追溯）
+    // 而是写一条 rewind 标记，重建上下文与界面回放都跳过被丢的那一段（可审计、可追溯）。
+    // v0.9.9：带 withFiles 时把这段区间里的文件改动也一起回滚（对话+文件统一回退）
     if (req.method === "POST" && u.pathname === "/api/rewind") {
       const b = await readBody(req);
       const sid = String(b.sessionId || "");
@@ -1246,9 +1341,72 @@ const server = http.createServer(async (req, res) => {
       if (events[at].type !== "user") return sendJson(res, 400, { error: "只能从「你发的那条消息」处重来" });
       const dropped = events.length - at - 1;
       if (!dropped) return sendJson(res, 400, { error: "这条就是最新的，没什么可回退的" });
-      sessions.append(sid, { type: "rewind", atIndex: at, dropped });
+      // 统一回退：这段区间里记过检查点的文件改动一并倒回去（冲突先 409 让人决定）
+      let files = null;
+      if (b.withFiles) {
+        const cpids = events.slice(at + 1).filter((e) => e.type === "change" && e.cp).map((e) => e.cp);
+        if (cpids.length) {
+          files = checkpoints.rollback(sid, cpids, { force: !!b.force });
+          if (!files.ok) {
+            const msg = files.needForce ? `有 ${files.conflicts.length} 个文件在这之后又被改过` : files.error || "文件回滚没成功";
+            return sendJson(res, files.needForce ? 409 : 400, { ...files, error: msg });
+          }
+        }
+      }
+      sessions.append(sid, { type: "rewind", atIndex: at, dropped, ...(files ? { files: (files.reverted || []).length } : {}) });
       const budget = budgetOf(buildHistory(sessions.read(sid)), limitsOf(st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]));
-      return sendJson(res, 200, { ok: true, atIndex: at, dropped, budget });
+      return sendJson(res, 200, { ok: true, atIndex: at, dropped, files, budget });
+    }
+    // 会话分叉：从某条消息处复制出一份新会话（原会话不动）
+    if (req.method === "POST" && u.pathname === "/api/fork") {
+      const b = await readBody(req);
+      const sid = String(b.sessionId || "");
+      if (!sid) return sendJson(res, 400, { error: "缺少会话 id" });
+      if (running.has(sid)) return sendJson(res, 409, { error: "这一轮还在跑，等它停下来再分叉" });
+      let newId = "";
+      try {
+        newId = sessions.fork(sid, Number(b.atIndex));
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const titles = loadTitles();
+      titles[newId] = (titles[sid] || "会话") + "（分支）";
+      saveTitles(titles);
+      return sendJson(res, 200, { ok: true, id: newId });
+    }
+    // MCP 扩展：看状态 / 存配置并重连（保存=把服务器接上，工具进工具表）
+    if (req.method === "GET" && u.pathname === "/api/mcp") {
+      return sendJson(res, 200, { servers: mcpHub.status(), raw: readMcpRaw() });
+    }
+    if (req.method === "POST" && u.pathname === "/api/mcp") {
+      const b = await readBody(req);
+      const raw = String(b.raw ?? "");
+      let cfg;
+      try {
+        cfg = raw.trim() ? JSON.parse(raw) : { servers: {} };
+      } catch (e) {
+        return sendJson(res, 400, { error: "JSON 解析失败：" + e.message });
+      }
+      if (typeof cfg !== "object" || cfg === null || (cfg.servers && typeof cfg.servers !== "object")) {
+        return sendJson(res, 400, { error: '配置要长这样：{ "servers": { "名字": { "command": "...", "args": [] } } }' });
+      }
+      writeFileAtomic(path.join(DATA, "mcp.json"), JSON.stringify(cfg, null, 2));
+      try {
+        const status = await applyMcp(cfg);
+        return sendJson(res, 200, { ok: true, servers: status });
+      } catch (e) {
+        return sendJson(res, 200, { ok: true, servers: mcpHub.status(), error: e.message });
+      }
+    }
+    // 放行规则存盘：看清单 / 删掉一条
+    if (req.method === "GET" && u.pathname === "/api/perm-saved") {
+      return sendJson(res, 200, { commands: savedPrefixes() });
+    }
+    if (req.method === "DELETE" && u.pathname === "/api/perm-saved") {
+      const pre = String(u.searchParams.get("prefix") || "").trim();
+      if (!pre) return sendJson(res, 400, { error: "缺少 prefix" });
+      dropPermPrefix(pre);
+      return sendJson(res, 200, { ok: true, commands: savedPrefixes() });
     }
     if (req.method === "POST" && u.pathname === "/api/compact") {
       const b = await readBody(req);
