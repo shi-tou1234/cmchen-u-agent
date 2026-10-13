@@ -68,3 +68,33 @@ test("没有 .agent 目录时安静地空手而归，不报错", () => {
   assert.deepEqual(loadSkills({ workspace: empty, uaHome: empty }), []);
   assert.equal(skillsPromptSection([]), "");
 });
+
+/* ===== v9.8：when_to_use / 清单降级 / ${SKILL_DIR} ===== */
+test("v9.8 when_to_use：清单带上触发面", () => {
+  const { ws, usb } = fixture();
+  fs.writeFileSync(path.join(usb, ".agent", "skills", "release", "SKILL.md"), "---\nname: release\ndescription: 出正式版的标准流程\nwhen_to_use: 用户说发版/打标签时\n---\n正文\n", "utf8");
+  const skills = loadSkills({ workspace: ws, uaHome: usb });
+  assert.match(skills[0].whenToUse, /发版/);
+  assert.match(skillsPromptSection(skills), /何时用：用户说发版/);
+});
+
+test("v9.8 技能清单超预算降级成「名字+路径」", () => {
+  const many = [];
+  for (let i = 0; i < 40; i++) many.push({ name: "skill" + i, description: "很长的说明".repeat(20), dirPath: "C:/x/skill" + i });
+  const sec = skillsPromptSection(many);
+  assert.ok(sec.length <= 4200, "降级后不该再超预算：" + sec.length);
+  assert.match(sec, /\(file: /, "降级格式是 名字 + SKILL.md 路径");
+  assert.ok(!sec.includes("很长的说明"), "降级后不带描述");
+  assert.match(sec, /skill0/);
+});
+
+test("v9.8 ${SKILL_DIR} 展开：skill 工具取正文时替换成技能目录", async () => {
+  const { ws, usb } = fixture();
+  fs.writeFileSync(path.join(usb, ".agent", "skills", "release", "SKILL.md"), "---\nname: release\ndescription: 出正式版的标准流程\n---\n跑 bash \"${SKILL_DIR}/scripts/setup.sh\"\n", "utf8");
+  const { freshRegistry } = await import("./helpers.mjs");
+  const { r } = await freshRegistry();
+  const out = await r.get("skill").run({ name: "release" }, { workspace: ws, uaHome: usb });
+  const dirPath = path.join(usb, ".agent", "skills", "release");
+  assert.ok(out.includes(dirPath + "/scripts/setup.sh"), "SKILL_DIR 要展开成技能目录：" + out.slice(0, 200));
+  assert.ok(!out.includes("${SKILL_DIR}"), "不许留下占位符");
+});

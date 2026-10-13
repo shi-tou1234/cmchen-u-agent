@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { gate, gateWith, isSafeCommand, MODES, DEFAULT_AUTO_APPROVE } from "../core/modes.mjs";
+import { gate, gateWith, isSafeCommand, commandSegments, matchesPrefix, MODES, DEFAULT_AUTO_APPROVE } from "../core/modes.mjs";
 import { runAgent } from "../core/agent-loop.mjs";
 import { freshRegistry, makeCtx, tmpDir } from "./helpers.mjs";
 
@@ -252,4 +252,28 @@ test("v7 拒绝提示：动态风险的工具有函数源码，不能把它打�
   assert.match(tr.text, /风险等级是 high/);
   assert.ok(!tr.text.includes("=>"), `拒绝提示混进了函数源码：${tr.text.slice(0, 120)}`);
   assert.ok(fs.readFileSync(path.join(ws, "keep.txt"), "utf8") === "x");
+});
+
+/* ===== v9.8：复合命令逐段校验（从前缀放行里堵「借道」） ===== */
+test("v9.8 拆段：引号里的分隔符不算、^ 转义不拆", () => {
+  assert.deepEqual(commandSegments("git status"), ["git status"]);
+  assert.deepEqual(commandSegments('git log --grep "a && b" | findstr x'), ['git log --grep "a && b"', "findstr x"]);
+  assert.deepEqual(commandSegments("a && b || c ; d & e"), ["a", "b", "c", "d", "e"]);
+  assert.deepEqual(commandSegments("echo a^&b"), ["echo a^&b"], "^& 是字面 &，不拆");
+});
+
+test("v9.8 前缀放行必须逐段命中（git status && 别的 不许借道）", () => {
+  assert.equal(matchesPrefix("git status", ["git status"]), true);
+  assert.equal(matchesPrefix("git status --short", ["git status"]), true);
+  assert.equal(matchesPrefix("git status && npm install left-pad", ["git status"]), false, "第二段没批过就不能整串放行");
+  assert.equal(matchesPrefix("git status && git log -3", ["git status"]), false, "git log 没批过同样不行");
+  assert.equal(matchesPrefix("git status && git log -3", ["git status", "git log"]), true, "两段都批过才放行");
+  assert.equal(matchesPrefix("dir & dir /b", ["dir"]), true);
+});
+
+test("v9.8 安全命令判定同样逐段（dir 开头也夹带不了安装命令）", () => {
+  assert.equal(isSafeCommand("dir && echo hi"), true, "两段都只读");
+  assert.equal(isSafeCommand("dir && npm install left-pad"), false, "借 dir 开头夹带安装命令");
+  assert.equal(isSafeCommand("git status && type a.txt"), true);
+  assert.equal(isSafeCommand("git status && del a.txt"), false);
 });

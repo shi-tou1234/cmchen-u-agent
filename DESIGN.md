@@ -519,6 +519,32 @@ P 并发: 同一会话第一条流还在跑时第二条 /api/chat 409；跑完�
 Q 回归: 全量用例全绿（含本版新增 4 个：junction×2 / Host / 并发；反绕在既有 shell 用例内）
 ```
 
+## v9.8 追加规格（2026-10-13 调研 codex / ZCode / opencode 源码：流式自动重连 + 压缩增强 + 一批小件）
+
+**来由**：三路只读调研成熟 agent 源码（openai/codex、本机 ZCode 安装、anomalyco/opencode），证据全部落在文件级；本版把「小改动、高收益」的 7 条落地。版本提到 0.9.8。
+
+1. **复合命令逐段校验**（core/modes.mjs，学 Codex execpolicy）：`&&/||/;/&/|` 拆段（引号里的不拆、`^` 转义不拆），「本会话前缀放行」与「安全命令判定」都要求**每一段**命中——`git status && 干别的` 再也借不了道
+2. **流式重试壳**（core/providers.mjs，学 Codex 的 responses_retry 与 "Reconnecting..."）：网络层失败（掐断/超时；ENOTFOUND/ECONNREFUSED 这类配置错不重试）、429/5xx（含 529）、**还没吐内容就断掉的流** → 800ms 起指数退避 + 抖动、尊重 `Retry-After`（秒数与 HTTP 日期两种格式都认）；重试前发 `reconnecting` 事件，网页在气泡里挂「⟳ 连接断了，正在自动重连（第 n/m 次…）」，一有内容自动撤掉；已吐过内容的流一律不整体重试（防重复输出）；上限 `UA_STREAM_RETRIES`（默认 3）
+3. **压缩增强**（server.mjs + core/context.mjs）：
+   - 压缩完**保留最近用户消息原文**（`pickRecentUsers`：从最新往回、按 token 截断保头；预算 = 主模型预算的 10%，下限 2000、上限 12000）——用户的约束/原话不再被摘要吃掉
+   - 压缩请求自身撞超限 → 丢最旧两条再试（学 Codex 的 remove_first_item）
+   - 聊天请求撞「上下文超限」→ **自动压一遍再重试一次**（学 ZCode 的 ProviderOverflow 兜底，救掉一次本会失败的请求）
+   - 「太短」守卫只拦真正的小会话（条数 ≥3 即交给 token 阈值判定）——压缩过的历史可能很短但很大
+4. **技能小件**（core/skills.mjs + tools/skill.mjs，学 ZCode）：frontmatter 支持 `when_to_use`（清单带触发面）；技能清单超 4000 字符整段降级为 `- name (file: SKILL.md 路径)`；正文里 `${SKILL_DIR}`（含前缀变体）展开成技能目录
+5. **`get_context_remaining`** 新工具（学 Codex）：模型可自问「还剩多少」，接近上限时提示先收尾；预算由主循环每步注入 `ctx.budgetNow`
+6. **AGENTS.md 层级发现**（server.mjs，学 Codex）：向上找项目根（`.git`，最多 8 层；找不到回退「工作区 + 上一层」），根 → 工作区逐级收集、同层 `AGENTS.override.md` 优先、总预算 8192 字符（超了优先保工作区那份）
+7. **每轮现场信息**（server.mjs，学 Codex 的 turn_aborted / current_time）：发给模型的用户消息带 `【当前时间 …】` 前缀（只进请求、不进日志、界面回放看不到）与「上一轮被用户手动停止」提醒（`wasLastTurnAborted`，防模型重跑已执行过的命令）；Mock 已同步认前缀行
+
+### v9.8 验收
+
+```
+R 拆段: commandSegments 引号内/^ 转义不拆；matchesPrefix 与 isSafeCommand 逐段命中（git status && npm install 不再借道）
+S 重试: 429 后成功 → 先发 reconnecting 再恢复内容；一直 429 按 UA_STREAM_RETRIES 次数后报「限流」人话；401 不重试；空流断开会重连、吐过内容的断流不重试
+T 压缩: /compact 后最近的用户原话仍在请求里；小窗口（12k）自动压缩能压回阈值以下；压缩请求撞超限会丢最旧重试
+U AGENTS: 项目根→工作区两级注入、顺序根在前、AGENTS.override.md 优先
+V 回归: 全量 164 用例全绿（本版新增 16 个）；无头 Edge 冒烟照旧（启动→解锁→清 cookie 发消息→锁屏弹出→重解锁）
+```
+
 ## v4 追加规格（2026-10-12 领导圈定 P0+P1，对标 codex）
 
 ### P0

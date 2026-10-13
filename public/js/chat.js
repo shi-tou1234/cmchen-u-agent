@@ -205,6 +205,10 @@ export async function sendMessage(text) {
   }
 }
 
+function clearReconnect(c) {
+  c.getStream().querySelector(".reconnect-note")?.remove();
+}
+
 function handleEvent(ev, c) {
   switch (ev.type) {
     case "session":
@@ -225,8 +229,22 @@ function handleEvent(ev, c) {
       }
       break;
     }
+    case "reconnecting": {
+      // 模型流断了、服务端在自动重连：往当前气泡里挂一条提示，等下一段内容/收尾时撤掉
+      const bubble = c.getStream();
+      let n = bubble.querySelector(".reconnect-note");
+      if (!n) {
+        n = el(`<div class="reconnect-note"></div>`);
+        const t = bubble.querySelector(".text");
+        t ? bubble.insertBefore(n, t) : bubble.appendChild(n);
+      }
+      n.textContent = `⟳ 连接断了，正在自动重连（第 ${ev.attempt}/${ev.max} 次，约 ${Math.max(1, Math.round((ev.waitMs || 0) / 1000))} 秒）…`;
+      scrollEnd();
+      break;
+    }
     case "plan": renderPlan(ev.items); break;
     case "assistant_delta": {
+      clearReconnect(c); // 有内容进来了 = 重连成功
       // 开始出正文了：把这一轮的思考块收起来，并让下一轮可以再开一块（mutate，不能整个替换，否则共享状态断了）
       if (c.think.node) {
         finishThink(c.think.node, c.think.text, Date.now() - c.think.started);
@@ -243,6 +261,7 @@ function handleEvent(ev, c) {
     }
     // 思考过程：流式展开，等正文一来就收成一行「已思考 N 秒」
     case "reasoning_delta": {
+      clearReconnect(c);
       if (!showThinking()) break;
       if (!c.think.node) {
         c.think.node = addThink(c.getStream());
@@ -269,6 +288,7 @@ function handleEvent(ev, c) {
       break;
     }
     case "assistant_message": {
+      clearReconnect(c);
       if (c.think.node) {
         finishThink(c.think.node, c.think.text, Date.now() - c.think.started);
         clearInterval(c.think.timer);
@@ -285,7 +305,7 @@ function handleEvent(ev, c) {
       c.setFull("");
       break;
     }
-    case "tool_call": c.tools.set(ev.id, addTool(ev)); break;
+    case "tool_call": clearReconnect(c); c.tools.set(ev.id, addTool(ev)); break;
     case "tool_result": { const n = c.tools.get(ev.id); if (n) finishTool(n, ev); break; }
     case "change": S.changes.push(ev); break;
     case "check": addCheckCard(ev); break;
@@ -303,8 +323,9 @@ function handleEvent(ev, c) {
     case "auto_fix": noteLine("自动检查没过，已把输出交给它接着修（第 " + ev.round + " 轮）"); break;
     case "confirm_request": queueConfirm(ev); break;
     case "subagent_event": handleSub(ev, c.subs); break;
-    case "error": finishAi(c.getStream()); addError(ev.message); toast(ev.message, "err"); ping("出错了", ev.message); break;
+    case "error": clearReconnect(c); finishAi(c.getStream()); addError(ev.message); toast(ev.message, "err"); ping("出错了", ev.message); break;
     case "done": {
+      clearReconnect(c);
       const node = c.getStream();
       const empty = !node.querySelector(".text").textContent && !c.getFull();
       if (empty) node.remove();

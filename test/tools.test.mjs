@@ -119,3 +119,16 @@ test("web_fetch：抓本地 http 文本", async () => {
   await assert.rejects(() => run("web_fetch", { url: "ftp://x" }, ctx), /http/);
   server.close();
 });
+
+/* ===== v9.8：get_context_remaining ===== */
+test("v9.8 get_context_remaining：读主循环注入的实时预算", async () => {
+  const ctx = makeCtx({ workspace: tmpDir(), registry: reg });
+  ctx.budgetNow = () => ({ tokens: 1000, limitTokens: 5000, windowTokens: 8000, pct: 20 });
+  const out = await run("get_context_remaining", {}, ctx);
+  assert.match(out, /剩余约 4000 tokens/);
+  ctx.budgetNow = () => ({ tokens: 4900, limitTokens: 5000, windowTokens: 8000, pct: 98 });
+  assert.match(await run("get_context_remaining", {}, ctx), /接近上限/);
+  // 没有主循环注入时（比如工具单测）给一句人话，不抛错
+  const bare = makeCtx({ workspace: tmpDir(), registry: reg });
+  assert.match(await run("get_context_remaining", {}, bare), /无法查询/);
+});

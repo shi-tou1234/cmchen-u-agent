@@ -107,27 +107,37 @@ export function describeFetchError(err, url) {
   return `连不上 ${url}${hint}原始错误：${cause || msg}`;
 }
 
-// 统一的 POST：网络抖一下自动重试，重试不成再换成上面那句人话
-// （对标 Codex 的 responses_retry：指数退避 + 有上限；只重试「没拿到响应」与 429/5xx，鉴权类错误不重试）
-const RETRYABLE = new Set([429, 500, 502, 503, 504]);
-async function postStream(url, headers, body, signal, attempt = 0) {
-  let res;
+// 单次 POST——重试策略统一收进 streamChat 外层的重试壳；这里只给错误打标：
+// 「地址写错/服务没起」类重试也是白等，不标可重试；连接被掐断、超时才值得重发
+async function postStream(url, headers, body, signal) {
   try {
-    res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+    return await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
   } catch (e) {
     if (e?.name === "AbortError") throw e; // 用户主动停止，不改写
-    if (attempt < 2) {
-      await new Promise((r) => setTimeout(r, 600 * (attempt + 1) * (attempt + 1)));
-      return postStream(url, headers, body, signal, attempt + 1);
-    }
-    throw new Error(describeFetchError(e, url));
+    e.url = url;
+    e.retryable = !/ENOTFOUND|ECONNREFUSED/i.test(String(e?.cause?.code || ""));
+    throw e;
   }
-  if (RETRYABLE.has(res.status) && attempt < 2) {
-    try { await res.text(); } catch {}
-    await new Promise((r) => setTimeout(r, 600 * (attempt + 1) * (attempt + 1)));
-    return postStream(url, headers, body, signal, attempt + 1);
-  }
-  return res;
+}
+
+// 哪些状态码值得重试（对标 Codex 的 responses_retry；529 = Anthropic 过载）
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
+
+// Retry-After：秒数与 HTTP 日期两种写法都认（对标 Codex 的 retry_after.rs）
+export function retryAfterMs(res) {
+  const v = res?.headers?.get?.("retry-after");
+  if (!v) return 0;
+  const sec = Number(String(v).trim());
+  if (Number.isFinite(sec) && sec >= 0) return Math.min(sec * 1000, 120000);
+  const at = Date.parse(v);
+  if (!Number.isNaN(at)) return Math.min(Math.max(0, at - Date.now()), 120000);
+  return 0;
+}
+
+// 指数退避 + 抖动（0.9–1.1）：800ms → 1.6s → 3.2s…封顶 30s
+export function backoffMs(attempt) {
+  const base = Math.min(30000, 800 * 2 ** attempt);
+  return Math.round(base * (0.9 + Math.random() * 0.2));
 }
 
 // 上游报错翻译成人话（含状态码，便于排查）
@@ -148,6 +158,7 @@ export function friendlyUpstreamError(status, body, provider) {
   if ((status === 400 || status === 404) && /model|not supported|unknown|does not exist|no such/i.test(text)) {
     return `这家服务不认这个模型，或该模型不走当前协议${tag}（有的网关按模型分协议：Claude 系选 Anthropic、GPT/Grok 系选 Responses、其余选 OpenAI 兼容）：${tail}`;
   }
+  if (status === 429) return `请求太密被限流${tag}（已按服务端提示自动重试过；稍等再发，或把任务拆小）：${tail}`;
   return `模型服务返回 HTTP ${status}：${tail || "（没有正文）"}`;
 }
 
@@ -288,9 +299,13 @@ async function* sseLines(res) {
     try {
       chunk = await reader.read();
     } catch (e) {
-      // 流跑到一半被掐断（网关超时、断网）：说清楚是"中途断了"，不是"连不上"
+      // 流跑到一半被掐断（网关超时、断网）：说清楚是"中途断了"，不是"连不上"。
+      // 标成可重试——外层重试壳只在「还什么都没吐出来」时才敢重发
       if (e?.name === "AbortError") throw e;
-      throw new Error(`回复中断：连接在半路被切断（${String(e?.cause?.code || e?.message || "terminated")}）——可以重发这一条，或把任务拆小一点`);
+      const err = new Error(`回复中断：连接在半路被切断（${String(e?.cause?.code || e?.message || "terminated")}）——可以重发这一条，或把任务拆小一点`);
+      err.retryable = true;
+      err.midStream = true;
+      throw err;
     }
     if (chunk.done) break;
     buf += decoder.decode(chunk.value, { stream: true });
@@ -313,6 +328,8 @@ async function assertOk(res, provider) {
   const e = new Error(friendlyUpstreamError(res.status, detail, provider));
   e.status = res.status; // 上层（连通测试/清单拉取）可以据此再加工
   e.body = detail;
+  e.retryable = RETRYABLE_STATUS.has(res.status); // 429/5xx 交给外层重试壳
+  e.retryAfterMs = retryAfterMs(res);
   throw e;
 }
 
@@ -497,16 +514,21 @@ async function* streamAnthropic(provider, messages, tools, signal) {
 //   [{tool:"fs_write", args:{...}, say:"先建文件"} , ..., {say:"完成"}]
 // 否则内置演示剧本：提到「建文件/创建」就 fs_write hello.txt，然后汇报。
 function mockScript(userText) {
-  if (userText.startsWith("MOCKSCRIPT:")) {
-    return JSON.parse(userText.slice("MOCKSCRIPT:".length));
+  // v0.9.8 起用户消息会带「当前时间」等前缀行（只发给模型、不进日志）——先跳过这些元信息行再认剧本
+  const first = String(userText || "")
+    .split("\n")
+    .find((l) => l.trim() && !l.startsWith("【当前时间") && !l.startsWith("（注意：上一轮"));
+  const t = (first || "").trim();
+  if (t.startsWith("MOCKSCRIPT:")) {
+    return JSON.parse(t.slice("MOCKSCRIPT:".length));
   }
-  if (/建文件|创建|hello/.test(userText)) {
+  if (/建文件|创建|hello/.test(t)) {
     return [
       { tool: "fs_write", args: { path: "hello.txt", content: "你好，来自 u-agent" }, say: "我来在工作区创建 hello.txt。" },
       { say: "已创建 hello.txt，内容是「你好，来自 u-agent」。" },
     ];
   }
-  return [{ say: `（Mock 模型）收到：${userText}。请在设置里接入真实模型通道并填钥匙。` }];
+  return [{ say: `（Mock 模型）收到：${t}。请在设置里接入真实模型通道并填钥匙。` }];
 }
 
 async function* streamMock(provider, messages, tools, signal) {
@@ -558,9 +580,9 @@ async function* streamMock(provider, messages, tools, signal) {
   yield { type: "end", stopReason: "stop", toolCalls: [] };
 }
 
-// ---------- 统一入口 ----------
+// ---------- 统一入口（带重试壳） ----------
 
-export function streamChat(provider, messages, tools, signal) {
+function streamChatOnce(provider, messages, tools, signal) {
   switch (provider.protocol) {
     case "mock":
       return streamMock(provider, messages, tools, signal);
@@ -573,6 +595,65 @@ export function streamChat(provider, messages, tools, signal) {
     default:
       throw new Error(`未知协议 ${provider.protocol}`);
   }
+}
+
+function sleepWithAbort(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(t);
+      const e = new Error("已中止");
+      e.name = "AbortError";
+      reject(e);
+    };
+    const t = setTimeout(() => {
+      try { signal?.removeEventListener?.("abort", onAbort); } catch {}
+      resolve();
+    }, ms);
+    if (signal?.aborted) return onAbort();
+    try { signal?.addEventListener?.("abort", onAbort, { once: true }); } catch {}
+  });
+}
+
+// 统一重试壳（对标 Codex 的 responses_retry 与 "Reconnecting... n/m"）：
+//   可重试 = 网络层失败（掐断/超时）/ 429/5xx / 还没吐任何内容就断掉的流；
+//   退避 800ms 起指数增长 + 抖动，有 Retry-After 就听服务端的；
+//   每次重试前发 reconnecting 事件给界面（别让人对着没反应的页面猜）。
+//   已经吐过内容的流一律不整体重试——避免重复输出，宁可报错让用户重发。
+export function streamChat(provider, messages, tools, signal) {
+  const maxRetries = Math.max(0, Number(process.env.UA_STREAM_RETRIES ?? 3));
+  return (async function* () {
+    let attempt = 0;
+    for (;;) {
+      let emitted = false;
+      let sawTerminal = false;
+      try {
+        for await (const ev of streamChatOnce(provider, messages, tools, signal)) {
+          if (ev.type === "text" || ev.type === "reasoning" || ev.type === "tool_start" || ev.type === "tool_delta") emitted = true;
+          if (ev.type === "error") sawTerminal = true;
+          yield ev;
+          if (ev.type === "end") return;
+        }
+        if (sawTerminal) return;
+        // 协议流要么给 end 要么给 error；走到这说明中途被静默掐断
+        const e = new Error("回复中断：连接在半路被切断——可以重发这一条，或把任务拆小一点");
+        e.retryable = true;
+        e.midStream = true;
+        throw e;
+      } catch (e) {
+        if (e?.name === "AbortError") throw e;
+        const canRetry = e.retryable === true && !emitted && attempt < maxRetries;
+        if (!canRetry) {
+          // 网络层的原始错误 → 换成说人话的句子；其余（已是人话）原样抛
+          if (e.url && !e.status) throw new Error(describeFetchError(e, e.url));
+          throw e;
+        }
+        attempt++;
+        const waitMs = e.retryAfterMs > 0 ? e.retryAfterMs : backoffMs(attempt - 1);
+        yield { type: "reconnecting", attempt, max: maxRetries, waitMs, reason: truncate(String(e.message || "连接中断"), 140) };
+        await sleepWithAbort(waitMs, signal);
+      }
+    }
+  })();
 }
 
 export { dataUrl };
