@@ -31,6 +31,8 @@ let provs = [];
 let expanded = -1;
 let dirty = false;
 let onSaved = null;
+let extraRoots = []; // 额外可访问的目录（先存内存，点保存才写盘）
+let dirPickTarget = "ws"; // 目录选择器这次给谁挑：「ws」工作区 / 「extra」额外目录
 
 const markDirty = () => {
   dirty = true;
@@ -63,6 +65,9 @@ async function loadAll() {
     S.workspace = st.workspace || "";
     $("#wsInput").value = S.workspace;
     wsHint();
+    extraRoots = Array.isArray(st.extraRoots) ? [...st.extraRoots] : [];
+    renderExtraRoots();
+    $("#kProxy").value = st.proxy || "";
     provs = st.providers.map((p) => ({ ...p }));
     S.autoApprove = normalizeAA(st.autoApprove);
     S.assist = st.assist || "";
@@ -128,8 +133,8 @@ function renderNotifyHelp() {
 
 function wsHint() {
   $("#wsHint").textContent = S.workspace
-    ? "已设置。沙箱之外的地方，agent 一律拒绝读写。"
-    : "还没设置，先挑一个文件夹——这是 agent 唯一能动手写的地方。";
+    ? "已设置。工作区、U 盘与「额外目录」之外的地方会被拒绝；切到「完全权限」模式则不设边界。"
+    : "还没设置，先挑一个文件夹——这是 agent 默认能动手写的地方。";
 }
 
 function renderInfo(info) {
@@ -152,6 +157,27 @@ function renderInfo(info) {
   $("#agentsState").innerHTML = S.workspace
     ? `工作区根目录还没有 <code>AGENTS.md</code>。在对话里输入 <code>/init</code>，让 agent 自己写一份：${esc(S.workspace)}\\AGENTS.md`
     : "先设置工作区，才能用这个功能。";
+}
+
+/* ---- 额外可访问的目录 ---- */
+function renderExtraRoots() {
+  const box = $("#extraRoots");
+  if (!box) return;
+  if (!extraRoots.length) {
+    box.innerHTML = `<span class="field-help">还没有 —— 点右边「添加目录」</span>`;
+    return;
+  }
+  box.innerHTML = extraRoots
+    .map((p, i) => `<div class="row-between" style="padding:3px 0"><code style="font-size:12px">${esc(p)}</code><button class="btn btn-ghost" data-i="${i}" style="height:22px;padding:0 8px;font-size:11.5px">移除</button></div>`)
+    .join("");
+  $$("button[data-i]", box).forEach(
+    (b) =>
+      (b.onclick = () => {
+        extraRoots.splice(Number(b.dataset.i), 1);
+        renderExtraRoots();
+        markDirty();
+      })
+  );
 }
 
 /* ================= 导航 ================= */
@@ -672,6 +698,8 @@ async function save() {
     active: S.active || provs[0]?.name,
     workspace: $("#wsInput").value.trim(),
     searchKeys: { tavily: $("#kTavily").value.trim(), brave: $("#kBrave").value.trim() },
+    proxy: $("#kProxy").value.trim(),
+    extraRoots,
     autoApprove: S.autoApprove,
     assist: $("#assistSel").value || "",
     autoCompactAt: Number($("#autoCompactSel").value) || 0,
@@ -689,6 +717,9 @@ async function save() {
     broadcastAA();
     $("#wsInput").value = S.workspace;
     wsHint();
+    extraRoots = Array.isArray(st.extraRoots) ? [...st.extraRoots] : extraRoots;
+    renderExtraRoots();
+    $("#kProxy").value = st.proxy || "";
     dirty = false;
     $("#dirtyHint").hidden = true;
     refreshCustomCommands(); // 工作区可能换了，命令/技能清单跟着刷新
@@ -768,6 +799,7 @@ function renderAutoApprove() {
   }).join("");
   $("#aaList").classList.toggle("off", !aa.enabled);
   $$("#aaList [data-aa]").forEach((box) => {
+    box.disabled = !aa.enabled; // CSS 只挡了鼠标、键盘还能切=安全开关两套标准（审查 #24）
     box.onchange = () => {
       S.autoApprove.actions[box.dataset.aa] = box.checked;
       markDirty();
@@ -799,7 +831,12 @@ export function initSettings() {
 
   // 工作区
   $("#wsInput").addEventListener("input", markDirty);
-  $("#wsBrowse").onclick = () => { $("#dirRoot").hidden = false; browseDir(S.workspace || ""); };
+  $("#wsBrowse").onclick = () => { dirPickTarget = "ws"; $("#dirRoot").hidden = false; browseDir(S.workspace || ""); };
+  $("#extraAdd").onclick = () => {
+    dirPickTarget = "extra";
+    $("#dirRoot").hidden = false;
+    browseDir(extraRoots[extraRoots.length - 1] || S.workspace || "");
+  };
   $("#dirUp").onclick = async () => {
     const cur = $("#dirNow").value;
     if (!cur || /^[A-Za-z]:\\?$/.test(cur)) return browseDir("");
@@ -811,11 +848,18 @@ export function initSettings() {
   $("#dirPick").onclick = () => {
     const p = $("#dirNow").value;
     if (!p || p === "这台电脑") return toast("先选一个文件夹", "err");
-    $("#wsInput").value = p;
+    if (dirPickTarget === "extra") {
+      if (!extraRoots.includes(p) && extraRoots.length < 10) extraRoots.push(p);
+      renderExtraRoots();
+      toast("已加入额外目录：" + p, "ok");
+    } else {
+      $("#wsInput").value = p;
+      wsHint();
+      toast("已选中：" + p, "ok");
+    }
+    dirPickTarget = "ws";
     $("#dirRoot").hidden = true;
-    wsHint();
     markDirty();
-    toast("已选中：" + p, "ok");
   };
 
   // 通道
@@ -914,7 +958,7 @@ export function initSettings() {
   $("#thinkOn").onchange = () => {
     setShowThinking($("#thinkOn").checked);
     syncThink();
-    $(".think").forEach((n) => (n.hidden = !showThinking()));
+    $$(".think").forEach((n) => (n.hidden = !showThinking()));
     window.dispatchEvent(new CustomEvent("ua:thinking-change", { detail: { on: showThinking() } }));
   };
   window.addEventListener("ua:thinking-change", syncThink);

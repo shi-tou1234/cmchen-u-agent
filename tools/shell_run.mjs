@@ -1,24 +1,8 @@
-// 受限命令执行：黑名单任何模式都拦；执行本身属于高危（走审批）。tools/shell_run.mjs
+// 受限命令执行：黑名单任何模式都拦（与 shell_bg 共用 core/blacklist.mjs）；执行本身属于高危（走审批）。
 import path from "node:path";
-import { resolveInside } from "../core/sandbox.mjs";
+import { resolveInside, rootsOf } from "../core/sandbox.mjs";
 import { runCommand, fmtOutput } from "../core/shellutil.mjs";
-
-const BLACKLIST = [
-  [/format\s+[a-z]:/i, "格式化磁盘"],
-  [/\bshutdown\b/i, "关机/重启"],
-  [/\breg(\.exe)?\s+delete\b/i, "删注册表"],
-  [/\bvssadmin\b/i, "删卷影副本"],
-  [/\bcipher\s+\/w\b/i, "擦写磁盘空闲空间"],
-  [/\b(rd|rmdir)\b[^&|>]*\/s/i, "递归删目录（rd /s）"],
-  [/\bdel\b[^&|>]*\/s\b[^&|>]*[a-z]:\\/i, "递归删绝对路径（del /s + 盘符）"],
-  [/\bdiskpart\b/i, "磁盘分区操作"],
-  [/\bbcdedit\b/i, "改启动配置"],
-  [/remove-item\b[^&|>]*-recurse[^&|>]*[a-z]:\\/i, "PowerShell 递归删绝对路径"],
-];
-
-// cmd 的 ^ 是转义符、引号在分词时会被吃掉：fo^rmat、f"or"mat 到 cmd 里都会还原成 format。
-// 匹配前把这两类字符去掉再查一遍——黑名单是防手滑的护栏，别被这两种写法轻易绕过。
-const unescapeForMatch = (cmd) => String(cmd).replace(/\^/g, "").replace(/"/g, "");
+import { assertCommandAllowed } from "../core/blacklist.mjs";
 
 export default {
   name: "shell_run",
@@ -33,11 +17,8 @@ export default {
     required: ["command"],
   },
   async run(args, ctx) {
-    const probe = unescapeForMatch(args.command);
-    for (const [re, label] of BLACKLIST) {
-      if (re.test(args.command) || re.test(probe)) throw new Error(`命令被无条件拦截（${label}）：${args.command}`);
-    }
-    const cwd = resolveInside([ctx.workspace, ctx.uaHome], args.cwd || ".", ctx.workspace);
+    assertCommandAllowed(args.command);
+    const cwd = resolveInside(rootsOf(ctx), args.cwd || ".", ctx.workspace);
     const r = await runCommand({
       command: path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe"),
       args: ["/d", "/s", "/c", args.command],

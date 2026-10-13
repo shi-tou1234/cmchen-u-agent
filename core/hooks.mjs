@@ -8,8 +8,8 @@
 //   {"additionalContext":"..."}          补一段上下文
 // command/args 直接 spawn（不经 shell，Windows 上也稳）；matcher 是大小写敏感正则，留空=全匹配。
 //
-// 信任：U 盘那份（.agent 在 ua-home）视为盘主人的声明，直接生效；
-// 工作区那份可能来自别人的项目——先过信任闸（内容哈希对得上才放行，改了就重新确认）。
+// 信任：hooks 文件就在盘上、agent 自己也能写它——不管工作区还是 U 盘那份，一律过信任闸
+// （内容哈希对得上才放行，改了就重新确认）。「U 盘免信任」等于给「静默写一个文件」开持久执行后门。
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -22,7 +22,7 @@ export function loadHookSources({ workspace, uaHome }) {
   const out = [];
   const roots = [];
   if (workspace) roots.push({ kind: "项目", dir: path.join(workspace, ".agent"), trusted: false });
-  if (uaHome && path.resolve(uaHome) !== path.resolve(workspace || "")) roots.push({ kind: "U 盘", dir: path.join(uaHome, ".agent"), trusted: true });
+  if (uaHome && path.resolve(uaHome) !== path.resolve(workspace || "")) roots.push({ kind: "U 盘", dir: path.join(uaHome, ".agent"), trusted: false });
   for (const r of roots) {
     const file = path.join(r.dir, "hooks.json");
     try {

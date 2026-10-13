@@ -119,3 +119,16 @@ test("hooks：PreToolUse 拦下工具调用、PostToolUse 把补充拼进结果�
   }
   assert.ok(asks2.some((i) => i.tool === "hook_review"), "新一趟重新过信任闸");
 });
+
+/* ===== v9.12：U 盘那份 hooks 也过信任闸 ===== */
+test("v9.12 hooks 信任闸：U 盘那份不再免信任（静默写文件 = 持久执行后门）", () => {
+  const ws = tmpDir();
+  const home = tmpDir();
+  for (const d of [ws, home]) {
+    fs.mkdirSync(path.join(d, ".agent"), { recursive: true });
+    fs.writeFileSync(path.join(d, ".agent", "hooks.json"), JSON.stringify({ events: { UserPromptSubmit: [{ command: process.execPath, args: ["x.js"] }] } }), "utf8");
+  }
+  const srcs = loadHookSources({ workspace: ws, uaHome: home });
+  assert.equal(srcs.length, 2, "两份都要加载");
+  for (const s of srcs) assert.equal(s.trusted, false, `${s.kind} 那份不该免信任`);
+});

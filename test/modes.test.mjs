@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { gate, gateWith, isSafeCommand, commandSegments, matchesPrefix, MODES, DEFAULT_AUTO_APPROVE } from "../core/modes.mjs";
+import { gate, gateWith, isSafeCommand, commandSegments, commandPrefix, matchesPrefix, MODES, DEFAULT_AUTO_APPROVE } from "../core/modes.mjs";
 import { runAgent } from "../core/agent-loop.mjs";
 import { freshRegistry, makeCtx, tmpDir } from "./helpers.mjs";
 
@@ -276,4 +276,87 @@ test("v9.8 安全命令判定同样逐段（dir 开头也夹带不了安装命�
   assert.equal(isSafeCommand("dir && npm install left-pad"), false, "借 dir 开头夹带安装命令");
   assert.equal(isSafeCommand("git status && type a.txt"), true);
   assert.equal(isSafeCommand("git status && del a.txt"), false);
+});
+
+/* ===== v9.12：按 cmd 真实语义拆段、前缀收紧、critical 档 ===== */
+test("v9.12 拆段：单引号不保护 &（cmd 真语义）、换行算分隔", () => {
+  assert.deepEqual(commandSegments("echo A '& ver"), ["echo A '", "ver"], "cmd 不把 ' 当引号，照它拆");
+  assert.deepEqual(commandSegments("dir\r\npowershell -enc x"), ["dir", "powershell -enc x"], "换行算分隔");
+  assert.equal(isSafeCommand("git status '& powershell -c calc"), false, "单引号借道封死");
+  assert.equal(isSafeCommand("git status\npowershell -c calc"), false, "换行借道封死");
+  assert.equal(isSafeCommand('echo A "& ver"'), true, "双引号是 cmd 认的引号，保护照旧");
+});
+
+test("v9.12 前缀收紧：批过 npm run build 不放行别的脚本；解释器不塌缩", () => {
+  assert.equal(commandPrefix("npm run build"), "npm run build");
+  assert.equal(commandPrefix("git status --short"), "git status");
+  assert.equal(commandPrefix("dir"), "dir");
+  assert.equal(matchesPrefix("npm run deploy", ["npm run build"]), false, "别的脚本要另批");
+  assert.equal(matchesPrefix("npm run build --prod", ["npm run build"]), true);
+  assert.equal(commandPrefix("python -V"), "python -V", "解释器守卫");
+  assert.equal(commandPrefix("C:\\Python311\\python.exe -V"), "C:\\Python311\\python.exe -V", "带路径也认出");
+  assert.equal(matchesPrefix("python evil.py", [commandPrefix("python -V")]), false, "批过 -V 不等于放行任意脚本");
+});
+
+test("v9.12 critical 档：必须人工确认，自动放行开关也放不过", () => {
+  assert.equal(gate("confirm", "critical"), "confirm");
+  assert.equal(gate("auto", "critical"), "deny");
+  assert.equal(gate("readonly", "critical"), "deny");
+  assert.equal(gate("full", "critical"), "run", "full 是盘主人的明确选择，不设防");
+  const r = gateWith("confirm", "critical", { toolName: "fs_write", autoApprove: aa({ editFiles: true, deleteFiles: true }) });
+  assert.equal(r.g, "confirm");
+  assert.equal(r.auto, false);
+  assert.match(r.reason, /必须人工确认/);
+});
+
+/* ===== v9.13：第二轮审查修复 ===== */
+test("v9.13 SAFE_CMD 补写删旗标：--output / -delete / branch -D 不再算安全", () => {
+  for (const c of [
+    "git diff --output=C:\\Users\\Public\\evil.txt",
+    "git log --output=x.txt HEAD",
+    "git show --output=out.txt HEAD",
+    "find . -delete",
+    "git branch -D main",
+    "find . -exec calc ;",
+  ]) {
+    assert.equal(isSafeCommand(c), false, c);
+  }
+  assert.equal(isSafeCommand("git diff"), true, "普通 git diff 仍算安全");
+  assert.equal(isSafeCommand("dir"), true, "基线不受影响");
+});
+
+test("v9.13 前缀不截断写旗标；带重定向的段不许蹭前缀", () => {
+  const full = commandPrefix("git diff --output=C:\\evil.txt");
+  assert.match(full, /--output/, "含 --output 的命令，前缀要整条（批一次只放行那一条）");
+  assert.equal(matchesPrefix("git diff --output=D:\\other.txt", [full]), false, "别的 --output 变体不白名单直通");
+  assert.equal(matchesPrefix("dir > x.txt", ["dir"]), false, "带重定向的段不许蹭 dir 前缀（那是写文件）");
+  assert.equal(matchesPrefix("dir /b", ["dir"]), true, "普通 dir 参数照旧");
+});
+
+test("v9.13 联网/子任务在确认模式必过审（开关不再形同虚设）", () => {
+  assert.equal(gateWith("confirm", "medium", { toolName: "web_fetch", autoApprove: aa({}) }).g, "confirm", "不勾就要问");
+  assert.equal(gateWith("confirm", "medium", { toolName: "web_fetch", autoApprove: aa({ useWeb: true }) }).g, "run", "勾了「联网」才自动放");
+  assert.equal(gateWith("confirm", "medium", { toolName: "web_search", autoApprove: aa({ useWeb: true }) }).g, "run");
+  assert.equal(gateWith("confirm", "medium", { toolName: "spawn_subagent", autoApprove: aa({}) }).g, "confirm");
+  assert.equal(gateWith("confirm", "medium", { toolName: "spawn_subagent", autoApprove: aa({ useSubagent: true }) }).g, "run");
+  assert.equal(gate("readonly", "medium"), "deny", "只读/计划模式：联网与子任务直接拒（不再把上下文往外发）");
+  assert.equal(gateWith("auto", "medium", { toolName: "web_fetch" }).g, "run", "auto 模式保持不弹窗语义");
+});
+
+test("v9.13 黑名单在弹窗前就拦（full 模式直接拒、不进审批）", async () => {
+  const { r } = await freshRegistry();
+  const ws = tmpDir();
+  const asks = [];
+  const evs = await collect(
+    runAgent({
+      provider: { protocol: "mock" },
+      messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "shell_run", args: { command: "format c: /q" } }]) }],
+      registry: r,
+      ctx: makeCtx({ workspace: ws, mode: "full", registry: r, confirmImpl: (info) => asks.push(info) || true }),
+    })
+  );
+  assert.equal(asks.length, 0, "黑名单命令不该进审批弹窗（原先弹了才查）");
+  const tr = evs.find((e) => e.type === "tool_result" && e.name === "shell_run");
+  assert.equal(tr.denied, true);
+  assert.match(tr.text, /无条件拦截/);
 });

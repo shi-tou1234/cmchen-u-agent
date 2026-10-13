@@ -12,19 +12,23 @@ export const MODE_LABEL = {
 };
 
 // gate(mode, risk) → "run" | "confirm" | "deny"（只按套餐判定，不含细粒度开关）
+// risk：low / medium / high / critical。critical = agent 自查面（见 sandbox.isSelfSurface：
+// 它自己的配置/代码/数据/运行时）——行为与 high 一致，但细粒度开关也放不过，必须人工点头；
+// 只有 full 模式不设防（那是盘主人自己选的）。
 export function gate(mode, risk) {
+  const hard = risk === "high" || risk === "critical";
   switch (mode) {
     case "full":
       return "run";
     case "auto":
-      return risk === "high" ? "deny" : "run";
+      return hard ? "deny" : "run";
     case "confirm":
-      return risk === "high" ? "confirm" : "run";
+      return hard ? "confirm" : "run";
     case "readonly":
     case "plan":
       return risk === "low" ? "run" : "deny";
     default:
-      return risk === "high" ? "confirm" : "run";
+      return hard ? "confirm" : "run";
   }
 }
 
@@ -35,7 +39,7 @@ export const TOOL_CATEGORY = {
   fs_list: "read", fs_read: "read", fs_search: "read", sys_info: "read",
   git_status: "read", git_diff: "read", git_log: "read",
   fs_write: "write", fs_edit: "write", fs_mkdir: "write", fs_move: "write",
-  git_commit: "write", git_push: "write", git_pull: "write",
+  git_commit: "write", git_pull: "write",
   fs_delete: "delete",
   shell_run: "exec",
   web_search: "web", web_fetch: "web",
@@ -80,27 +84,33 @@ export const DEFAULT_AUTO_APPROVE = {
 
 // 明显只读、无副作用的命令（在 shell 黑名单之外再做一层启发式判定）
 const SAFE_CMD = /^\s*(dir|ls|type|cat|more|echo|pwd|cd|where|which|find|findstr|grep|head|tail|wc|tree|file|stat|hostname|ver|date|time|ipconfig|tasklist|whoami|env|set)\b|^\s*git\s+(status|log|diff|branch|show|remote|describe)\b|^\s*(node|python|python3|npm|git|go|java|dotnet)\s+(-v|--version|-version)\b/i;
-const RISKY_TOKEN = /(^|\s|>|\||&|;)(rm|del|erase|rmdir|rd|mv|move|copy|cp|xcopy|robocopy|format|shutdown|reg|sc|net|taskkill|curl|wget|Invoke-WebRequest|Start-Process|npm\s+(install|i|uninstall|update)|pip\s+install|git\s+(push|commit|reset|checkout|clean|rebase|merge))\b/i;
+// 写盘/执行/重定向类旗标也要算「危险」（审查 #7 实测：git diff --output=路径 被判安全且能任意写文件、
+// find . -delete 递归删除、git branch -D 强删分支）。
+// 这些旗标不靠前缀位置匹配——出现在哪都算数。
+const RISKY_TOKEN = /(^|\s|>|\||&|;)(rm|del|erase|rmdir|rd|mv|move|copy|cp|xcopy|robocopy|format|shutdown|reg|sc|net|taskkill|curl|wget|Invoke-WebRequest|Start-Process|npm\s+(install|i|uninstall|update)|pip\s+install|git\s+(push|commit|reset|checkout|clean|rebase|merge|branch\s+-[dD])|--output|--delete|-delete|-exec|-execdir)\b/i;
 
-// 复合命令拆段：cmd 里 && || ; & | 都能再接一条命令——门禁校验必须逐段看，
+// 复合命令拆段：cmd 里 && || & | 与换行都能再接一条命令——门禁校验必须逐段看，
 // 否则「批准过 git status」会把 `git status && 干别的` 一起放行。
-// 引号里的分隔符不算；^ 是转义（^& 是字面 &）；拆多了只会更严，不会更松。
+// 只认双引号：cmd 不把 ' 当引号（实测 `echo A '& ver` 里 & 后面的命令照跑），
+// 照 cmd 的真实语义拆，才不会放走「单引号借道」。
+// ^ 是转义（^& 是字面 &）；拆多了只会更严，不会更松。
 export function commandSegments(cmd) {
   const s = String(cmd || "");
   const out = [];
   let cur = "";
-  let quote = "";
+  let quote = false;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (quote) {
       cur += c;
-      if (c === quote) quote = "";
+      if (c === '"') quote = false;
       continue;
     }
-    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
+    if (c === '"') { quote = true; cur += c; continue; }
     if (c === "^" && i + 1 < s.length) { cur += c + s[i + 1]; i++; continue; }
-    if (c === "&" || c === "|" || c === ";") {
-      if (s[i + 1] === c) i++;
+    if (c === "&" || c === "|" || c === ";" || c === "\r" || c === "\n") {
+      if ((c === "&" || c === "|") && s[i + 1] === c) i++;
+      if (c === "\r" && s[i + 1] === "\n") i++;
       out.push(cur);
       cur = "";
       continue;
@@ -122,17 +132,34 @@ export function isSafeCommand(cmd) {
   });
 }
 
-// 「本会话不再问这类命令」用的前缀：取到第一个带 - 或 = 的 token 之前，最多两段
-//   git status --short → "git status"；npm install left-pad → "npm install"；dir → "dir"
+// 「本会话不再问这类命令」用的前缀：取到第一个带 - 或 = 的 token 之前，最多三段。
+//   git status --short → "git status"；npm run build → "npm run build"；dir → "dir"
+// 三段而不是两段：`npm run build` 只记成 `npm run` 的话，批一次 build 等于放行全部脚本（审查报告 H4）。
+// 特例：只留下一个词、而这词还是解释器（python/node/powershell/npm…）时退回整条命令——
+// 否则批过 `python -V` 就等于放行 `python <任意脚本>`。
+const INTERPRETERS = new Set([
+  "python", "python3", "py", "node", "nodejs", "npm", "npx", "pnpm", "yarn", "bun", "deno",
+  "powershell", "pwsh", "cmd", "bash", "sh", "zsh", "perl", "ruby", "php", "java", "javac",
+  "dotnet", "go", "cargo", "rustc", "tsx", "ts-node", "uv", "pip", "pip3", "git",
+]);
 export function commandPrefix(cmd) {
-  const toks = String(cmd || "").trim().split(/\s+/).filter(Boolean).slice(0, 2);
+  const s = String(cmd || "").trim();
+  // 含写盘/执行/重定向内容的命令不截断前缀：批过「git diff --output=x.txt」只能放行一模一样的这条，
+  // 否则前缀被截成 "git diff"，之后任何 --output 变体都白名单直通（审查 #7）
+  if (/--output\b|--delete\b|-delete\b|-exec(dir)?\b|>/.test(s)) return s.slice(0, 80);
+  const toks = s.split(/\s+/).filter(Boolean).slice(0, 3);
   const keep = [];
   for (const t of toks) {
     if (/^-|^-{2}|=/.test(t)) break;
     keep.push(t);
-    if (keep.length >= 2) break;
+    if (keep.length >= 3) break;
   }
-  return keep.join(" ") || String(cmd || "").trim().slice(0, 40);
+  if (keep.length === 1) {
+    // 带路径的解释器也要认出：C:\Python311\python.exe -V 同样不能塌缩成「C:\...\python」
+    const base = keep[0].toLowerCase().replace(/\.exe$/i, "").split(/[\\/]/).pop();
+    if (INTERPRETERS.has(base)) return s.slice(0, 80);
+  }
+  return keep.join(" ") || s.slice(0, 40);
 }
 
 // 某条命令是否落在用户「本会话已放行」的前缀里（逐段校验：复合命令每一段都得在范围内）
@@ -143,6 +170,7 @@ export function matchesPrefix(cmd, prefixes) {
   if (!list.length) return false;
   return segs.every((seg) => {
     const c = seg.toLowerCase();
+    if (c.includes(">")) return false; // 带重定向的段不许蹭前缀放行（dir > x.txt 是写文件，不是列目录）
     return list.some((pre) => c === pre || c.startsWith(pre + " "));
   });
 }
@@ -152,11 +180,16 @@ export function matchesPrefix(cmd, prefixes) {
  * @returns {{g:"run"|"confirm"|"deny", auto:boolean, reason?:string}}
  */
 export function gateWith(mode, risk, opts = {}) {
-  const base = gate(mode, risk);
+  const cat = TOOL_CATEGORY[opts.toolName || ""];
+  let base = gate(mode, risk);
+  // 联网 / 派子任务：确认模式下也必须过一次审（勾了「联网」「子任务」开关才自动放）。
+  // 审查 #6 实测：这俩是 low/medium，套餐判定直接 run，开关永远查不到——用户以为关了联网，agent 照样发包。
+  if (base === "run" && mode === "confirm" && (cat === "web" || cat === "sub")) base = "confirm";
   if (base !== "confirm") return { g: base, auto: false };
+  // critical（agent 自查面）：细粒度开关没有资格放行，必须人来点
+  if (risk === "critical") return { g: "confirm", auto: false, reason: "agent 自己的配置/代码/数据，必须人工确认" };
 
   const aa = opts.autoApprove;
-  const cat = TOOL_CATEGORY[opts.toolName || ""];
   if (!aa?.enabled) return { g: "confirm", auto: false, reason: "自动放行没开" };
 
   const on = (k) => !!aa.actions?.[k];

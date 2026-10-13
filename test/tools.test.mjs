@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
-import { freshRegistry, makeCtx, tmpDir, runSyncRetry } from "./helpers.mjs";
+import { freshRegistry, makeCtx, tmpDir, runSyncRetry, REPO } from "./helpers.mjs";
 
 let reg;
 test.before(async () => {
@@ -103,21 +103,21 @@ test("git 未初始化时给明确错误", async () => {
   await assert.rejects(() => run("git_status", {}, ctx), /不是 git 仓库/);
 });
 
-test("web_fetch：抓本地 http 文本", async () => {
+test("web_fetch：拦本机/内网地址（防 SSRF），非 http 拒", async () => {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end("<html><head><style>.x{}</style></head><body><h1>你好uagent</h1><script>evil()</script><p>正文段落</p></body></html>");
+    res.end("<html><body><h1>你好uagent</h1></body></html>");
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const url = `http://127.0.0.1:${server.address().port}/x.html`;
-  const ctx = makeCtx({ workspace: tmpDir(), registry: reg });
-  const out = await run("web_fetch", { url }, ctx);
-  assert.match(out, /你好uagent/);
-  assert.match(out, /正文段落/);
-  assert.doesNotMatch(out, /evil\(\)/);
-  assert.doesNotMatch(out, /\.x\{\}/);
-  await assert.rejects(() => run("web_fetch", { url: "ftp://x" }, ctx), /http/);
-  server.close();
+  try {
+    const url = `http://127.0.0.1:${server.address().port}/x.html`;
+    const ctx = makeCtx({ workspace: tmpDir(), registry: reg });
+    // v9.12 起：本机/内网地址一律拦下（也不许经 r.jina.ai 兜底转发）。HTML 转文本管线改由 web.test 直测 htmlToText
+    await assert.rejects(() => run("web_fetch", { url }, ctx), /内网\/本机地址被拦下/);
+    await assert.rejects(() => run("web_fetch", { url: "ftp://x" }, ctx), /http/);
+  } finally {
+    server.close(); // 断言失败也必须关掉，不然进程挂着不退（v9.12 排查过的坑）
+  }
 });
 
 /* ===== v9.8：get_context_remaining ===== */
@@ -155,4 +155,96 @@ test("v9.9 ask_user：作答数组转成给模型的文字；跳过有兜底话�
 
   const ctx2 = makeCtx({ workspace: ws, registry: reg, confirmImpl: () => ({ ok: false }) });
   assert.match(await run("ask_user", { questions: [{ question: "x" }] }, ctx2), /跳过/);
+});
+
+/* ===== v9.10：额外可访问的目录（extraRoots） ===== */
+test("v9.10 extraRoots：额外目录里的文件可读，未放行则照旧拒绝", async () => {
+  const ws = tmpDir();
+  const extra = tmpDir();
+  fs.writeFileSync(path.join(extra, "note.txt"), "外面世界的笔记", "utf8");
+  const ctx = makeCtx({ workspace: ws, registry: reg });
+  await assert.rejects(() => run("fs_read", { path: path.join(extra, "note.txt") }, ctx), /越界/);
+  ctx.extraRoots = [extra];
+  assert.match(await run("fs_read", { path: path.join(extra, "note.txt") }, ctx), /外面世界的笔记/);
+  const elsewhere = tmpDir();
+  fs.writeFileSync(path.join(elsewhere, "x.txt"), "x", "utf8");
+  await assert.rejects(() => run("fs_read", { path: path.join(elsewhere, "x.txt") }, ctx), /越界/, "没放行的目录照旧拒绝");
+});
+
+/* ===== v9.10：完全权限模式不设路径边界 ===== */
+test("v9.10 完全权限：工作区外任意路径可读可写；其它模式照旧拒绝", async () => {
+  const ws = tmpDir();
+  const outside = tmpDir();
+  const target = path.join(outside, "anywhere.txt");
+  const full = makeCtx({ workspace: ws, registry: reg, mode: "full" });
+  await run("fs_write", { path: target, content: "全权限可写" }, full);
+  assert.match(await run("fs_read", { path: target }, full), /全权限可写/);
+  const confirm = makeCtx({ workspace: ws, registry: reg, mode: "confirm" });
+  await assert.rejects(() => run("fs_read", { path: target }, confirm), /越界/, "谨慎模式照旧拒绝");
+  const readonly = makeCtx({ workspace: ws, registry: reg, mode: "readonly" });
+  await assert.rejects(() => run("fs_read", { path: target }, readonly), /越界/, "只读模式也拒");
+});
+
+/* ===== v9.12：安全批（黑名单共享 / 删根保护 / 自查面 critical / run_checks 提级） ===== */
+test("v9.12 shell_bg 与 shell_run 共享黑名单，full 模式也拦", async () => {
+  const ws = tmpDir();
+  const ctx = makeCtx({ workspace: ws, registry: reg, mode: "full" });
+  await assert.rejects(() => run("shell_bg", { command: "format c: /q" }, ctx), /无条件拦截/);
+  await assert.rejects(() => run("shell_bg", { command: "fo^rmat c: /q" }, ctx), /无条件拦截/, "caret 转义同样拦");
+});
+
+test("v9.12 fs_delete 根目录保护：大小写别名与 extraRoots 都拦住", async () => {
+  const ws = tmpDir();
+  const extra = tmpDir();
+  const ctx = makeCtx({ workspace: ws, registry: reg, mode: "full" });
+  ctx.extraRoots = [extra];
+  await assert.rejects(() => run("fs_delete", { path: extra }, ctx), /拒绝删除/, "额外目录的根不许整个删");
+  const alias = ws.replace(/[A-Za-z]/, (m) => (m === m.toLowerCase() ? m.toUpperCase() : m.toLowerCase()));
+  if (alias !== ws) await assert.rejects(() => run("fs_delete", { path: alias }, ctx), /拒绝删除/, "大小写别名骗不过护栏");
+});
+
+test("v9.12 自查面 critical：命中 agent 自己身上时提级，工作区照旧", async () => {
+  const ws = tmpDir();
+  const ctx = makeCtx({ workspace: ws, registry: reg });
+  assert.equal(reg.get("fs_write").risk({ path: path.join(REPO, "data", "probe.json"), content: "{}" }, ctx), "critical");
+  assert.equal(reg.get("fs_write").risk({ path: "普通.txt", content: "x" }, ctx), "medium", "工作区里的新建不受影响");
+  assert.equal(reg.get("fs_edit").risk({ path: path.join(REPO, "core", "x.mjs"), old: "a", new: "b" }, ctx), "critical");
+  assert.equal(reg.get("fs_delete").risk({ path: path.join(REPO, "core", "x.mjs") }, ctx), "critical");
+  assert.equal(reg.get("fs_delete").risk({ path: path.join(ws, "a.txt") }, ctx), "high");
+  assert.equal(reg.get("run_checks").risk, "medium", "run_checks 不再标 low（只读模式不许静默跑项目脚本）");
+});
+
+/* ===== v9.13：第二轮审查修复 ===== */
+test("v9.13 fs_edit：$ 模式按字面处理、old 为空拒绝、GBK 文件不弄坏", async () => {
+  const ws = tmpDir();
+  const ctx = makeCtx({ workspace: ws, registry: reg });
+  fs.writeFileSync(path.join(ws, "t.txt"), "hello world", "utf8");
+  await run("fs_edit", { path: "t.txt", old: "world", new: "[$&]" }, ctx);
+  assert.equal(fs.readFileSync(path.join(ws, "t.txt"), "utf8"), "hello [$&]", "$& 要按字面写进去（审查 #2）");
+  await assert.rejects(() => run("fs_edit", { path: "t.txt", old: "", new: "x" }, ctx), /old 不能为空/, "空 old 不许绕过双护栏（审查 #16）");
+  // GBK 文件：读出来不乱码、替换后内容正确（写回 UTF-8 并在结果里说明）
+  const gbk = Buffer.concat([Buffer.from([0xc4, 0xe3, 0xba, 0xc3]), Buffer.from(" world")]); // "你好 world"（GBK）
+  fs.writeFileSync(path.join(ws, "gbk.txt"), gbk);
+  const read = await run("fs_read", { path: "gbk.txt" }, ctx);
+  assert.match(read, /你好/, "GBK 要解出来：" + read.slice(0, 90));
+  assert.match(read, /按 GBK 解码/);
+  const out = await run("fs_edit", { path: "gbk.txt", old: "world", new: "everyone" }, ctx);
+  assert.match(out, /GBK/, "写回要提示编码变化：" + out);
+  assert.equal(fs.readFileSync(path.join(ws, "gbk.txt"), "utf8"), "你好 everyone");
+});
+
+test("v9.13 工具档位修正：git_push→high、web 两件→medium、spawn_subagent 独占", async () => {
+  assert.equal(reg.get("git_push").risk, "high", "push 是不可逆外发，还触发仓库 hooks（审查 #14）");
+  assert.equal(reg.get("web_search").risk, "medium");
+  assert.equal(reg.get("web_fetch").risk, "medium");
+  assert.equal(reg.get("spawn_subagent").parallel, false, "它跑完整 agent 循环，不能声明并行（审查 #13）");
+});
+
+test("v9.13 自动检查命令也过黑名单（checks 原先完全绕开）", async () => {
+  const { runChecks } = await import("../core/checks.mjs");
+  const r = await runChecks({ test: "format c: /q" }, tmpDir());
+  assert.equal(r.ok, false);
+  assert.match(r.results[0].output, /无条件拦截/);
+  const ok = await runChecks({ test: "node -v" }, tmpDir());
+  assert.equal(ok.results[0].ok, true, "正常检查命令不受影响");
 });

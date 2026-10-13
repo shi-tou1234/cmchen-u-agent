@@ -5,7 +5,9 @@ export default {
   name: "run_checks",
   description:
     "在工作区里跑用户配置的检查命令（test / lint），返回退出码与输出。改完代码后用它自己验一遍，别等用户发现",
-  risk: "low",
+  // 会在当前工作区跑命令：命令是用户配的，但项目可能是别人的（npm test 会跑 package.json 里的 scripts）。
+  // 早先标 low 等于连只读模式都放行「打开不可信项目即执行」——提到 medium（审查报告 H2）。
+  risk: "medium",
   parallel: false, // 会跑命令，独占
   params: {
     type: "object",

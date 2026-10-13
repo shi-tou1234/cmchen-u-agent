@@ -46,6 +46,8 @@ export function makeCtx({ workspace, mode = "confirm", registry, provider, emit 
   return {
     uaHome: REPO,
     workspace,
+    extraRoots: [],
+    allowAnyPath: mode === "full", // 完全权限：沙箱不设边界（与 server 的 ctx 语义一致）
     mode,
     registry,
     provider: provider || { protocol: "mock" },

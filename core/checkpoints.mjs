@@ -209,7 +209,12 @@ export class Checkpoints {
       if (!cur.ok) continue; // 读不了的（超大文件）不拦，下面的恢复会如实报错
       if (cur.sha !== want.sha) conflicts.push({ rel: want.rel, since: want.sha === null ? "改动之后又被重新创建" : "改动之后又被改过" });
     }
-    if (conflicts.length && !force) return { ok: false, needForce: true, conflicts };
+    if (conflicts.length && !force) {
+      // 回退预览分级（v9.10）：把「安全（会被自动恢复）/ 不安全（列明原因）」都报出来，前端弹窗分级展示
+      const unsafe = new Set(conflicts.map((c) => c.rel));
+      const safe = [...new Set([...expect.values()].map((v) => v.rel))].filter((r) => !unsafe.has(r));
+      return { ok: false, needForce: true, conflicts, safe };
+    }
 
     const restored = [];
     const removed = [];

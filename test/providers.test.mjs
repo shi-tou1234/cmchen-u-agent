@@ -392,3 +392,33 @@ test("v9.8 重试壳：没吐内容就断 → 自动重连成功；已吐内容�
   assert.equal(m, 1, "吐过内容不许整体重试");
   await up2.close();
 });
+
+/* ===== v9.10：缓存命中字段（各家协议归一成 usage.cached） ===== */
+test("v9.10 缓存命中：三家协议的字段都归一到 usage.cached", async () => {
+  const up1 = await mockUpstream((req, res) =>
+    sse(res, [
+      { choices: [{ delta: { content: "hi" } }] },
+      { usage: { prompt_tokens: 100, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 80 } }, choices: [] },
+    ])
+  );
+  const u1 = (await collect(streamChat({ protocol: "openai-chat", baseURL: up1.url, model: "m", secret: "k" }, [{ role: "user", text: "x" }], []))).find((e) => e.type === "usage");
+  assert.equal(u1.cached, 80, "OpenAI 系 prompt_tokens_details.cached_tokens");
+  await up1.close();
+
+  const up2 = await mockUpstream((req, res) => sse(res, [{ usage: { prompt_tokens: 50, completion_tokens: 2, prompt_cache_hit_tokens: 30 }, choices: [] }]));
+  const u2 = (await collect(streamChat({ protocol: "openai-chat", baseURL: up2.url, model: "m", secret: "k" }, [{ role: "user", text: "x" }], []))).find((e) => e.type === "usage");
+  assert.equal(u2.cached, 30, "DeepSeek 系 prompt_cache_hit_tokens");
+  await up2.close();
+
+  const up3 = await mockUpstream((req, res) => sse(res, [{ type: "message_start", message: { usage: { input_tokens: 100, cache_read_input_tokens: 64 } } }, { type: "message_stop" }]));
+  const u3 = (await collect(streamChat({ protocol: "anthropic", baseURL: up3.url, model: "claude-sonnet-5-5", secret: "k" }, [{ role: "user", text: "x" }], []))).find((e) => e.type === "usage");
+  assert.equal(u3.cached, 64, "Anthropic cache_read_input_tokens");
+  await up3.close();
+
+  const up4 = await mockUpstream((req, res) =>
+    sse(res, [{ type: "response.completed", response: { status: "completed", usage: { input_tokens: 10, output_tokens: 2, input_tokens_details: { cached_tokens: 7 } } } }])
+  );
+  const u4 = (await collect(streamChat({ protocol: "openai-responses", baseURL: up4.url, model: "m", secret: "k" }, [{ role: "user", text: "x" }], []))).find((e) => e.type === "usage");
+  assert.equal(u4.cached, 7, "Responses 系 input_tokens_details.cached_tokens");
+  await up4.close();
+});
