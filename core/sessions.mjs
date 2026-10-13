@@ -67,6 +67,19 @@ export class Sessions {
       });
   }
 
+  // 从某条消息处「分叉」出一份新会话（原会话不动）：复制 0..atIndex 的事件 + 一条 fork 标记。
+  // 玩法：想试另一条路又不想弄脏主线时用；分叉后输入框会带回那条消息的原文。
+  fork(id, atIndex) {
+    const src = this.read(id);
+    if (!src.length) throw new Error("会话不存在");
+    const at = Number(atIndex);
+    if (!Number.isInteger(at) || at < 0 || at >= src.length) throw new Error("分叉位置不对");
+    const newId = this.create("s");
+    const lines = src.slice(0, at + 1).map((e) => JSON.stringify(e)).join("\n") + "\n";
+    fs.appendFileSync(this.fileOf(newId), lines + JSON.stringify({ ts: nowTs(), type: "fork", from: id, atIndex: at }) + "\n", "utf8");
+    return newId;
+  }
+
   list() {
     const files = fs.readdirSync(this.dir).filter((f) => f.endsWith(".jsonl"));
     const seen = new Set(files);

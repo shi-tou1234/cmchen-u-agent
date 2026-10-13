@@ -320,6 +320,11 @@ function handleEvent(ev, c) {
     case "goal_check":
       noteLine(ev.met ? "完成标准已达成：" + (ev.reason || "") : "完成标准还没达成：" + (ev.reason || ""));
       break;
+    case "hook": {
+      const what = ev.block ? "拦下了这次操作" : ev.warn ? "有话说" : "通过";
+      noteLine(`⚙ 项目 hook（${ev.event}）${what}${ev.reason ? "：" + ev.reason : ""}${ev.ms ? `（${ev.ms}ms）` : ""}`);
+      break;
+    }
     case "auto_fix": noteLine("自动检查没过，已把输出交给它接着修（第 " + ev.round + " 轮）"); break;
     case "confirm_request": queueConfirm(ev); break;
     case "subagent_event": handleSub(ev, c.subs); break;
@@ -399,9 +404,11 @@ function addUser(text, images) {
   if ($(".welcome")) clearStream();
   const imgs = (images || []).map((i) => `<img class="att-img" src="data:${i.mediaType};base64,${i.data}">`).join("");
   const node = el(`<div class="msg msg-user"><div class="bubble">${md(text)}${imgs}</div>
-    <button class="rw-btn" title="从这里重来：后面这段不再进上下文，这条消息放回输入框">${icon("refresh", "ic ic-sm")}从这儿重来</button></div>`);
-  node.__raw = text; // 原样存一份，回退时用它去日志里找对应那条
-  node.querySelector(".rw-btn").onclick = () => rewindTo(node);
+    <button class="rw-btn" title="回退到这里：之后的对话不再进上下文；默认连这段的文件改动一起回滚（按住 Alt 只回退对话）">${icon("refresh", "ic ic-sm")}从这儿重来</button>
+    <button class="fk-btn" title="从这里分叉出一条新会话：原会话完全不动，这句原话放回输入框">${icon("git", "ic ic-sm")}分叉</button></div>`);
+  node.__raw = text; // 原样存一份，回退/分叉时用它去日志里找对应那条
+  node.querySelector(".rw-btn").onclick = (e) => rewindTo(node, e.altKey);
+  node.querySelector(".fk-btn").onclick = () => forkTo(node);
   colEl().appendChild(node);
   scrollEnd(true);
 }
@@ -417,7 +424,7 @@ function rewindRanges(events) {
 }
 const isDropped = (ranges, i) => ranges.some((r) => i > r.atIndex && i < r.marker);
 
-async function rewindTo(node) {
+async function rewindTo(node, onlyChat) {
   if (!S.sessionId) return toast("还没有可以回退的对话", "err");
   if (S.sending) return toast("等这一轮跑完再回退", "err");
   const raw = node.__raw || "";
@@ -425,7 +432,7 @@ async function rewindTo(node) {
   if (!node.dataset.armed) {
     node.dataset.armed = "1";
     btn.classList.add("armed");
-    btn.textContent = "再点一次：后面这段对话不再进上下文";
+    btn.textContent = "再点一次：对话+文件一起回退（按住 Alt 只回退对话）";
     clearTimeout(node._rwTimer);
     node._rwTimer = setTimeout(() => {
       delete node.dataset.armed;
@@ -436,31 +443,70 @@ async function rewindTo(node) {
   }
   clearTimeout(node._rwTimer);
   try {
-    const j = await api.session(S.sessionId);
-    const ranges = rewindRanges(j.events);
-    const ord = [...colEl().querySelectorAll(".msg-user")].filter((n) => n.__raw === raw).indexOf(node);
-    let at = -1;
-    let seen = -1;
-    for (let i = 0; i < j.events.length; i++) {
-      const e = j.events[i];
-      if (e.type !== "user" || isDropped(ranges, i)) continue;
-      if ((e.text || "") === raw && ++seen === ord) { at = i; break; }
-    }
+    const at = await findUserEventIndex(node);
     if (at < 0) return toast("没在日志里找到这条消息（可能已被压缩）", "err");
-    const r = await api.rewind(S.sessionId, at);
+    const r = await rewindRequest(at, !onlyChat);
     const fresh = await api.session(S.sessionId);
     renderHistory(fresh.events);
     if (fresh.budget) { S.budget = fresh.budget; renderUsage(); }
     // 放回输入框时只回原话：附件块（【文件 …】）是发送时才拼进去的，不跟着回来
     setInput(raw.split("\n\n【文件 ")[0] || raw);
-    toast(`已回退 ${r.dropped} 条记录，文件改动不受影响`, "ok");
+    const nf = (r.files?.reverted || []).length;
+    toast(`已回退 ${r.dropped} 条记录` + (nf ? `，回滚了 ${nf} 个文件改动` : "，文件改动不受影响"), "ok");
+  } catch (e) {
+    if (e.message !== "已取消") toast(e.message, "err");
+  }
+}
+
+// 统一回退（v0.9.9）：默认对话+文件一起；文件撞车先问一句再强制
+async function rewindRequest(at, withFiles) {
+  try {
+    return await api.rewind(S.sessionId, at, withFiles ? { withFiles: true } : {});
+  } catch (e) {
+    if (e.status === 409 && e.data?.needForce) {
+      const n = e.data.conflicts?.length || 0;
+      if (!confirm(`有 ${n} 个文件在这次回退覆盖的范围之后又被改过。仍要强制回退吗？（强制会把它们恢复到更早的样子）`)) throw new Error("已取消");
+      return await api.rewind(S.sessionId, at, { withFiles: true, force: true });
+    }
+    throw e;
+  }
+}
+
+// 在日志里找到这条用户消息对应的事件下标（回退与分叉共用）
+async function findUserEventIndex(node) {
+  const raw = node.__raw || "";
+  const j = await api.session(S.sessionId);
+  const ranges = rewindRanges(j.events);
+  const ord = [...colEl().querySelectorAll(".msg-user")].filter((n) => n.__raw === raw).indexOf(node);
+  let seen = -1;
+  for (let i = 0; i < j.events.length; i++) {
+    const e = j.events[i];
+    if (e.type !== "user" || isDropped(ranges, i)) continue;
+    if ((e.text || "") === raw && ++seen === ord) return i;
+  }
+  return -1;
+}
+
+// 从这条消息分叉出一条新会话（原会话不动）
+async function forkTo(node) {
+  if (!S.sessionId) return toast("还没有可以分叉的对话", "err");
+  if (S.sending) return toast("等这一轮跑完再分叉", "err");
+  const raw = node.__raw || "";
+  try {
+    const at = await findUserEventIndex(node);
+    if (at < 0) return toast("没在日志里找到这条消息（可能已被压缩）", "err");
+    const r = await api.fork(S.sessionId, at);
+    setInput(raw.split("\n\n【文件 ")[0] || raw);
+    window.dispatchEvent(new CustomEvent("ua:open-session", { detail: { id: r.id } }));
+    toast("已分叉出一条新会话（原会话没动），那句原话已放回输入框", "ok");
   } catch (e) {
     toast(e.message, "err");
   }
 }
 
 function rewindLine(r) {
-  return `<div class="rewind-line">${icon("refresh", "ic ic-sm")}<span>已回退到这里${r.dropped ? `（丢弃 ${r.dropped} 条记录）` : ""} · 只影响对话，文件改动还在</span></div>`;
+  const nf = typeof r.files === "number" ? r.files : (r.files?.reverted || []).length;
+  return `<div class="rewind-line">${icon("refresh", "ic ic-sm")}<span>已回退到这里${r.dropped ? `（丢弃 ${r.dropped} 条记录）` : ""}${nf ? `，回滚了 ${nf} 个文件改动` : " · 只影响对话，文件改动还在"}</span></div>`;
 }
 
 function addStream() {
@@ -828,7 +874,7 @@ export function renderHistory(events) {
       case "plan": renderPlan(ev.items); break;
       case "compact": break;
       case "reasoning": if (showThinking()) addThinkStatic(ev.text, ev.ms); break;
-      case "rewind": colEl().appendChild(el(rewindLine({ dropped: ev.dropped }))); break;
+      case "rewind": colEl().appendChild(el(rewindLine({ dropped: ev.dropped, files: ev.files }))); break;
       case "user": ev.auto ? noteLine(ev.text.split("\n")[0] + "（自动）") : addUser(ev.text, ev.images); break;
       case "check": addCheckCard(ev); break;
       case "assistant_message": { const n = addStream(); finishAi(n, ev.text); break; }
@@ -1042,12 +1088,36 @@ function showConfirm() {
   const why = $("#cfmWhy");
   why.hidden = !ev.reason;
   why.textContent = ev.reason ? "⚠ " + ev.reason : "";
-  // 「本会话不再问这类命令」：按钮上写清放行范围（对标 Codex 的 don't ask again for commands that start with …）
+  $("#cfmNote").closest("label").hidden = false; // 上一单若是提问表单，把备注栏恢复出来
+  // 「不再问这类命令」两档：本会话 / 存盘（对标 Codex 的 don't ask again）
   const always = $("#cfmAlways");
-  always.hidden = !ev.prefix;
+  const alwaysSaved = $("#cfmAlwaysSaved");
+  always.hidden = alwaysSaved.hidden = !ev.prefix;
   if (ev.prefix) {
     always.textContent = "本会话不再问「" + ev.prefix + " …」";
-    always.onclick = () => resolveConfirm(true, true);
+    always.onclick = () => resolveConfirm(true, true, "session");
+    alwaysSaved.textContent = "总是允许（存盘）";
+    alwaysSaved.onclick = () => resolveConfirm(true, true, "always");
+  }
+  // v0.9.9：ask_user 提问表单（多字段/多选/自定义答案）
+  if (ev.name === "ask_user" && Array.isArray(ev.args?.questions)) {
+    $("#cfmNote").closest("label").hidden = true;
+    $("#cfmYes").textContent = "提交";
+    $("#cfmNo").textContent = "跳过（不作答）";
+    $("#cfmBody").innerHTML = renderAskForm(ev.args.questions);
+    $("#cfmRoot").hidden = false;
+    return;
+  }
+  // v0.9.9：工作区 hooks 的信任复核
+  if (ev.name === "hook_review") {
+    $("#cfmYes").textContent = "批准运行";
+    $("#cfmNo").textContent = "不运行";
+    $("#cfmBody").innerHTML =
+      `<p class="field-help">工作区里带的 hooks（${esc((ev.args?.文件 || []).join("、"))}）会在这台电脑上执行命令：</p>` +
+      `<div class="cfm-args">${esc((ev.args?.将执行 || []).join("\n"))}</div>` +
+      `<p class="field-help">批准后本次运行一直有效；hooks.json 内容改了会重新问</p>`;
+    $("#cfmRoot").hidden = false;
+    return;
   }
   // 计划评审（计划模式里交上来的计划）：列步骤，按钮改成「批准执行 / 继续改计划」
   const yesBtn = $("#cfmYes");
@@ -1083,12 +1153,42 @@ function showConfirm() {
   $("#cfmNote").value = ""; // 上一单的附言不许带到下一单
   $("#cfmRoot").hidden = false;
 }
-async function resolveConfirm(approve, remember) {
+async function resolveConfirm(approve, remember, scope) {
   const ev = queue.shift();
   const note = $("#cfmNote").value.trim().slice(0, 300);
+  let opts;
+  if (ev && ev.name === "ask_user") {
+    const answers = [...$("#cfmBody").querySelectorAll(".ask-q")].map((box) => {
+      const picked = [...box.querySelectorAll("input[type=radio]:checked, input[type=checkbox]:checked")].map((i) => i.value);
+      const custom = box.querySelector(".ask-custom").value.trim();
+      if (custom) picked.push(custom);
+      return picked.length > 1 ? picked : picked[0] || "";
+    });
+    opts = { value: { answers } };
+  }
   $("#cfmRoot").hidden = true;
-  if (ev) await api.confirm(ev.confirmId, approve, note, remember && ev.prefix ? ev.prefix : "").catch(() => {});
+  if (ev) {
+    const pre = remember && ev.prefix ? ev.prefix : "";
+    await api.confirm(ev.confirmId, approve, note, pre, { ...(scope ? { scope } : {}), ...(opts || {}) }).catch(() => {});
+  }
   if (queue.length) setTimeout(showConfirm, 260);
+}
+
+// ask_user 的提问表单：一个问题一块（单选/多选 + 自定义答案）
+function renderAskForm(questions) {
+  return questions
+    .map(
+      (q, i) => `
+    <div class="ask-q" data-i="${i}">
+      ${q.header ? `<span class="ask-tag">${esc(q.header)}</span>` : ""}
+      <div class="ask-title">${esc(q.question)}</div>
+      ${(q.options || [])
+        .map((o) => `<label class="ask-opt"><input type="${q.multiple ? "checkbox" : "radio"}" name="ask${i}" value="${esc(o.label)}"><span><b>${esc(o.label)}</b>${o.description ? ` <span class="muted sm">${esc(o.description)}</span>` : ""}</span></label>`)
+        .join("")}
+      <input class="input input-sm ask-custom" placeholder="自己的答案（可留空）" autocomplete="off">
+    </div>`
+    )
+    .join("");
 }
 
 /* ================= 斜杠命令 / @ 提及文件 ================= */

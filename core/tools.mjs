@@ -26,6 +26,15 @@ export class Registry {
   get(name) {
     return this.map.get(name);
   }
+
+  // 动态注册（MCP 等外部工具用）：load() 会清表，外部工具要在 load 之后再注册一遍
+  register(tool) {
+    if (tool?.name && typeof tool.run === "function") this.map.set(tool.name, tool);
+  }
+
+  unregisterPrefix(prefix) {
+    for (const k of [...this.map.keys()]) if (k.startsWith(prefix)) this.map.delete(k);
+  }
 }
 
 export const toolsDirOf = (uaHome) => path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tools");

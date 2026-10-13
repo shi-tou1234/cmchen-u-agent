@@ -15,6 +15,7 @@ const PANELS = [
   { id: "memory", label: "记忆", icon: "brain" },
   { id: "web", label: "联网", icon: "globe" },
   { id: "security", label: "安全", icon: "key" },
+  { id: "mcp", label: "扩展", icon: "bot" },
   { id: "about", label: "关于", icon: "info" },
 ];
 
@@ -157,6 +158,58 @@ function renderInfo(info) {
 function selectPanel(id) {
   $$("#setNav button").forEach((b) => b.classList.toggle("on", b.dataset.panel === id));
   $$("#setContent .panel").forEach((p) => (p.hidden = p.dataset.panel !== id));
+  if (id === "mcp") refreshMcpPanel().catch(() => {});
+  if (id === "security") refreshPermSaved().catch(() => {});
+}
+
+/* ================= 扩展（MCP） ================= */
+async function refreshMcpPanel() {
+  const raw = $("#mcpRaw");
+  const j = await api.mcp();
+  if (raw && document.activeElement !== raw) raw.value = j.raw || '{ "servers": {} }';
+  renderMcpStatus(j.servers || []);
+}
+function renderMcpStatus(servers) {
+  const box = $("#mcpStatus");
+  if (!box) return;
+  if (!servers.length) {
+    box.textContent = "还没有配置服务器";
+    return;
+  }
+  box.innerHTML = servers
+    .map((s) => {
+      const dot = s.running ? "🟢" : "🔴";
+      const detail = s.running ? `${s.tools.length} 个工具：${s.tools.map(esc).join("、") || "（无）"}` : esc(s.error || "未运行");
+      return `${dot} <b>${esc(s.name)}</b>：${detail}${!s.running && s.stderr ? `<br><span class="muted sm">${esc(s.stderr.slice(0, 160))}</span>` : ""}`;
+    })
+    .join("<br>");
+}
+
+/* ================= 已保存的放行规则 ================= */
+async function refreshPermSaved() {
+  const box = $("#permSaved");
+  if (!box) return;
+  try {
+    const j = await api.permSaved();
+    const list = j.commands || [];
+    if (!list.length) {
+      box.textContent = "还没有 —— 在确认弹窗里点「总是允许（存盘）」就会加到这里";
+      return;
+    }
+    box.innerHTML = list
+      .map((p) => `<div class="row-between" style="padding:3px 0"><code style="font-size:12px">${esc(p)} …</code><button class="btn btn-ghost" data-pre="${esc(p)}" style="height:22px;padding:0 8px;font-size:11.5px">删掉</button></div>`)
+      .join("");
+    $$("button[data-pre]", box).forEach(
+      (b) =>
+        (b.onclick = async () => {
+          await api.dropPerm(b.dataset.pre).catch(() => {});
+          refreshPermSaved();
+          toast("已删除该放行规则", "ok");
+        })
+    );
+  } catch {
+    box.textContent = "读取失败";
+  }
 }
 
 /* ================= 通道卡片 ================= */
@@ -871,6 +924,24 @@ export function initSettings() {
     if (notifyGranted()) new Notification("u-agent 的提醒长这样", { body: "跑完、需要你批准或出错时，它就会这样喊你" });
     else toast("浏览器还没允许通知，先把地址栏那侧的权限改成「允许」", "err");
     renderNotifyHelp();
+  };
+
+  // 扩展（MCP）：保存即重连
+  $("#mcpSave").onclick = async () => {
+    const btn = $("#mcpSave");
+    btn.disabled = true;
+    btn.textContent = "连接中…";
+    try {
+      const j = await api.saveMcp($("#mcpRaw").value);
+      renderMcpStatus(j.servers || []);
+      const okCount = (j.servers || []).filter((s) => s.running).length;
+      toast(okCount ? `已连接 ${okCount} 个 MCP 服务器` : "配置已保存，但还没有服务器连上（看下面的状态）", okCount ? "ok" : "err");
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "保存并重连";
+    }
   };
 
   // 安全

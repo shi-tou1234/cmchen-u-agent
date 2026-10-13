@@ -53,7 +53,7 @@ export const api = {
   renameSession: (id, title) => post("/api/session-rename", { id, title }),
   dropSession: (id) => req("/api/session?id=" + encodeURIComponent(id), { method: "DELETE" }),
 
-  confirm: (confirmId, approve, note, rememberPrefix) => post("/api/confirm", { confirmId, approve, note: note || "", rememberPrefix: rememberPrefix || "" }),
+  confirm: (confirmId, approve, note, rememberPrefix, opts) => post("/api/confirm", { confirmId, approve, note: note || "", rememberPrefix: rememberPrefix || "", ...(opts || {}) }),
   abort: (sessionId) => post("/api/abort", { sessionId }),
   compact: (sessionId, provider, instruction) => post("/api/compact", { sessionId, provider, instruction: instruction || "" }),
   modelInfo: (provider) => post("/api/model-info", { provider }),
@@ -65,7 +65,12 @@ export const api = {
   jobLog: (id, tail) => get("/api/jobs-log?id=" + encodeURIComponent(id) + "&tail=" + (tail || 8000)),
   getGoal: (sessionId) => get("/api/goal?sessionId=" + encodeURIComponent(sessionId)),
   expandCommand: (name, args) => post("/api/command-expand", { name, args: args || "" }),
-  rewind: (sessionId, atIndex) => post("/api/rewind", { sessionId, atIndex }),
+  rewind: (sessionId, atIndex, opts) => post("/api/rewind", { sessionId, atIndex, ...(opts || {}) }),
+  fork: (sessionId, atIndex) => post("/api/fork", { sessionId, atIndex }),
+  mcp: () => get("/api/mcp"),
+  saveMcp: (raw) => post("/api/mcp", { raw }),
+  permSaved: () => get("/api/perm-saved"),
+  dropPerm: (prefix) => req("/api/perm-saved?prefix=" + encodeURIComponent(prefix), { method: "DELETE" }),
   testProvider: (provider) => post("/api/test-provider", { provider }),
   listModels: (provider) => post("/api/list-models", { provider }),
 

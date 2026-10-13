@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<meta name="ua-version" content="0.9.8">
+<meta name="ua-version" content="0.9.9">
 <title>u-agent · 随身 AI</title>
 <link rel="stylesheet" href="/css/app.css">
 </head>
@@ -486,6 +486,30 @@
               <button class="btn btn-danger" id="wipeBtn">全部删除</button>
             </div>
           </div>
+          <div class="card">
+            <div class="card-head">
+              <h3>已保存的放行规则</h3>
+              <p>你在确认弹窗里点过「总是允许」的命令前缀。存盘生效：换会话、重启后仍然自动放行</p>
+            </div>
+            <div class="card-body" id="permSaved">读取中…</div>
+          </div>
+        </section>
+
+        <!-- 扩展（MCP） -->
+        <section class="panel" data-panel="mcp" hidden>
+          <div class="card">
+            <div class="card-head">
+              <h3>MCP 扩展服务器</h3>
+              <p>接外部工具（Model Context Protocol）：填一个 JSON，保存即连接。工具会以 mcp__名字__工具 出现在工具表里，默认每次调用都要你确认；信任的服务器可在条目里写 "risk": "medium"</p>
+            </div>
+            <div class="card-body">
+              <textarea class="input" id="mcpRaw" rows="8" spellcheck="false" style="min-height:140px;font-family:var(--mono);font-size:12px" placeholder='{ "servers": { "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "G:\\"] } } }'></textarea>
+              <div class="row-between mt">
+                <span class="field-help" id="mcpStatus">还没有配置</span>
+                <button class="btn btn-warn" id="mcpSave">保存并重连</button>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- 关于 -->
@@ -637,6 +661,7 @@
     </div>
     <footer class="sheet-foot">
       <span class="grow"></span>
+      <button class="btn btn-ghost" id="cfmAlwaysSaved" hidden></button>
       <button class="btn btn-ghost" id="cfmAlways" hidden></button>
       <button class="btn btn-ghost" id="cfmNo">拒绝</button>
       <button class="btn btn-warn" id="cfmYes">批准执行</button>

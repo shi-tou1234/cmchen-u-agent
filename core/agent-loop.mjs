@@ -2,6 +2,7 @@
 import { streamChat } from "./providers.mjs";
 import { gateWith, MODE_LABEL, MODE_PROMPT, commandPrefix, matchesPrefix } from "./modes.mjs";
 import { budgetOf } from "./context.mjs";
+import { loadHookSources, matchHooks, runHookBatch } from "./hooks.mjs";
 import { truncate } from "./util.mjs";
 import path from "node:path";
 
@@ -78,6 +79,12 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
   let steps = 0;
   ctx.loopGuard = ctx.loopGuard || { lastSig: "", count: 0 }; // 防死循环：连续重复同一个调用才计数（跨轮保持，由服务端按会话持有）
 
+  // v0.9.9 用户 hooks：每趟加载一次来源清单；工作区那份要过信任闸（本次运行内批准过就记着）
+  const hookSources = loadHookSources({ workspace: ctx.workspace, uaHome: ctx.uaHome });
+  const hookTrustedNow = new Set();
+  const hookDeniedNow = new Set();
+  const hookAllowed = (s) => s.trusted || !!ctx.hookTrust?.(s) || hookTrustedNow.has(s.file);
+
   try {
     while (steps < maxSteps) {
       steps++;
@@ -129,6 +136,8 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
       // 结果按原顺序回填给模型（tool 消息顺序必须跟 assistant 里的 tool_calls 对齐）。
       const results = new Array(ended.toolCalls.length).fill(null);
       const jobs = [];
+      const preNotes = new Map(); // idx → PreToolUse hook 补充的上下文（执行成功后拼进结果）
+      const postMatchesByIdx = new Map(); // idx → PostToolUse 匹配（结果循环里才用得上）
       for (let idx = 0; idx < ended.toolCalls.length; idx++) {
         const tc = ended.toolCalls[idx];
         const tool = registry.get(tc.name);
@@ -210,6 +219,49 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           continue;
         }
 
+        // ── v0.9.9 PreToolUse hooks：可以把这个调用拦下来（exit 2 / {"decision":"block"}），也可以补上下文 ──
+        const preMatches = matchHooks(hookSources, "PreToolUse", tc.name);
+        const postMatchesForTool = matchHooks(hookSources, "PostToolUse", tc.name);
+        if (preMatches.length || postMatchesForTool.length) {
+          // 信任闸：工作区来的 hooks 没过审就先弹一次确认（U 盘那份视为盘主人的声明，直接生效）
+          const untrustedFiles = [...new Set([...preMatches, ...postMatchesForTool]
+            .filter((m) => !hookAllowed(m.source) && !hookDeniedNow.has(m.source.file))
+            .map((m) => m.source.file))];
+          if (untrustedFiles.length && typeof ctx.confirm === "function") {
+            const lines = [...preMatches, ...postMatchesForTool]
+              .filter((m) => untrustedFiles.includes(m.source.file))
+              .map((m) => `${m.source.kind}·${m.hook.command} ${m.hook.args.join(" ")}`)
+              .slice(0, 6);
+            const reason = "工作区自带的 hooks 会在你电脑上执行命令，先确认一次（按内容哈希记着；改了就再问）";
+            const { id: hid, done: hdone } = ctx.confirm({ tool: "hook_review", args: { 文件: untrustedFiles, 将执行: lines }, risk: "high", reason });
+            yield { type: "confirm_request", confirmId: hid, id: tc.id, name: "hook_review", args: { 文件: untrustedFiles, 将执行: lines }, risk: "high", reason };
+            const hv = await hdone;
+            const hok = hv && typeof hv === "object" ? !!hv.ok : !!hv;
+            if (hok) {
+              for (const f of untrustedFiles) hookTrustedNow.add(f);
+              for (const m of [...preMatches, ...postMatchesForTool]) if (untrustedFiles.includes(m.source.file)) ctx.hookApprove?.(m.source);
+            } else {
+              for (const f of untrustedFiles) hookDeniedNow.add(f);
+            }
+          }
+          if (preMatches.length) {
+            const events = [];
+            const batch = await runHookBatch(
+              preMatches,
+              { hook_event_name: "PreToolUse", session_id: ctx.sessionId || "", cwd: ctx.workspace, tool_name: tc.name, tool_input: tc.args || {} },
+              { cwd: ctx.workspace, shouldRun: hookAllowed, onEvent: (e) => events.push(e) }
+            );
+            for (const e of events) yield e;
+            if (batch.blocked) {
+              results[idx] = `被项目 hook 拦下：${batch.reason}`;
+              yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: results[idx] };
+              continue;
+            }
+            if (batch.context) preNotes.set(idx, batch.context);
+          }
+          if (postMatchesForTool.length) postMatchesByIdx.set(idx, postMatchesForTool);
+        }
+
         let note = "";
         if (g === "confirm") {
           const why = doom ? `同一个调用（${tc.name}）这一轮已经重复 ${repeat} 次，可能卡在循环里` : "";
@@ -282,6 +334,19 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           // 超长输出：落盘 + 掐头去尾 + 附上「哪里能读全文」（比硬截断友好，模型能自己取回来）
           if (out.ok && typeof ctx.spill === "function") {
             try { text = ctx.spill(text, tc); } catch {}
+          }
+          if (out.ok && preNotes.has(idx)) text += `\n（hook 补充：${preNotes.get(idx)}）`;
+          // ── v0.9.9 PostToolUse hooks：只看不做主（可补上下文；自己出错只上报，不拦工具）──
+          const postMatchesForTool = postMatchesByIdx.get(idx) || [];
+          if (postMatchesForTool.length) {
+            const events = [];
+            const pb = await runHookBatch(
+              postMatchesForTool,
+              { hook_event_name: "PostToolUse", session_id: ctx.sessionId || "", cwd: ctx.workspace, tool_name: tc.name, tool_input: tc.args || {}, tool_result: String(text).slice(0, 20000), ok: out.ok },
+              { cwd: ctx.workspace, shouldRun: hookAllowed, onEvent: (e) => events.push(e) }
+            );
+            for (const e of events) yield e;
+            if (pb.context) text += `\n（hook 补充：${pb.context}）`;
           }
           results[idx] = text;
           yield { type: "tool_result", id: tc.id, name: tc.name, ok: out.ok, text, ms };

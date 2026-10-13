@@ -132,3 +132,27 @@ test("v9.8 get_context_remaining：读主循环注入的实时预算", async () 
   const bare = makeCtx({ workspace: tmpDir(), registry: reg });
   assert.match(await run("get_context_remaining", {}, bare), /无法查询/);
 });
+
+/* ===== v9.9：ask_user ===== */
+test("v9.9 ask_user：作答数组转成给模型的文字；跳过有兜底话术", async () => {
+  const ws = tmpDir();
+  const emitted = [];
+  const ctx = makeCtx({
+    workspace: ws,
+    registry: reg,
+    confirmImpl: () => ({ ok: true, value: { answers: ["build", ["A", "B"]] } }),
+    emit: (e) => emitted.push(e),
+  });
+  const out = await run("ask_user", {
+    questions: [
+      { header: "目录", question: "删哪个？", options: [{ label: "tmp" }, { label: "build" }] },
+      { header: "范围", question: "多选", multiple: true, options: [{ label: "A" }, { label: "B" }] },
+    ],
+  }, ctx);
+  assert.match(out, /目录：build/);
+  assert.match(out, /范围：A、B/);
+  assert.ok(emitted.some((e) => e.type === "confirm_request" && e.name === "ask_user"), "要发确认请求给界面");
+
+  const ctx2 = makeCtx({ workspace: ws, registry: reg, confirmImpl: () => ({ ok: false }) });
+  assert.match(await run("ask_user", { questions: [{ question: "x" }] }, ctx2), /跳过/);
+});

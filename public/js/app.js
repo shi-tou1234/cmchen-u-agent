@@ -292,6 +292,7 @@ function bindGlobal() {
   });
 
   window.addEventListener("ua:sessions-cleared", () => { S.sessionId = null; newChat(); });
+  window.addEventListener("ua:open-session", (e) => { if (e.detail?.id) loadSession(e.detail.id); });
   window.addEventListener("ua:open-settings", (e) => openSettings({ panel: e.detail?.panel }));
   window.addEventListener("ua:autoapprove-change", () => chat.renderAutoApproveBar());
   window.addEventListener("ua:settings-saved", () => chat.refreshWelcomeNote());
