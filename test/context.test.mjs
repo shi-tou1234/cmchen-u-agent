@@ -132,3 +132,46 @@ test("rewind：回退后又聊新的，新内容正常进上下文", async () =>
   assert.ok(!texts.includes("错误回复"));
   assert.ok(texts.includes("换个问法") && texts.includes("新回复"), "回退之后聊的算数");
 });
+
+/* ===== v9.8：压缩保留用户原文 / 中断检测 ===== */
+test("pickRecentUsers：从最新往回保留用户原话，超预算就停", async () => {
+  const { pickRecentUsers } = await import("../core/context.mjs");
+  const um = (tag, n) => ({ role: "user", text: tag + "x".repeat(n) });
+  const msgs = [um("很旧", 1200), { role: "assistant", text: "回复" }, um("中间", 1200), { role: "assistant", text: "好" }, um("最后", 600)];
+  // 预算 600：后两条（约 505 token）装得下，最旧那条装不下
+  const kept = pickRecentUsers(msgs, 600);
+  assert.equal(kept.length, 2);
+  assert.ok(kept[0].text.startsWith("中间") && kept[1].text.startsWith("最后"), "从最新往回、保持原顺序");
+  assert.ok(!kept.some((m) => m.text.startsWith("很旧")), "预算不够的旧话不塞");
+  // 最新一条超预算 → 截断也要留（它就是当前请求）
+  const kept2 = pickRecentUsers([um("超长", 100000)], 500);
+  assert.equal(kept2.length, 1);
+  assert.ok(kept2[0].text.startsWith("超长"));
+  assert.match(kept2[0].text, /压缩时截断/);
+  // 预算很紧 → 只留最新
+  assert.deepEqual(pickRecentUsers(msgs, 260).map((m) => m.text.slice(0, 2)), ["最后"]);
+});
+
+test("buildHistory：compact 带 keepUsers 时，摘要后面跟着用户原文", async () => {
+  const { buildHistory } = await import("../core/context.mjs");
+  const events = [
+    ev("user", { text: "第一轮" }),
+    ev("assistant_message", { text: "回复一" }),
+    ev("compact", { summary: "之前的摘要", keepUsers: [{ text: "用户说过：别动数据库" }], atIndex: 2, keepTail: 0 }),
+    ev("user", { text: "第二轮" }),
+    ev("assistant_message", { text: "回复二" }),
+  ];
+  const msgs = buildHistory(events);
+  assert.equal(msgs[0].role, "system");
+  assert.equal(msgs[1].role, "user");
+  assert.equal(msgs[1].text, "用户说过：别动数据库");
+  assert.ok(JSON.stringify(msgs).includes("第二轮"));
+});
+
+test("wasLastTurnAborted：上一轮以 aborted done 结尾才算中断", async () => {
+  const { wasLastTurnAborted } = await import("../core/context.mjs");
+  assert.equal(wasLastTurnAborted([ev("user", { text: "x" }), ev("done", { text: "已中止。", aborted: true })]), true);
+  assert.equal(wasLastTurnAborted([ev("user", { text: "x" }), ev("done", { text: "完" })]), false);
+  assert.equal(wasLastTurnAborted([ev("user", { text: "x" }), ev("done", { aborted: true }), ev("user", { text: "下一轮" })]), false, "又说过话就不算");
+  assert.equal(wasLastTurnAborted([]), false);
+});

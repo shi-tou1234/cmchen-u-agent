@@ -453,7 +453,8 @@ test("验收P：压缩后旧轮次被摘要替代", async () => {
   const last = UP.requests.at(-1);
   const flat = JSON.stringify(last.messages || last.input || "");
   assert.ok(flat.includes("更早对话的摘要"), "压缩后请求应带摘要标记");
-  assert.ok(!flat.includes("第一件事：查询版本号"), "被压缩的旧轮次不应原样出现");
+  assert.ok(flat.includes("第一件事：查询版本号") && flat.includes("第三件事：算个数"), "v9.8：最近的用户原话原文保留");
+  assert.ok(!(last.messages || last.input || []).some((m) => m.role === "assistant"), "助手回合已被摘要替代（压缩后不再原样出现）");
 });
 
 test("验收Q：覆盖写 confirm_request 带 diff 预览", async () => {
@@ -1418,4 +1419,28 @@ test("v9.7 同一会话并发聊天被拒（409）", async () => {
   const second = await jjson("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Mock", message: { text: "插队一条" }, mode: "confirm" }) });
   assert.equal(second.status, 409, "并发应被拒：" + JSON.stringify(second.json));
   await first; // 等第一轮走完（确认超时自动拒绝）
+});
+
+/* ===== v0.9.8：AGENTS.md 层级发现 ===== */
+test("v9.8 AGENTS.md 层级发现：项目根→工作区逐级拼接、override 优先", async () => {
+  await activateUp();
+  const root = tmpDir();
+  const ws = path.join(root, "proj");
+  fs.mkdirSync(path.join(root, ".git"), { recursive: true }); // 标记项目根
+  fs.mkdirSync(ws, { recursive: true });
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "根约定：提交信息用中文", "utf8");
+  fs.writeFileSync(path.join(ws, "AGENTS.md"), "工作区约定：先跑测试", "utf8");
+  await postSettings({ workspace: ws });
+  const sysOf = (req) => String((req?.messages || []).find((m) => m.role === "system")?.content || "");
+  const lastSys = () => sysOf(UP.requests.filter((r) => sysOf(r).includes("你是 u-agent")).at(-1));
+  await chat({ sessionId: "s-agents-md", provider: "Up", mode: "confirm", message: { text: "打个招呼" } });
+  assert.ok(lastSys().includes("根约定：提交信息用中文"), "要带项目根的 AGENTS.md");
+  assert.ok(lastSys().includes("工作区约定：先跑测试"), "要带工作区的 AGENTS.md");
+  assert.ok(lastSys().indexOf("根约定：提交信息用中文") < lastSys().indexOf("先跑测试"), "拼接顺序：根在前、工作区在后");
+  // 同层出现 override：原文件让位
+  fs.writeFileSync(path.join(root, "AGENTS.override.md"), "覆盖版约定", "utf8");
+  await chat({ sessionId: "s-agents-md", provider: "Up", mode: "confirm", message: { text: "再说一句" } });
+  assert.ok(lastSys().includes("覆盖版约定"), "同层有 override 就优先用");
+  assert.ok(!lastSys().includes("根约定：提交信息用中文"), "override 让原文件让位");
+  await postSettings({ workspace: wsDir }); // 收尾：工作区还原
 });

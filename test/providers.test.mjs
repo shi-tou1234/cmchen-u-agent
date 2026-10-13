@@ -152,7 +152,7 @@ test("Mock：MOCKSCRIPT 剧本按工具步数续播", async () => {
 });
 
 /* ===== v0.8.2：网关适配（OpenCode Zen / Go 这类按模型分协议、要会话头的网关） ===== */
-import { normalizeBase, buildHeaders, endpoint, friendlyUpstreamError } from "../core/providers.mjs";
+import { normalizeBase, buildHeaders, endpoint, friendlyUpstreamError, retryAfterMs, backoffMs } from "../core/providers.mjs";
 
 test("地址纠偏：把整条接口地址粘进来也能用", () => {
   assert.equal(normalizeBase("https://opencode.ai/zen/go/v1/chat/completions"), "https://opencode.ai/zen/go/v1");
@@ -296,4 +296,99 @@ test("Mock：剧本里写 think 会先吐思考过程（离线演示也能看效
   const evs = await collect(streamChat({ protocol: "mock" }, [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], []));
   assert.equal(evs.filter((e) => e.type === "reasoning").map((e) => e.delta).join(""), "我在想…");
   assert.match(evs.filter((e) => e.type === "text").map((e) => e.delta).join(""), /好的/);
+});
+
+/* ===== v9.8：流式重试壳（429/5xx/断流 → 退避重连 + reconnecting 事件） ===== */
+test("v9.8 Retry-After 解析：秒数与 HTTP 日期都认", () => {
+  const res = (v) => ({ headers: { get: () => v } });
+  assert.equal(retryAfterMs(res("7")), 7000);
+  assert.equal(retryAfterMs(res(null)), 0);
+  assert.equal(retryAfterMs(res("garbage")), 0);
+  const ms = retryAfterMs(res(new Date(Date.now() + 5000).toUTCString()));
+  assert.ok(ms > 3000 && ms <= 6000, "日期格式应换算成剩余毫秒：" + ms);
+  assert.ok(backoffMs(0) >= 700 && backoffMs(0) <= 900, "首次退避约 800ms（含抖动）");
+});
+
+test("v9.8 重试壳：429 先失败后成功——发过 reconnecting 且最终拿到内容", async () => {
+  let n = 0;
+  const up = await mockUpstream((req, res) => {
+    n++;
+    if (n === 1) {
+      res.writeHead(429, { "retry-after": "0", "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "slow down" }));
+      return;
+    }
+    sse(res, [{ choices: [{ delta: { content: "恢复啦" } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  });
+  const provider = { protocol: "openai-chat", baseURL: up.url, model: "m", secret: "k" };
+  const evs = await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+  assert.equal(up.requests.length, 2, "第一次 429 应触发一次重试");
+  assert.ok(evs.some((e) => e.type === "reconnecting" && e.attempt === 1), "重试前要给界面发 reconnecting");
+  assert.ok(evs.some((e) => e.type === "text" && e.delta === "恢复啦"));
+  assert.equal(evs.at(-1).type, "end");
+  await up.close();
+});
+
+test("v9.8 重试壳：一直 429 时按上限重试后报人话（UA_STREAM_RETRIES 可调）", async () => {
+  const old = process.env.UA_STREAM_RETRIES;
+  process.env.UA_STREAM_RETRIES = "1";
+  try {
+    let n = 0;
+    const up = await mockUpstream((req, res) => {
+      n++;
+      res.writeHead(429, { "retry-after": "0", "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "slow down" }));
+    });
+    const err = await collect(streamChat({ protocol: "openai-chat", baseURL: up.url, model: "m", secret: "k" }, [{ role: "user", text: "hi" }], [])).catch((e) => e);
+    assert.ok(err instanceof Error);
+    assert.match(err.message, /限流/);
+    assert.equal(n, 2, "1 次原始 + 1 次重试");
+    await up.close();
+  } finally {
+    if (old === undefined) delete process.env.UA_STREAM_RETRIES;
+    else process.env.UA_STREAM_RETRIES = old;
+  }
+});
+
+test("v9.8 重试壳：非重试错误（401）不重试、立即报错", async () => {
+  let n = 0;
+  const up = await mockUpstream((req, res) => {
+    n++;
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "bad key" }));
+  });
+  const err = await collect(streamChat({ protocol: "openai-chat", baseURL: up.url, model: "m", secret: "bad" }, [{ role: "user", text: "hi" }], [])).catch((e) => e);
+  assert.ok(err instanceof Error);
+  assert.equal(n, 1, "401 不该重试");
+  await up.close();
+});
+
+test("v9.8 重试壳：没吐内容就断 → 自动重连成功；已吐内容才断 → 不重试直接报中断", async () => {
+  let n = 0;
+  const up1 = await mockUpstream((req, res) => {
+    n++;
+    if (n === 1) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.destroy();
+      return;
+    }
+    sse(res, [{ choices: [{ delta: { content: "第二次好了" } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  });
+  const evs = await collect(streamChat({ protocol: "openai-chat", baseURL: up1.url, model: "m", secret: "k" }, [{ role: "user", text: "hi" }], []));
+  assert.ok(evs.some((e) => e.type === "reconnecting"), "空流断开应触发重连");
+  assert.ok(evs.some((e) => e.type === "text" && e.delta === "第二次好了"));
+  await up1.close();
+
+  let m = 0;
+  const up2 = await mockUpstream((req, res) => {
+    m++;
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "半句" } }] }) + "\n\n");
+    setTimeout(() => res.destroy(), 30);
+  });
+  const err = await collect(streamChat({ protocol: "openai-chat", baseURL: up2.url, model: "m", secret: "k" }, [{ role: "user", text: "hi" }], [])).catch((e) => e);
+  assert.ok(err instanceof Error, "应抛错");
+  assert.match(err.message, /中断/);
+  assert.equal(m, 1, "吐过内容不许整体重试");
+  await up2.close();
 });

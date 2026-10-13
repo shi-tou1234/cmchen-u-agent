@@ -111,6 +111,7 @@ export function loadSkills({ workspace, uaHome }) {
         dir: e.name,
         kind: root.kind,
         description: meta.description || body.replace(/\s+/g, " ").trim().slice(0, 120),
+        whenToUse: meta.when_to_use || meta["when-to-use"] || "", // 触发面：清单里多这一句，模型更容易在对的时候想起来用它
         allowedTools: meta["allowed-tools"] || "",
         body: body.trim(),
         dirPath: path.join(base, e.name),
@@ -190,12 +191,23 @@ export function expandCommand(command, argsText, opts = {}) {
   return injectFiles(text, base || opts.workspace || process.cwd(), opts).trim();
 }
 
-/** 给系统提示用的一行清单（技能的渐进披露：只有名字与说明） */
+/** 给系统提示用的一行清单（技能的渐进披露：只有名字与说明；超预算降级成「名字+路径」） */
+const SKILLS_SECTION_MAX = 4000; // 清单的字符预算：技能多了不许它吃掉窗口
+const SKILL_LINE_MAX = 200; // 单行截断：描述再长也别把清单撑爆
 export function skillsPromptSection(skills) {
   if (!skills?.length) return "";
-  const lines = [
-    "可用技能（用户放在 U 盘/工作区里的做事方法。需要时用 skill 工具加载它的正文，按它说的做）：",
-  ];
-  for (const s of skills) lines.push(`- ${s.name}：${s.description}`);
-  return lines.join("\n");
+  const head = "可用技能（用户放在 U 盘/工作区里的做事方法。需要时用 skill 工具加载它的正文，按它说的做）：";
+  const full = [head];
+  for (const s of skills) {
+    const when = s.whenToUse ? `（何时用：${s.whenToUse}）` : "";
+    const line = `- ${s.name}：${s.description}${when}`;
+    full.push(line.length > SKILL_LINE_MAX ? line.slice(0, SKILL_LINE_MAX) + "…" : line);
+  }
+  let text = full.join("\n");
+  if (text.length <= SKILLS_SECTION_MAX) return text;
+  // 超预算：整段降级为「名字 (file: SKILL.md 路径)」——模型需要时自己去读那份文件
+  const short = [head];
+  for (const s of skills) short.push(`- ${s.name} (file: ${path.join(s.dirPath || "", "SKILL.md")})`);
+  text = short.join("\n");
+  return text.length > SKILLS_SECTION_MAX ? text.slice(0, SKILLS_SECTION_MAX) + "\n…[技能清单过长已截断]" : text;
 }

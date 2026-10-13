@@ -89,8 +89,59 @@ export function buildHistory(events) {
     }
   }
   flushCur();
-  if (compact) msgs.unshift({ role: "system", text: `【更早对话的摘要，供延续上下文】\n${compact.summary}` });
+  if (compact) {
+    msgs.unshift({ role: "system", text: `【更早对话的摘要，供延续上下文】\n${compact.summary}` });
+    // 压缩时特意留住的「最近用户消息原文」紧跟摘要放回：用户的约束/原话比模型摘要可靠
+    const kept = (compact.keepUsers || []).filter((m) => m && m.text);
+    if (kept.length) msgs.splice(1, 0, ...kept.map((m) => ({ role: "user", text: m.text })));
+  }
   return msgs;
+}
+
+// 把一段文本截到不超过 budget 个 token（先按 1 字≈1 token 保守估，再逐步放宽验证）
+export function truncateToTokens(text, budget) {
+  const s = String(text || "");
+  if (budget <= 0 || estTokens(s) <= budget) return budget <= 0 ? "" : s;
+  let n = Math.max(100, budget); // CJK 大约 1 字 1 token
+  for (let i = 0; i < 8 && n < s.length && estTokens(s.slice(0, n)) > budget; i++) n = Math.floor(n * 0.8);
+  return s.slice(0, n);
+}
+
+// 压缩前挑「最近用户消息原文」（对标 Codex 的 compact：保留最近用户消息 ≤ 预算）：
+// 从最新往回整条保留；最新那条超预算就按 token 截断保头；更早的塞不下就不塞，不把预算切成碎片。
+export function pickRecentUsers(messages, budgetTokens = 12000, maxCount = 20) {
+  const out = [];
+  let used = 0;
+  let newest = true;
+  for (let i = (messages?.length || 0) - 1; i >= 0 && out.length < maxCount; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    const text = String(m.text || "");
+    if (!text.trim() && !m.images?.length) continue;
+    const cost = estTokens(text) + (m.images?.length || 0) * 900;
+    const remain = budgetTokens - used;
+    if (remain <= 200) break;
+    if (cost > remain) {
+      if (!newest) break;
+      out.unshift({ text: truncateToTokens(text, Math.max(200, remain - (m.images?.length || 0) * 900)) + "…[原文过长，压缩时截断]" });
+      break;
+    }
+    out.unshift({ text });
+    used += cost;
+    newest = false;
+  }
+  return out;
+}
+
+// 上一轮是不是被「手动停止」打断的：下一轮开头给模型一句说明（对标 Codex 的 turn_aborted），
+// 免得它以为上一轮失败了、把已经执行过的命令又跑一遍
+export function wasLastTurnAborted(events) {
+  for (let i = (events?.length || 0) - 1; i >= 0; i--) {
+    const t = events[i].type;
+    if (t === "done") return events[i].aborted === true;
+    if (t === "user" || t === "error") return false;
+  }
+  return false;
 }
 
 // 预算：按「这个模型真实能吃多少 token」算占比，而不是拿一个写死的字数上限吓唬人。

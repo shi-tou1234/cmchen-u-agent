@@ -82,13 +82,44 @@ export const DEFAULT_AUTO_APPROVE = {
 const SAFE_CMD = /^\s*(dir|ls|type|cat|more|echo|pwd|cd|where|which|find|findstr|grep|head|tail|wc|tree|file|stat|hostname|ver|date|time|ipconfig|tasklist|whoami|env|set)\b|^\s*git\s+(status|log|diff|branch|show|remote|describe)\b|^\s*(node|python|python3|npm|git|go|java|dotnet)\s+(-v|--version|-version)\b/i;
 const RISKY_TOKEN = /(^|\s|>|\||&|;)(rm|del|erase|rmdir|rd|mv|move|copy|cp|xcopy|robocopy|format|shutdown|reg|sc|net|taskkill|curl|wget|Invoke-WebRequest|Start-Process|npm\s+(install|i|uninstall|update)|pip\s+install|git\s+(push|commit|reset|checkout|clean|rebase|merge))\b/i;
 
+// 复合命令拆段：cmd 里 && || ; & | 都能再接一条命令——门禁校验必须逐段看，
+// 否则「批准过 git status」会把 `git status && 干别的` 一起放行。
+// 引号里的分隔符不算；^ 是转义（^& 是字面 &）；拆多了只会更严，不会更松。
+export function commandSegments(cmd) {
+  const s = String(cmd || "");
+  const out = [];
+  let cur = "";
+  let quote = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      cur += c;
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
+    if (c === "^" && i + 1 < s.length) { cur += c + s[i + 1]; i++; continue; }
+    if (c === "&" || c === "|" || c === ";") {
+      if (s[i + 1] === c) i++;
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  out.push(cur);
+  return out.map((x) => x.trim()).filter(Boolean);
+}
+
 export function isSafeCommand(cmd) {
-  const c = String(cmd || "").trim();
-  if (!c) return false;
-  // 输出重定向会写到文件里，不管前面的命令多无害，都不再当成「只读」
-  if (c.includes(">")) return false;
-  if (RISKY_TOKEN.test(c)) return false;
-  return SAFE_CMD.test(c);
+  const segs = commandSegments(cmd);
+  if (!segs.length) return false;
+  // 每一段都得是「明显只读」；输出重定向会写到文件里，不管前面多无害都不算
+  return segs.every((seg) => {
+    if (seg.includes(">")) return false;
+    if (RISKY_TOKEN.test(seg)) return false;
+    return SAFE_CMD.test(seg);
+  });
 }
 
 // 「本会话不再问这类命令」用的前缀：取到第一个带 - 或 = 的 token 之前，最多两段
@@ -104,16 +135,16 @@ export function commandPrefix(cmd) {
   return keep.join(" ") || String(cmd || "").trim().slice(0, 40);
 }
 
-// 某条命令是否落在用户「本会话已放行」的前缀里（前缀后必须是空白或结尾，别让 git status 匹配到 git statuser）
+// 某条命令是否落在用户「本会话已放行」的前缀里（逐段校验：复合命令每一段都得在范围内）
 export function matchesPrefix(cmd, prefixes) {
-  const c = String(cmd || "").trim().toLowerCase();
-  if (!c) return false;
-  for (const p of prefixes || []) {
-    const pre = String(p || "").trim().toLowerCase();
-    if (!pre) continue;
-    if (c === pre || c.startsWith(pre + " ")) return true;
-  }
-  return false;
+  const segs = commandSegments(cmd);
+  if (!segs.length) return false;
+  const list = (prefixes || []).map((p) => String(p || "").trim().toLowerCase()).filter(Boolean);
+  if (!list.length) return false;
+  return segs.every((seg) => {
+    const c = seg.toLowerCase();
+    return list.some((pre) => c === pre || c.startsWith(pre + " "));
+  });
 }
 
 /**

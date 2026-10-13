@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Registry } from "./core/tools.mjs";
 import { runAgent } from "./core/agent-loop.mjs";
 import { streamChat, normalizeBase, buildHeaders, describeFetchError } from "./core/providers.mjs";
-import { buildHistory, budgetOf, compactPrompt, rewindRanges, isDropped } from "./core/context.mjs";
+import { buildHistory, budgetOf, compactPrompt, rewindRanges, isDropped, pickRecentUsers, wasLastTurnAborted } from "./core/context.mjs";
 import { Sessions } from "./core/sessions.mjs";
 import { ConfirmGate } from "./core/confirm.mjs";
 import { Checkpoints, SNAP_PATHS } from "./core/checkpoints.mjs";
@@ -27,7 +27,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.9.7";
+const VERSION = "0.9.8";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -211,7 +211,7 @@ const readMemory = () => {
 const loadTitles = () => readJson(TITLES, {});
 const saveTitles = (t) => writeJson(TITLES, t);
 
-let agentsCache = { mtime: 0, text: "" };
+let agentsCache = { key: "", text: "" };
 // 工作区文件索引（供 @ 提及）：广度受限地走一遍目录树，只返回相对路径。
 // 命中规则：不区分大小写的子串匹配；命中的路径前缀越靠后越靠前排序（贴近用户在打的字）。
 const IDX_SKIP = /^(node_modules|\.git|\.svn|\.hg|dist|build|out|target|coverage|__pycache__|\.venv|venv|\.next|\.nuxt|\.cache|\.idea|\.vscode|vendor|Pods)$/i;
@@ -248,12 +248,68 @@ function listWorkspaceFiles(root, q, limit) {
   return hit.slice(0, limit).map((p) => ({ path: p, name: p.slice(p.lastIndexOf("/") + 1) }));
 }
 
+// AGENTS.md 层级发现（对标 Codex）：向上找项目根（.git 所在层），根到工作区逐级收集；
+// 同一层写了 AGENTS.override.md 就用它；总预算 8192 字符，超了优先保「更贴近工作区」的那份。
+// 没找到项目根的普通目录（U 盘常见）回退成「工作区 + 上一层」。
+function agentsChain(workspace) {
+  const chain = [];
+  let dir = path.resolve(workspace);
+  for (let i = 0; i < 8; i++) {
+    chain.unshift(dir);
+    if (fs.existsSync(path.join(dir, ".git"))) return chain; // 到项目根了
+    const parent = path.dirname(dir);
+    if (parent === dir) return chain; // 到盘根了
+    dir = parent;
+  }
+  return chain;
+}
 function agentsMdOf(workspace) {
   try {
-    const p = path.join(workspace, "AGENTS.md");
-    const st = fs.statSync(p);
-    if (st.mtimeMs !== agentsCache.mtime) agentsCache = { mtime: st.mtimeMs, text: fs.readFileSync(p, "utf8").slice(0, 8192) };
-    return agentsCache.text;
+    const ws = path.resolve(workspace);
+    let chain = agentsChain(ws);
+    if (!fs.existsSync(path.join(chain[0], ".git"))) chain = chain.slice(-2); // 没找到项目根：只认工作区与上一层
+    const parts = [];
+    for (const dir of chain) {
+      for (const name of ["AGENTS.override.md", "AGENTS.md"]) {
+        const p = path.join(dir, name);
+        try {
+          const st = fs.statSync(p);
+          if (st.isFile()) {
+            parts.push({ dir, p, mtimeMs: st.mtimeMs });
+            break;
+          }
+        } catch {}
+      }
+    }
+    if (!parts.length) return "";
+    const key = parts.map((x) => x.p + ":" + x.mtimeMs).join("|");
+    if (key === agentsCache.key) return agentsCache.text;
+    const BUDGET = 8192;
+    const segs = parts.map((x) => ({ dir: x.dir, body: fs.readFileSync(x.p, "utf8") }));
+    const head = (x) => (segs.length > 1 ? `# AGENTS.md（${x.dir === ws ? "工作区" : x.dir}）\n` : "");
+    let text;
+    const total = segs.reduce((n, x) => n + x.body.length + 64, 0);
+    if (total <= BUDGET) {
+      text = segs.map((x) => head(x) + x.body).join("\n\n");
+    } else {
+      const kept = [];
+      let used = 0;
+      for (let i = segs.length - 1; i >= 0; i--) {
+        const seg = segs[i];
+        const remain = BUDGET - used;
+        if (remain < 200) break;
+        if (seg.body.length <= remain) {
+          kept.unshift(seg);
+          used += seg.body.length + 64;
+        } else {
+          kept.unshift({ ...seg, body: seg.body.slice(0, remain) + "\n…[AGENTS.md 超出预算，已截断]" });
+          break;
+        }
+      }
+      text = kept.map((x) => head(x) + x.body).join("\n\n");
+    }
+    agentsCache = { key, text };
+    return text;
   } catch {
     return "";
   }
@@ -375,21 +431,80 @@ async function judgeGoal(provider, st, goal, lastReply, changedRels) {
   return { met, reason };
 }
 
-// 把「旧轮次摘要成一条 compact 事件」抽出来：手动 /api/compact 与自动压缩共用同一套
-async function compactSession(sessionId, provider, { keepTailMax = 6, instruction = "", auto = false } = {}) {
+// 「保留最近用户消息原文」的 token 预算上限（对标 Codex 留用户原话的做法）。
+// 实际取 min(上限, 该模型预算的 10%) 且不低于 2000——小窗口模型别把压完的上下文又塞回阈值以上
+const KEEP_USER_TOKENS = 12000;
+
+// 保留预算按「主模型」算（不是压缩用的轻量通道——轻量通道认不出模型时会退回默认大预算，把上限带偏）
+function keepUserBudgetOf(limits) {
+  return Math.max(2000, Math.min(KEEP_USER_TOKENS, Math.round((Number(limits?.limitTokens) || 150000) * 0.1)));
+}
+
+// 「上下文超限」的兜底识别：各家措辞不同，尽量都认（压缩重试与溢出兜底都用它）
+function isContextOverflowError(msg) {
+  return /(maximum context|context length|context window|too many tokens|token limit|exceed.{0,30}(context|token)|prompt is too long|input is too long|too long.{0,20}(prompt|input|context))/i.test(String(msg || ""));
+}
+
+// 压缩后重建的上下文里，把「本轮用户消息」贴回最后一条 user：
+// 带时间前缀与实际图片（keepUsers 只存文字，图片不进会话日志省空间）
+function patchCurrentUser(messages, outgoingText, images) {
+  const last = [...messages].reverse().find((m) => m.role === "user");
+  if (last) {
+    last.text = outgoingText;
+    if (images.length) last.images = images;
+    return messages;
+  }
+  return [...messages, { role: "user", text: outgoingText, ...(images.length ? { images } : {}) }];
+}
+
+// 包一层主循环：agent 报「上下文超限」时，先压缩一遍再重试这一趟（只一次）；
+// 其它错误原样往上抛（对标 ZCode 的 ProviderOverflow 兜底，救掉一次本会失败的请求）
+async function* agentRunWithOverflowRetry({ provider, messages, registry, ctx, onOverflow }) {
+  let msgs = messages;
+  for (;;) {
+    try {
+      yield* runAgent({ provider, messages: msgs, registry, ctx });
+      return;
+    } catch (e) {
+      const next = isContextOverflowError(e.message) && onOverflow ? await onOverflow() : null;
+      if (!next) throw e;
+      msgs = next;
+    }
+  }
+}
+
+// 把「旧轮次摘要成一条 compact 事件」抽出来：手动 /api/compact 与自动压缩共用同一套。
+// v0.9.8 起：压缩完把「最近用户消息原文」一起留住（用户的约束/原话比摘要可靠）；
+// 压缩请求本身撞上超限就丢最旧一段再试（对标 Codex 的 remove_first_item 重试）
+async function compactSession(sessionId, provider, { keepTailMax = 6, instruction = "", auto = false, keepBudgetTokens = 0 } = {}) {
   const events = sessions.read(sessionId);
   const msgs = buildHistory(events);
   const keepTail = Math.max(0, Math.min(keepTailMax, msgs.length - 2));
-  if (msgs.length < 4 || msgs.length - keepTail < 2) throw new Error("对话还太短，无需压缩");
+  // 条数下限只拦真正的小会话；压缩过的历史可能很短但很大（摘要+一条超长用户消息），交给 token 阈值判定
+  if (msgs.length < 3 || msgs.length - keepTail < 2) throw new Error("对话还太短，无需压缩");
   const before = budgetOf(msgs);
+  const keepBudget = keepBudgetTokens > 0 ? keepBudgetTokens : keepUserBudgetOf(limitsOf(provider));
+  const keepUsers = pickRecentUsers(msgs, keepBudget);
+  const runSummary = async (dropMore) => {
+    let out = "";
+    for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail + dropMore, instruction) }], [], AbortSignal.timeout(90000))) {
+      if (ev.type === "text") out += ev.delta;
+      else if (ev.type === "error") throw new Error(ev.message);
+    }
+    return out.trim();
+  };
   let summary = "";
-  for await (const ev of streamChat(provider, [{ role: "user", text: compactPrompt(msgs, keepTail, instruction) }], [], AbortSignal.timeout(90000))) {
-    if (ev.type === "text") summary += ev.delta;
-    else if (ev.type === "error") throw new Error(ev.message);
+  for (let drop = 0; ; drop += 2) {
+    try {
+      summary = await runSummary(drop);
+      break;
+    } catch (e) {
+      if (drop < 12 && isContextOverflowError(e.message)) continue; // 丢最旧的两条再试
+      throw e;
+    }
   }
-  summary = summary.trim();
   if (!summary) throw new Error("模型没有返回摘要");
-  sessions.append(sessionId, { type: "compact", summary, atIndex: events.length, keepTail, ...(auto ? { auto: true } : {}) });
+  sessions.append(sessionId, { type: "compact", summary, keepUsers, atIndex: events.length, keepTail, ...(auto ? { auto: true } : {}) });
   return { summary, before, keepTail };
 }
 
@@ -399,13 +514,13 @@ async function autoCompactIfNeeded(sessionId, provider, st, limits) {
   if (!(threshold > 0)) return null; // 0 = 关
   const events = sessions.read(sessionId);
   const msgs = buildHistory(events);
-  if (msgs.length < 6) return null; // 太短没必要压
+  if (msgs.length < 3) return null; // 太短肯定没必要压；够长了就交给下面的阈值判定
   const b = budgetOf(msgs, limits);
   if (b.tokens < b.limitTokens * threshold) return null;
   const p = pickAssist(st, provider);
   if (!p) return null; // 没有可用模型（离线演示）就不硬压，留给手动
   try {
-    const r = await compactSession(sessionId, { ...p, baseURL: normalizeBase(p.baseURL), sessionId, userAgent: `u-agent/${VERSION}` }, { auto: true });
+    const r = await compactSession(sessionId, { ...p, baseURL: normalizeBase(p.baseURL), sessionId, userAgent: `u-agent/${VERSION}` }, { auto: true, keepBudgetTokens: keepUserBudgetOf(limits) });
     return { summary: r.summary, before: r.before, after: budgetOf(buildHistory(sessions.read(sessionId)), limits) };
   } catch {
     return null; // 自动压缩失败就当没发生，绝不能挡住这一轮
@@ -489,7 +604,14 @@ async function handleChat(req, res, body) {
   let pastEvents = sessions.read(sessionId);
   let history = buildHistory(pastEvents);
   const turnSeq = pastEvents.filter((e) => e.type === "user").length + 1; // 第几轮：写进快照清单，回滚时看得懂
-  let messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
+  // 发给模型的用户消息多带两样「现场信息」（只进请求、不进会话日志，界面回放看不到）：
+  // 当前时间（长会话跨天防日期错觉）与「上一轮被手动停止」的提醒（防它重跑已执行过的命令）
+  const meta = [`【当前时间 ${new Date().toLocaleString("zh-CN", { hour12: false })}】`];
+  if (wasLastTurnAborted(pastEvents)) {
+    meta.push("（注意：上一轮是用户主动点了停止。被中断的命令/工具可能已部分执行——先检查现状，别把已完成的事再做一遍；后台可能还有进程。）");
+  }
+  const outgoingText = meta.join("\n") + "\n\n" + text;
+  let messages = [...history, { role: "user", text: outgoingText, ...(images.length ? { images } : {}) }];
   const limits = limitsOf(provider); // 这个模型真实能吃多少：按窗口算，不再用写死的字数
   let budget = budgetOf(messages, limits);
   const context = contextInfoOf(provider);
@@ -512,7 +634,7 @@ async function handleChat(req, res, body) {
       sse(res, { type: "compact", auto: true, before: auto.before, after: auto.after, summary: auto.summary });
       pastEvents = sessions.read(sessionId);
       history = buildHistory(pastEvents);
-      messages = [...history, { role: "user", text, ...(images.length ? { images } : {}) }];
+      messages = patchCurrentUser([...history], outgoingText, images); // 本轮消息贴在历史最后那条 user 上（摘要与留存的用户原文已在历史里）
       budget = budgetOf(messages, limits);
     }
   } catch {}
@@ -533,6 +655,7 @@ async function handleChat(req, res, body) {
     skillsText: skillsPromptSection(loadSkills({ workspace: st.workspace, uaHome: UA_HOME })), // 技能清单：只有名字与说明
     checks: st.checks, // test / lint 命令（run_checks 工具与轮末自动检查共用）
     goal: lastGoal(sessionId), // 本次任务的完成标准（/goal 设的）
+    limits, // 当前模型的可用 token 预算（get_context_remaining 工具用它算余量）
     jobLogDir: path.join(DATA, "jobs"), // 后台任务的输出落这里
 
     sessionId,
@@ -570,11 +693,28 @@ async function handleChat(req, res, body) {
   let runMessages = messages;
   let fixRounds = 0;
   let judgeRounds = 0; // 完成标准催了几次
+  let overflowRetried = false; // 「上下文超限 → 压一遍再试」只做一次
+  // 超限兜底：压缩一遍、把本轮消息贴回去（对标 ZCode 的 ProviderOverflow 兜底）
+  const onOverflow = async () => {
+    if (overflowRetried) return null;
+    overflowRetried = true;
+    try {
+      const p = pickAssist(st, provider);
+      if (p) {
+        const r = await compactSession(sessionId, { ...p, baseURL: normalizeBase(p.baseURL), sessionId, userAgent: `u-agent/${VERSION}` }, { auto: true, keepBudgetTokens: keepUserBudgetOf(limits) });
+        sse(res, { type: "compact", auto: true, before: r.before, keepTail: r.keepTail, summary: r.summary });
+      }
+      runMessages = patchCurrentUser(buildHistory(sessions.read(sessionId)), outgoingText, images);
+      return runMessages;
+    } catch {
+      return null;
+    }
+  };
   try {
     // 一轮对话可能跑多趟：模型跑完 → 自动检查 → 没过就把输出交给它接着修（最多 CHECKS_MAX_FIX 轮）
     for (;;) {
       let changedThisPass = false;
-      for await (const ev of runAgent({ provider, messages: runMessages, registry, ctx })) {
+      for await (const ev of agentRunWithOverflowRetry({ provider, messages: runMessages, registry, ctx, onOverflow })) {
         if (ev.type === "usage") {
           usageTotal.input += ev.input || 0;
           usageTotal.output += ev.output || 0;
@@ -1124,7 +1264,7 @@ const server = http.createServer(async (req, res) => {
       const provider = { ...picked, baseURL: normalizeBase(picked.baseURL), sessionId: sid, userAgent: `u-agent/${VERSION}` };
       const limits = limitsOf(provider);
       try {
-        const r = await compactSession(sid, provider, { keepTailMax: 6, instruction: b.instruction });
+        const r = await compactSession(sid, provider, { keepTailMax: 6, instruction: b.instruction, keepBudgetTokens: keepUserBudgetOf(limits) });
         const after = budgetOf(buildHistory(sessions.read(sid)), limits);
         return sendJson(res, 200, { ok: true, summary: r.summary, before: r.before, after });
       } catch (e) {

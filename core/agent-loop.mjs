@@ -1,6 +1,7 @@
 // agent 主循环：prompt → 模型流 → tool_calls → 模式门禁/确认 → 执行 → 回填 → 循环
 import { streamChat } from "./providers.mjs";
 import { gateWith, MODE_LABEL, MODE_PROMPT, commandPrefix, matchesPrefix } from "./modes.mjs";
+import { budgetOf } from "./context.mjs";
 import { truncate } from "./util.mjs";
 import path from "node:path";
 
@@ -98,6 +99,8 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           yield { type: "reasoning_delta", delta: ev.delta };
         } else if (ev.type === "usage") {
           yield ev; // 透传用量给界面/服务端累计
+        } else if (ev.type === "reconnecting") {
+          yield ev; // 模型流断了、正在自动重连：透传给界面，让人知道不是卡死
         } else if (ev.type === "error") {
           throw new Error(ev.message);
         } else if (ev.type === "end") {
@@ -116,6 +119,9 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
       }
 
       history.push({ role: "assistant", text: roundText, toolCalls: ended.toolCalls, ...(thinkForHistory ? { thinking: thinkForHistory } : {}) });
+
+      // 给 get_context_remaining 用的实时预算（含刚回填的这一步）
+      ctx.budgetNow = () => budgetOf([{ role: "system", text: systemPrompt(ctx) }, ...history], ctx.limits);
 
       // ── 一轮里的多个工具调用 ──
       // 门禁判定、弹窗、检查点按顺序做（要排队、要追加写清单，必须串行）；
