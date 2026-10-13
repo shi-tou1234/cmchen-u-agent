@@ -80,3 +80,19 @@ test("MCP：起不来的服务器不炸，状态里说清楚", async () => {
   assert.equal(hub.tools().length, 0);
   hub.stop();
 });
+
+test("v9.12 MCP：.cmd shim（npx 这类）经 cmd.exe 包一层能起来、能调用", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows 专测");
+  const dir = tmpDir();
+  const script = fakeServerIn(dir);
+  const shim = path.join(dir, "fake-mcp.cmd");
+  fs.writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${script}"\r\n`, "utf8");
+  const hub = new McpHub({});
+  const status = await hub.apply({ servers: { shim: { command: shim } } });
+  assert.equal(status[0].running, true, "shim 要能起来（原先 EINVAL 开箱即坏）：" + JSON.stringify(status));
+  const tools = hub.tools();
+  const echo = tools.find((x) => x.name === "mcp__shim__echo");
+  assert.ok(echo, JSON.stringify(tools.map((x) => x.name)));
+  assert.match(String(await echo.run({ text: "shim 通" })), /echo: shim 通/);
+  hub.stop();
+});

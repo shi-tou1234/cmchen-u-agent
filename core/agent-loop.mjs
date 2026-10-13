@@ -3,6 +3,7 @@ import { streamChat } from "./providers.mjs";
 import { gateWith, MODE_LABEL, MODE_PROMPT, commandPrefix, matchesPrefix } from "./modes.mjs";
 import { budgetOf } from "./context.mjs";
 import { loadHookSources, matchHooks, runHookBatch } from "./hooks.mjs";
+import { assertCommandAllowed } from "./blacklist.mjs";
 import { truncate } from "./util.mjs";
 import path from "node:path";
 
@@ -43,7 +44,7 @@ function buildChange(name, args, ctx, preview) {
   return c;
 }
 
-export function systemPrompt({ workspace, uaHome, mode, platform, memory, agentsMd, state, skillsText, goal }) {
+export function systemPrompt({ workspace, uaHome, mode, platform, memory, agentsMd, state, skillsText, goal, allowAnyPath, extraRoots }) {
   const lines = [
     "你是 u-agent——一个跑在用户 U 盘里的本地 AI 助手，通过工具帮用户操作这台电脑上的文件、执行命令、联网查资料、操作 git。",
     `今天是 ${new Date().toISOString().slice(0, 10)}。运行平台：${platform}。`,
@@ -57,6 +58,8 @@ export function systemPrompt({ workspace, uaHome, mode, platform, memory, agents
     "- 用户消息里的 `@相对路径` 表示他明确指向工作区里的这个文件；动手前先用 fs_read 把它读清楚，不要凭猜测改。",
     `- 回答用用户的语言（默认中文），当前权限模式：${MODE_LABEL[mode] || mode}。`,
   ];
+  if (allowAnyPath) lines.push("当前是完全权限模式：文件读写不限于工作区，任意路径都可操作（危险操作也不再弹窗——动手前自己看清楚，别碰系统盘）。");
+  else if (extraRoots?.length) lines.push("额外放行的目录（与工作区同等对待）：" + extraRoots.join("、"));
   if (MODE_PROMPT[mode]) lines.push(MODE_PROMPT[mode]);
   if (state?.plan?.length) {
     lines.push("当前任务计划：");
@@ -178,6 +181,19 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           continue;
         }
         const risk = typeof tool.risk === "function" ? tool.risk(tc.args, ctx) : tool.risk;
+        // 黑名单先行：命中就当场拒、不进审批弹窗——原先弹窗之后才查，
+        // 用户会为一个注定失败的命令点批准（审查 #9 附带项）
+        if ((tc.name === "shell_run" || tc.name === "shell_bg") && tc.args?.command) {
+          try {
+            assertCommandAllowed(tc.args.command);
+          } catch (e) {
+            ctx.audit?.({ tool: tc.name, risk, decision: "denied", note: "无条件拦截", args: tc.args });
+            yield { type: "tool_call", id: tc.id, name: tc.name, args: tc.args, risk, gate: "deny", auto: false };
+            results[idx] = `${e.message}。这是无条件拦截，请勿重试，直接向用户说明原因。`;
+            yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: results[idx] };
+            continue;
+          }
+        }
         // 细粒度门禁：套餐判定要确认时，再看自动放行开关（含连续放行上限）
         const decided = gateWith(ctx.mode, risk, {
           toolName: tc.name,
@@ -214,6 +230,7 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
 
         if (g === "deny") {
           // 注意：tool.risk 可能是函数（动态风险），得用上面已经算好的 risk 值
+          ctx.audit?.({ tool: tc.name, risk, decision: "denied", args: tc.args });
           results[idx] = `已拒绝（当前为${MODE_LABEL[ctx.mode]}）：工具 ${tc.name} 的风险等级是 ${risk}，此模式不允许。请向用户说明并让其切换权限模式。`;
           yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: results[idx] };
           continue;
@@ -223,7 +240,8 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         const preMatches = matchHooks(hookSources, "PreToolUse", tc.name);
         const postMatchesForTool = matchHooks(hookSources, "PostToolUse", tc.name);
         if (preMatches.length || postMatchesForTool.length) {
-          // 信任闸：工作区来的 hooks 没过审就先弹一次确认（U 盘那份视为盘主人的声明，直接生效）
+          // 信任闸（v9.12 收紧）：任何来源的 hooks（含 U 盘那份）没过审都先弹一次确认——
+          // hooks 文件在盘上、agent 也写得动它，免信任等于给「静默写文件」开持久执行后门
           const untrustedFiles = [...new Set([...preMatches, ...postMatchesForTool]
             .filter((m) => !hookAllowed(m.source) && !hookDeniedNow.has(m.source.file))
             .map((m) => m.source.file))];
@@ -232,7 +250,7 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
               .filter((m) => untrustedFiles.includes(m.source.file))
               .map((m) => `${m.source.kind}·${m.hook.command} ${m.hook.args.join(" ")}`)
               .slice(0, 6);
-            const reason = "工作区自带的 hooks 会在你电脑上执行命令，先确认一次（按内容哈希记着；改了就再问）";
+            const reason = "项目或 U 盘自带的 hooks 会在你电脑上执行命令，先确认一次（按内容哈希记着；改了就再问）";
             const { id: hid, done: hdone } = ctx.confirm({ tool: "hook_review", args: { 文件: untrustedFiles, 将执行: lines }, risk: "high", reason });
             yield { type: "confirm_request", confirmId: hid, id: tc.id, name: "hook_review", args: { 文件: untrustedFiles, 将执行: lines }, risk: "high", reason };
             const hv = await hdone;
@@ -275,6 +293,7 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           if (ok) ctx.autoCount = 0; // 用户亲自确认过，重新计连续自动次数
           if (ok) ctx.loopGuard.count = 0; // 用户点头了，重复计数重来
           yield { type: "confirm_result", confirmId, approved: ok, note };
+          ctx.audit?.({ tool: tc.name, risk, decision: ok ? "approved" : isObj && v.timeout ? "timeout" : "rejected", note, args: tc.args });
           if (!ok) {
             results[idx] = note ? `用户拒绝了该操作，并说：${note}` : doom ? `同一个调用重复 ${repeat} 次、又没得到确认，已跳过。请不要重复同样的调用，换个思路或向用户说明。` : "用户拒绝或超时未确认该操作。";
             yield { type: "tool_result", id: tc.id, name: tc.name, ok: false, denied: true, text: results[idx] };
@@ -286,6 +305,11 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
         let cp = null;
         if (chg && typeof ctx.snapshot === "function") {
           try { cp = await ctx.snapshot({ name: tc.name, args: tc.args || {}, toolCallId: tc.id }); } catch { cp = null; }
+        }
+        // 审计（v9.12）：medium 以上不弹窗的放行记一行；full 模式全记（它不弹窗，事后要说得清）。
+        // 弹过确认的那条已在 above 的 confirm 分支记过「approved/rejected/timeout」，这里不重复。
+        if (g !== "confirm" && (risk !== "low" || ctx.mode === "full")) {
+          ctx.audit?.({ tool: tc.name, risk, decision: why ? "prefix" : decided.auto ? "auto" : "run", note, args: tc.args });
         }
         jobs.push({ idx, tc, tool, chg, cp, note, started: Date.now() });
       }

@@ -3,6 +3,7 @@
 import path from "node:path";
 import { runCommand, fmtOutput } from "./shellutil.mjs";
 import { truncate } from "./util.mjs";
+import { assertCommandAllowed } from "./blacklist.mjs";
 
 export const CHECK_TIMEOUT = Number(process.env.UA_CHECK_TIMEOUT_MS) || 60000;
 export const CHECKS_MAX_FIX = 2; // 每个用户轮次最多自动修复两次，防跑飞
@@ -18,6 +19,12 @@ export async function runChecks(cfg, workspace, only = "") {
   }
   const results = [];
   for (const c of list) {
+    try {
+      assertCommandAllowed(c.command); // 检查命令也经 cmd.exe 跑：黑名单是同一个护栏（审查 #9 实测原先三条路径全绕开）
+    } catch (e) {
+      results.push({ name: c.name, command: c.command, code: -1, ms: 0, timedOut: false, ok: false, output: e.message + "（这条检查命令被无条件拦截，请换掉它）" });
+      continue;
+    }
     const t0 = Date.now();
     const r = await runCommand({
       command: path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe"),

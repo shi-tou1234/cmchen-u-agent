@@ -9,8 +9,9 @@ export default {
   description: "派生一个子 agent 独立完成子任务（子 agent 看不到主对话，task 里要把上下文写全）。返回子 agent 的最终汇报",
   risk: "medium",
 
-  parallel: true, // 只读：可与同批其它只读工具并行（不声明就独占）
-  // 见 core/agent-loop.mjs 的调度：只读同批并发，其余单独成片
+  // 独占（审查 #13）：它驱动的是完整 agent 循环、能写文件跑命令，原先抄了只读工具的 parallel:true，
+  // 违反了「写类必须单独成片」的调度不变式
+  parallel: false,
   params: {
     type: "object",
     properties: {
@@ -29,6 +30,10 @@ export default {
     const subCtx = {
       ...ctx,
       subDepth: ctx.subDepth + 1,
+      // 防死循环计数与连续自动放行次数都换成子任务自己的一份（审查 #17：原先…ctx 按引用共享，
+      // 子任务里的重复调用会污染父会话的 loopGuard，反之亦然）
+      loopGuard: { lastSig: "", count: 0 },
+      autoCount: 0,
       emit: (e) => ctx.emit({ type: "subagent_event", name, sessionId: sid, event: e }),
     };
     for await (const ev of runAgent({

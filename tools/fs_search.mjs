@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { resolveInside } from "../core/sandbox.mjs";
+import { resolveInside, rootsOf } from "../core/sandbox.mjs";
 import { truncate } from "../core/util.mjs";
 
 const SKIP = new Set(["node_modules", ".git", "data", "runtime", "cache"]);
@@ -42,7 +42,7 @@ export default {
   },
   async run(args, ctx) {
     if (!args.query && !args.glob) throw new Error("query 和 glob 至少给一个");
-    const root = resolveInside([ctx.workspace, ctx.uaHome], args.path || ".", ctx.workspace);
+    const root = resolveInside(rootsOf(ctx), args.path || ".", ctx.workspace);
     const nameRe = args.glob ? toMin(args.glob) : null;
     const q = args.query || "";
     const out = [];

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { resolveInside, SandboxDenyError } from "../core/sandbox.mjs";
+import { resolveInside, rootsOf, SandboxDenyError } from "../core/sandbox.mjs";
 
 export default {
   name: "fs_list",
@@ -16,7 +16,7 @@ export default {
     },
   },
   async run(args, ctx) {
-    const p = resolveInside([ctx.workspace, ctx.uaHome], args.path || ".", ctx.workspace);
+    const p = resolveInside(rootsOf(ctx), args.path || ".", ctx.workspace);
     const st = fs.statSync(p);
     if (!st.isDirectory()) throw new Error(`不是目录：${p}`);
     const out = fs.readdirSync(p, { withFileTypes: true }).map((e) => {

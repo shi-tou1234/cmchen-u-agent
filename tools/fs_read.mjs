@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import { resolveInside } from "../core/sandbox.mjs";
-import { truncate } from "../core/util.mjs";
+import { resolveInside, rootsOf } from "../core/sandbox.mjs";
+import { truncate, decodeTextSmart } from "../core/util.mjs";
 
 export default {
   name: "fs_read",
@@ -19,16 +19,18 @@ export default {
     required: ["path"],
   },
   async run(args, ctx) {
-    const p = resolveInside([ctx.workspace, ctx.uaHome], args.path, ctx.workspace);
+    const p = resolveInside(rootsOf(ctx), args.path, ctx.workspace);
     const st = fs.statSync(p);
     if (st.isDirectory()) throw new Error(`是目录不是文件：${p}（用 fs_list）`);
     if (st.size > 2 * 1048576) throw new Error(`文件太大（${st.size}B），超过 2MB 不支持直接读取`);
-    const raw = fs.readFileSync(p, "utf8");
+    // 编码嗅探：UTF-8 解不了就按 GBK 解——硬编码 utf8 会让 GBK 文件显示成一堆乱码（审查 #3）
+    const { text: raw, enc } = decodeTextSmart(fs.readFileSync(p));
     let lines = raw.split("\n");
     const total = lines.length;
     const off = Math.max(1, args.offset || 1);
     const lim = args.limit || 5000;
     lines = lines.slice(off - 1, off - 1 + lim).map((l, i) => String(off + i).padStart(5) + "| " + l);
-    return `${p}（共 ${total} 行${total > lim ? `，显示 ${off}-${Math.min(total, off - 1 + lim)}` : ""}）\n${truncate(lines.join("\n"), 200000)}`;
+    const encNote = enc === "utf-8" ? "" : `，按 ${enc.toUpperCase()} 解码`;
+    return `${p}（共 ${total} 行${total > lim ? `，显示 ${off}-${Math.min(total, off - 1 + lim)}` : ""}${encNote}）\n${truncate(lines.join("\n"), 200000)}`;
   },
 };

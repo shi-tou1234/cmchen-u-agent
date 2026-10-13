@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/icon.png">
 <meta name="color-scheme" content="light dark">
-<meta name="ua-version" content="0.9.9">
+<meta name="ua-version" content="1.0.0">
 <title>u-agent · 随身 AI</title>
 <link rel="stylesheet" href="/css/app.css">
 </head>
@@ -104,7 +105,7 @@
 <div class="app" id="app">
   <aside class="sidebar" id="sidebar">
     <div class="brand">
-      <span class="brand-mark"><svg class="ic"><use href="#i-bolt"/></svg></span>
+      <img class="brand-mark" src="/icon.png" alt="">
       <span class="brand-text"><b>u-agent</b><small>随身 AI</small></span>
     </div>
 
@@ -114,6 +115,17 @@
       <svg class="ic"><use href="#i-search"/></svg>
       <input id="sessSearch" placeholder="搜索会话" autocomplete="off">
     </label>
+
+    <div class="sess-ops" id="sessOps">
+      <button id="sessManage" title="多选：批量删除 / 导出">管理</button>
+      <span class="sess-ops-manage">
+        <b id="sessOpsN">已选 0</b>
+        <button id="sessOpsAll">全选</button>
+        <button id="sessOpsExport">导出</button>
+        <button id="sessOpsDel" class="danger">删除</button>
+        <button id="sessOpsDone">完成</button>
+      </span>
+    </div>
 
     <nav class="sess-scroll" id="sessWrap">
       <div class="sess-list" id="sessList"></div>
@@ -127,7 +139,7 @@
 
   <div class="main">
     <header class="topbar">
-      <button class="icon-btn hide-wide" id="menuBtn" aria-label="会话列表"><svg class="ic"><use href="#i-menu"/></svg></button>
+      <button class="icon-btn" id="menuBtn" aria-label="会话列表（可收起侧栏）"><svg class="ic"><use href="#i-menu"/></svg></button>
       <h2 class="topbar-title" id="topTitle">新会话</h2>
       <span class="run-chip" id="runChip" hidden><span class="dot"></span><span id="runText">运行中</span><button id="runStop" title="停止这一轮">停止</button></span>
       <div class="grow"></div>
@@ -138,6 +150,18 @@
     <main class="stream" id="msgs">
       <div class="stream-inner" id="msgCol"></div>
     </main>
+    <div class="turn-rail" id="turnRail" hidden></div>
+    <div class="find-bar" id="findBar" hidden>
+      <input id="findInput" placeholder="在会话里找…" autocomplete="off">
+      <span id="findCount"></span>
+      <button id="findPrev" title="上一个（Shift+Enter）">↑</button>
+      <button id="findNext" title="下一个（Enter）">↓</button>
+      <button id="findClose" title="关闭（Esc）">✕</button>
+    </div>
+    <div class="sel-menu" id="selMenu" hidden>
+      <button data-act="quote"><svg class="ic ic-sm"><use href="#i-plus"/></svg>引用到输入框</button>
+      <button data-act="ask"><svg class="ic ic-sm"><use href="#i-message"/></svg>追问这句</button>
+    </div>
 
     <button class="jump-btn" id="scrollBtn" hidden>回到最新</button>
 
@@ -146,6 +170,7 @@
         <span class="sb-aa" id="sbAa"></span>
         <span class="sb-goal" id="sbGoal" hidden title=""></span>
         <span class="sb-jobs" id="sbJobs" hidden title="后台任务（点开看输出与停止）"></span>
+        <span class="sb-plan" id="sbPlan" hidden></span>
         <span class="grow"></span>
         <span class="ctx" id="ctxWrap">
           <span class="ctx-bar"><i id="ctxFill"></i></span>
@@ -179,6 +204,7 @@
               <div class="pop-body" id="modeList" role="listbox"></div>
             </div>
           </div>
+          <button class="tool-pill pill-sm" id="planQuick" title="计划模式：先只读调研、出一份计划，你批准后再动手（再点一次退出）"><svg class="ic ic-sm"><use href="#i-book"/></svg>计划</button>
           <button class="ghost-btn" id="attach" title="附加图片或文本文件"><svg class="ic"><use href="#i-clip"/></svg>附件</button>
           <span class="grow"></span>
           <span class="usage-text" id="usage"></span>
@@ -214,7 +240,7 @@
           <div class="card">
             <div class="card-head">
               <h3>工作区</h3>
-              <p>agent 只能读写工作区与 U 盘目录内的文件，超出范围一律拒绝</p>
+              <p>agent 默认只能读写工作区与 U 盘目录；可加下面「额外目录」放行别的文件夹，切到「完全权限」模式则不设边界</p>
             </div>
             <div class="card-body">
               <div class="path-row">
@@ -223,6 +249,20 @@
                 <button class="btn btn-ghost" id="wsBrowse"><svg class="ic"><use href="#i-folder"/></svg>浏览</button>
               </div>
               <p class="field-help" id="wsHint"></p>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h3>额外可访问的目录</h3>
+              <p>除工作区外，再放行几个文件夹（比如共享盘、另一个项目）。读取各模式都行；写入在「谨慎/自动」档照旧要你确认，「只读」档仍然只读</p>
+            </div>
+            <div class="card-body">
+              <div id="extraRoots" class="extra-roots"><span class="field-help">还没有 —— 点右边「添加目录」</span></div>
+              <div class="row-between mt">
+                <span class="field-help">和主工作区同等对待；最多 10 个</span>
+                <button class="btn btn-ghost" id="extraAdd"><svg class="ic"><use href="#i-folder"/></svg>添加目录</button>
+              </div>
             </div>
           </div>
 
@@ -437,7 +477,11 @@
                 <span class="field-label">Brave</span>
                 <input class="input" id="kBrave" type="password" placeholder="已保存则留空，不改" autocomplete="off" spellcheck="false">
               </label>
-              <p class="field-help mt">钥匙加密后存在 U 盘 <code>data\vault.bin</code>，网页里不会回显原文。</p>
+              <label class="field mt">
+                <span class="field-label">网络代理（可选）</span>
+                <input class="input" id="kProxy" placeholder="http://127.0.0.1:7890；留空 = 直连" autocomplete="off" spellcheck="false">
+              </label>
+              <p class="field-help mt">钥匙加密后存在 U 盘 <code>data\vault.bin</code>，网页里不会回显原文。代理作用于联网搜索与抓网页（不含模型通道）。</p>
             </div>
           </div>
         </section>
@@ -516,7 +560,7 @@
         <section class="panel" data-panel="about" hidden>
           <div class="card">
             <div class="card-body about">
-              <div class="about-brand"><svg class="ic"><use href="#i-bolt"/></svg></div>
+              <div class="about-brand"><img src="/icon.png" alt="u-agent"></div>
               <h3>u-agent</h3>
               <p class="muted sm" id="aboutVer">版本读取中…</p>
               <p class="about-desc">零安装、零依赖的便携 agent：插上任意 Windows 电脑，双击就能让它读写文件、跑命令、查资料、管 git。环境、配置、会话全部留在这只 U 盘。</p>
@@ -671,18 +715,27 @@
 
 <div class="boot-warn" id="bootWarn" hidden></div>
 
+<!-- ── Cmd/Ctrl+K 命令台 ───────────────────────────────── -->
+<div class="cmdk-root" id="cmdk" hidden>
+  <div class="backdrop"></div>
+  <div class="cmdk-panel">
+    <input class="cmdk-input" id="cmdkInput" placeholder="输入命令关键词…（↑↓ 选择，Enter 执行，Esc 关闭）" autocomplete="off" spellcheck="false">
+    <div class="cmdk-list" id="cmdkList"></div>
+  </div>
+</div>
+
+<!-- ── 快捷键一览（Ctrl+/） ───────────────────────────── -->
+<div class="cmdk-root" id="keysRoot" hidden>
+  <div class="backdrop"></div>
+  <div class="cmdk-panel">
+    <div class="cmdk-input keys-title">键盘快捷键（Esc 关闭）</div>
+    <div class="cmdk-list" id="keysList"></div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
-<script>
-  // 看门狗（普通脚本，不依赖 ES module）：界面脚本没跑起来就说清怎么办，别让人对着刷新的密码框发懵
-  setTimeout(function () {
-    if (document.documentElement.dataset.uaReady === "1") return;
-    var w = document.getElementById("bootWarn");
-    if (!w) return;
-    w.hidden = false;
-    w.textContent = "⚠ 界面脚本没有加载成功 —— 多半是浏览器缓存了旧脚本。按 Ctrl+F5 强制刷新一次；还不行就关掉那个黑色控制台窗口，重新双击 启动U-Agent.bat。";
-  }, 4000);
-</script>
+<script src="/js/watchdog.js"></script>
 
 <script type="module" src="/js/app.js"></script>
 </body>

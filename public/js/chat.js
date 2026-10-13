@@ -27,42 +27,100 @@ export function renderQueue() {
   const box = $("#queueList");
   if (!box) return;
   box.hidden = !sendQueue.length;
-  box.innerHTML = sendQueue
-    .map((t, i) => `<span class="q-chip" data-i="${i}" title="点一下放回输入框改改"><b>排队 ${i + 1}</b>${esc(t.slice(0, 40))}<button class="x" title="取消这条">✕</button></span>`)
-    .join("");
-  box.querySelectorAll(".q-chip").forEach((chip) => {
-    chip.querySelector(".x").onclick = (e) => {
-      e.stopPropagation();
-      sendQueue.splice(Number(chip.dataset.i), 1);
+  box.innerHTML = sendQueue.length
+    ? `<div class="q-head">排队中 ${sendQueue.length} 条 · 这一轮跑完自动发</div>` +
+      sendQueue
+        .map(
+          (it, i) => `<div class="q-row" data-i="${i}">
+        <span class="q-idx">${i + 1}</span>
+        <span class="q-text" title="点一下放回输入框改改">${esc(String(it.text || "").slice(0, 80))}</span>
+        <span class="q-acts">
+          <button data-a="up" title="上移" ${i === 0 ? "disabled" : ""}>↑</button>
+          <button data-a="down" title="下移" ${i === sendQueue.length - 1 ? "disabled" : ""}>↓</button>
+          <button data-a="send" title="立即：停掉当前这轮，把这条排到最前">立即</button>
+          <button data-a="del" class="x" title="取消这条">✕</button>
+        </span>
+      </div>`
+        )
+        .join("")
+    : "";
+  box.querySelectorAll(".q-row").forEach((row) => {
+    const i = Number(row.dataset.i);
+    row.querySelector(".q-text").onclick = () => {
+      const t = sendQueue.splice(i, 1)[0];
+      renderQueue();
+      setInput((t && t.text) || ""); // 放回输入框，改完再发
+    };
+    row.querySelector('[data-a="up"]').onclick = () => {
+      if (i > 0) [sendQueue[i - 1], sendQueue[i]] = [sendQueue[i], sendQueue[i - 1]];
       renderQueue();
     };
-    chip.onclick = () => {
-      const t = sendQueue.splice(Number(chip.dataset.i), 1)[0];
+    row.querySelector('[data-a="down"]').onclick = () => {
+      if (i < sendQueue.length - 1) [sendQueue[i + 1], sendQueue[i]] = [sendQueue[i], sendQueue[i + 1]];
       renderQueue();
-      setInput(t || ""); // 放回输入框，改完再发
+    };
+    row.querySelector('[data-a="del"]').onclick = () => {
+      sendQueue.splice(i, 1);
+      renderQueue();
+    };
+    row.querySelector('[data-a="send"]').onclick = () => {
+      // 「立即」= 停掉当前这轮，把这条排到队首；abort 后 finally 会照常排水，马上就发出去
+      const t = sendQueue.splice(i, 1)[0];
+      sendQueue.unshift(t);
+      renderQueue();
+      abortRun();
+      toast("已停掉当前这轮，「立即」这条马上发出", "ok");
     };
   });
 }
 
 function atBottom() {
   const s = streamEl();
-  return s.scrollHeight - s.scrollTop - s.clientHeight < 110;
+  // 近底阈值必须小：原先 110px，生成中用户往上拖滚动条、还没拖出 110px 就被判成「还在底部」，
+  // 下一帧又被拽回去——来回拉锯，滚动条看着在抽搐、根本拖不动（领导报障）。
+  // 10px 只容忍亚像素级布局抖动；真要看前面的内容，拖过 10px 就脱离跟随。
+  return s.scrollHeight - s.scrollTop - s.clientHeight < 10;
 }
+// 滚动到底：每帧最多调度一次，且不在这里做布局读取（阅读位置由 scroll 监听维护）
+let scrollRaf = false;
 function scrollEnd(force) {
-  const s = streamEl();
-  if (force || nearBottom) requestAnimationFrame(() => { s.scrollTop = s.scrollHeight; });
-  $("#scrollBtn").hidden = atBottom() || colEl().children.length < 3;
+  if (force) nearBottom = true;
+  if (force || nearBottom) {
+    $("#scrollBtn").hidden = true;
+    if (!scrollRaf) {
+      scrollRaf = true;
+      requestAnimationFrame(() => {
+        scrollRaf = false;
+        if (nearBottom) streamEl().scrollTop = streamEl().scrollHeight;
+      });
+    }
+  } else {
+    $("#scrollBtn").hidden = false;
+  }
+}
+
+// 前端版 token 估算（与 core/context.mjs 的 estTokens 同口径：中日韩 1 字≈1 token，其余 3.6 字≈1）
+const CJK_RE = /[\u2E80-\uD7FF\uF900-\uFAFF\uFF00-\uFFEF]/;
+function estApprox(s) {
+  let cjk = 0;
+  let n = 0;
+  for (const ch of String(s || "")) {
+    n++;
+    if (CJK_RE.test(ch)) cjk++;
+  }
+  return cjk + (n - cjk) / 3.6;
 }
 
 const scale = (chars) => (chars >= 1000 ? (chars / 1000).toFixed(1) + "k 字" : chars + " 字");
 /* ================= 发送 / SSE ================= */
-export async function sendMessage(text) {
+export async function sendMessage(text, opts = {}) {
+  const fromQueue = !!opts.fromQueue; // 排水自动发出：不碰输入框/附件，也不清附件的快照来源（审查 #19）
   if (S.sending) {
     // 正在跑的时候回车 = 排队（对标 MiniMax Code 的 Enter 排队 / Alt+Enter 引导）：
     // 不用干等，也不用打断它——这一轮跑完自动接着发
     const q = String(text ?? "").trim();
     if (q) {
-      sendQueue.push(q);
+      sendQueue.push({ text: q, sid: S.sessionId, texts: [...S.texts], images: [...S.images] }); // 快照入队：排水时不错发会话、不把之后贴的附件带进去
       renderQueue();
       clearComposer();
       toast("已排队，这一轮跑完自动发出（点排队条上的 ✕ 可取消）", "ok");
@@ -117,12 +175,14 @@ export async function sendMessage(text) {
   }
 
   let body = clean;
-  if (S.texts.length) {
+  const srcTexts = opts.texts || S.texts; // 排队消息用入队时的附件快照，别把之后贴的带进来（审查 #19）
+  const srcImages = opts.images || S.images;
+  if (srcTexts.length) {
     const fence = "```";
-    const files = S.texts.map((t) => `【文件 ${t.name}】\n${fence}\n${t.text}\n${fence}`).join("\n\n");
+    const files = srcTexts.map((t) => `【文件 ${t.name}】\n${fence}\n${t.text}\n${fence}`).join("\n\n");
     body = (clean ? clean + "\n\n" : "") + files;
   }
-  const images = S.images.map((i) => ({ mediaType: i.mediaType, data: i.data }));
+  const images = srcImages.map((i) => ({ mediaType: i.mediaType, data: i.data }));
   if (!body && !images.length) return;
 
   const needTitle = !S.title || S.title === "新会话";
@@ -131,8 +191,10 @@ export async function sendMessage(text) {
   S.lastSent = body;
   S.changes = [];
   addUser(body, images);
-  clearAttachments();
-  clearComposer();
+  if (!fromQueue) {
+    clearAttachments();
+    clearComposer(); // 排队消息自动发出时不碰这两样：那是用户正在写的新草稿（审查 #19 会「吃掉刚输入的字」）
+  }
 
   S.sending = true;
   setSendUI();
@@ -143,6 +205,19 @@ export async function sendMessage(text) {
   const think = { node: null, text: "", started: 0, timer: null }; // 整轮复用同一个：思考块只该有一个
   const ctrl = new AbortController();
   window.__abort = ctrl;
+  // 生成统计（首字延迟 / 速度 / 缓存命中），done 时算总账
+  // genMs 只累计「模型真在吐字」的段落：assistant_message 定稿即封段——
+  // 多步轮次里的工具等待不能算进速度，否则 tok/s 会被工具耗时稀释得离谱
+  const stats = {
+    t0: Date.now(),
+    firstAt: 0,
+    chars: 0,
+    estTok: 0,
+    genMs: 0,
+    segStart: 0,
+    startUsage: { input: S.tokens.input || 0, output: S.tokens.output || 0, cached: S.tokens.cached || 0 },
+  };
+  runStats = stats; // 顶栏「运行中」芯片实时显示首字与速度
 
   try {
     const res = await api.chat(
@@ -173,6 +248,7 @@ export async function sendMessage(text) {
           tools,
           subs,
           think,
+          stats,
           getStream: () => streamNode,
           setStream: (n) => (streamNode = n),
           getFull: () => full,
@@ -186,13 +262,30 @@ export async function sendMessage(text) {
   } finally {
     window.__abort = null;
     S.sending = false;
+    runStats = null;
+    if (liveStatsEl) {
+      // done 没走到（网络层直接挂了）：清掉实时行，别留一个永远转的「生成中」
+      clearInterval(liveStatsTimer);
+      liveStatsTimer = null;
+      liveStatsEl.remove();
+      liveStatsEl = null;
+    }
     setSendUI();
     S.onSessionTouched && S.onSessionTouched();
     // 排队里的下一条：这一轮已经结束，接着发出去
     if (sendQueue.length) {
       const next = sendQueue.shift();
       renderQueue();
-      setTimeout(() => sendMessage(next), 250);
+      const sid = S.sessionId;
+      setTimeout(() => {
+        // 这 250ms 里用户可能抢先发了新的一条、或切了会话——放回队头：别抹他刚输入的字、也别发错会话（审查 #19）
+        if (S.sending || S.sessionId !== sid) {
+          sendQueue.unshift(next);
+          renderQueue();
+          return;
+        }
+        sendMessage(next.text, { fromQueue: true, texts: next.texts, images: next.images });
+      }, 250);
     }
     // 会话标题是这轮结束后在后台起的，稍等一下再刷一次侧栏，让它冒出来
     if (needTitle) setTimeout(() => S.onSessionTouched && S.onSessionTouched(), 2600);
@@ -209,6 +302,16 @@ function clearReconnect(c) {
   c.getStream().querySelector(".reconnect-note")?.remove();
 }
 
+// 用量条重绘合并到 250ms 一次：原先每个 SSE 事件（含每个 token）都重跑一遍长模板（审查 #24）
+let usageSoonT = 0;
+function renderUsageSoon() {
+  if (usageSoonT) return;
+  usageSoonT = setTimeout(() => {
+    usageSoonT = 0;
+    renderUsage();
+  }, 250);
+}
+
 function handleEvent(ev, c) {
   switch (ev.type) {
     case "session":
@@ -219,7 +322,7 @@ function handleEvent(ev, c) {
       if (ev.provider) S.provider = ev.provider;
       S.onSessionTouched && S.onSessionTouched();
       break;
-    case "usage": S.tokens = { input: ev.input, output: ev.output }; break;
+    case "usage": S.tokens = { input: ev.input, output: ev.output, cached: ev.cached || 0 }; break;
     case "budget": if (ev.budget) S.budget = ev.budget; if (ev.context) S.context = ev.context; break;
     case "compact": {
       // 自动压缩（服务端在发问之前做的）：说一声并刷新用量条
@@ -245,6 +348,13 @@ function handleEvent(ev, c) {
     case "plan": renderPlan(ev.items); break;
     case "assistant_delta": {
       clearReconnect(c); // 有内容进来了 = 重连成功
+      if (c.stats) {
+        if (!c.stats.firstAt) c.stats.firstAt = Date.now();
+        if (!c.stats.segStart) c.stats.segStart = Date.now(); // 新一段「吐字」开始
+        c.stats.chars += (ev.delta || "").length;
+        c.stats.estTok += estApprox(ev.delta);
+        ensureLiveStats(c.stats); // 实时统计行：边写边滚
+      }
       // 开始出正文了：把这一轮的思考块收起来，并让下一轮可以再开一块（mutate，不能整个替换，否则共享状态断了）
       if (c.think.node) {
         finishThink(c.think.node, c.think.text, Date.now() - c.think.started);
@@ -255,13 +365,23 @@ function handleEvent(ev, c) {
         c.think.timer = null;
       }
       c.setFull(c.getFull() + ev.delta);
-      c.getStream().querySelector(".text").textContent = c.getFull();
+      // 流式渲染用 appendData 追加文本节点（不再整段重写 textContent——长回答里这是最大的重排来源）
+      const span = c.getStream().querySelector(".text");
+      if (!span.firstChild) span.appendChild(document.createTextNode(""));
+      span.firstChild.appendData(ev.delta || "");
       scrollEnd();
       break;
     }
     // 思考过程：流式展开，等正文一来就收成一行「已思考 N 秒」
     case "reasoning_delta": {
       clearReconnect(c);
+      if (c.stats) {
+        if (!c.stats.firstAt) c.stats.firstAt = Date.now(); // 思考也算「首字」（模型开始干活了）
+        if (!c.stats.segStart) c.stats.segStart = Date.now();
+        c.stats.chars += (ev.delta || "").length; // 思考的字也算进「字/秒」兜底口径
+        c.stats.estTok += estApprox(ev.delta);
+        ensureLiveStats(c.stats);
+      }
       if (!showThinking()) break;
       if (!c.think.node) {
         c.think.node = addThink(c.getStream());
@@ -271,7 +391,12 @@ function handleEvent(ev, c) {
         c.think.timer = setInterval(() => tickThink(node), 500);
       }
       c.think.text += ev.delta;
-      c.think.node.querySelector(".th-body").textContent = c.think.text;
+      const tb = c.think.node.querySelector(".th-body");
+      const peek = c.think.node.querySelector(".th-peek");
+      if (peek) peek.textContent = tailOf(c.think.text);
+      const stick = tb.scrollHeight - tb.scrollTop - tb.clientHeight < 40; // 人上滚了就暂停吸底
+      tb.textContent = c.think.text;
+      if (stick) tb.scrollTop = tb.scrollHeight;
       if (c.think.text.length > 40000) c.think.text = c.think.text.slice(-40000);
       scrollEnd();
       break;
@@ -289,8 +414,12 @@ function handleEvent(ev, c) {
     }
     case "assistant_message": {
       clearReconnect(c);
-      if (c.think.node) {
-        finishThink(c.think.node, c.think.text, Date.now() - c.think.started);
+      if (c.stats?.segStart) {
+        // 这一步的正文定稿：封段（之后的等待是工具时间，不算生成）
+        c.stats.genMs += Date.now() - c.stats.segStart;
+        c.stats.segStart = 0;
+      }
+      if (c.think.node) {        finishThink(c.think.node, c.think.text, Date.now() - c.think.started);
         clearInterval(c.think.timer);
         c.think.node = null;
         c.think.text = "";
@@ -303,6 +432,7 @@ function handleEvent(ev, c) {
       const next = addStream();
       c.setStream(next);
       c.setFull("");
+      if (c.stats?.firstAt) ensureLiveStats(c.stats); // 实时统计行跟着新的空槽垫底
       break;
     }
     case "tool_call": clearReconnect(c); c.tools.set(ev.id, addTool(ev)); break;
@@ -313,6 +443,7 @@ function handleEvent(ev, c) {
       if (ev.mode) {
         setMode(ev.mode);
         renderModeBtn(); // 权限胶囊/状态条芯片归它（renderModelBtn 是模型通道那个）
+        $("#planQuick")?.classList.toggle("on", S.mode === "plan");
         setSendUI();
         toast(ev.note || "已切换权限模式", "ok");
       }
@@ -336,13 +467,15 @@ function handleEvent(ev, c) {
       if (empty) node.remove();
       else finishAi(node, ev.text || c.getFull() || "（没有输出）");
       if (S.changes.length) { addChanges(S.changes); S.changes = []; }
+      addRoundStats(c.stats); // 首字 / 速度 / 缓存命中：跑完在最后挂一行小字（改动卡之后）
       if (ev.stopped) toast(ev.text || "已中止", "err");
       // 人要是切走了就喊一声：这一轮跑完了（页面在前台则不打扰）
       ping("这一轮跑完了", String(ev.text || c.getFull() || "").replace(/\s+/g, " ").slice(0, 90));
       break;
     }
   }
-  renderUsage();
+  if (ev.type === "done") renderUsage();
+  else renderUsageSoon();
 }
 
 function handleSub(ev, subs) {
@@ -362,6 +495,7 @@ function handleSub(ev, subs) {
   } else if (e.type === "tool_result") {
     body.appendChild(el(`<div style="color:${e.ok ? "var(--ok)" : "var(--danger)"}">${e.ok ? "✓" : "✕"} ${esc((e.text || "").slice(0, 160))}</div>`));
   } else if (e.type === "assistant_message") {
+    body.querySelector(".streaming")?.remove(); // 收掉流式占位块再渲染 markdown：不然同一段显示两遍（审查 #24）
     body.appendChild(el(`<div>${md(e.text)}</div>`));
   } else if (e.type === "assistant_delta") {
     let t = body.querySelector(".streaming");
@@ -376,12 +510,29 @@ function handleSub(ev, subs) {
 }
 
 /* ================= 消息节点 ================= */
-export function clearStream() { colEl().innerHTML = ""; }
+export function clearStream() {
+  colEl().innerHTML = "";
+  refreshTurnRail();
+  renderPlanChip([]);
+}
+
+/* ---- 空会话首屏（v9.10）：时段问候 + 自适应字号 + 大 Logo 水印（上实下隐；图标暂用内置闪电标，等正式 logo） ---- */
+function greetingNow() {
+  const h = new Date().getHours();
+  if (h < 5) return "夜深了，悠着点";
+  if (h < 9) return "早上好";
+  if (h < 12) return "上午好";
+  if (h < 14) return "中午好";
+  if (h < 18) return "下午好";
+  if (h < 23) return "晚上好";
+  return "夜深了，悠着点";
+}
 
 export function renderWelcome(info) {
   colEl().innerHTML = `<div class="welcome">
+    <div class="welcome-hello">${greetingNow()}</div>
     <div class="welcome-brand">
-      <span class="mark">${icon("bolt")}</span>
+      <img class="mark" src="/icon.png" alt="">
       <div><h1>u-agent</h1><div class="sub">插在这台电脑上的便携 AI · 只听 localhost 的话</div></div>
     </div>
     <p class="muted" style="font-size:13.5px;max-width:640px">它能读写工作区里的文件、跑命令行、查资料、管 git，还能拆出子任务并行处理。所有配置和对话都留在这只 U 盘。</p>
@@ -400,9 +551,59 @@ export function renderWelcome(info) {
   }));
 }
 
+/* ---- 回合导航条（v9.10）：会话左缘一列细条，鼠标扫过成"山峰"，点击直跳那个回合 ---- */
+function refreshTurnRail() {
+  const rail = $("#turnRail");
+  if (!rail) return;
+  const users = [...colEl().querySelectorAll(".msg.msg-user")];
+  if (users.length < 3) {
+    rail.hidden = true;
+    rail.innerHTML = "";
+    return;
+  }
+  rail.hidden = false;
+  rail.style.left = Math.max(4, $("#msgs").getBoundingClientRect().left + 10) + "px";
+  rail.innerHTML = users
+    .map((n) => {
+      const raw = (n.__raw || "").replace(/\s+/g, " ").slice(0, 60);
+      let next = n.nextElementSibling;
+      let reply = "";
+      while (next && !next.classList.contains("msg-user")) {
+        const t = next.querySelector?.(".text")?.textContent || "";
+        if (t.trim()) {
+          reply = t.replace(/\s+/g, " ").slice(0, 80);
+          break;
+        }
+        next = next.nextElementSibling;
+      }
+      return `<span class="rail-tick" title="${esc(raw)}${reply ? " —— " + esc(reply) : ""}"></span>`;
+    })
+    .join("");
+  [...rail.children].forEach((t, i) => {
+    t.onclick = () => users[i]?.scrollIntoView({ block: "start", behavior: "smooth" });
+  });
+  rail.onmousemove = (e) => {
+    [...rail.children].forEach((t) => {
+      const r = t.getBoundingClientRect();
+      const d = Math.abs(e.clientY - (r.top + r.height / 2)) / 24;
+      const s = d < 0.6 ? 2.6 : d < 1.3 ? 1.7 : d < 2.1 ? 1.25 : 1;
+      t.style.transform = `scaleX(${s})`;
+    });
+  };
+  rail.onmouseleave = () => [...rail.children].forEach((t) => (t.style.transform = ""));
+}
+
 function addUser(text, images) {
   if ($(".welcome")) clearStream();
-  const imgs = (images || []).map((i) => `<img class="att-img" src="data:${i.mediaType};base64,${i.data}">`).join("");
+  // mediaType 来自会话日志：日志就在盘上、agent 也写得动它——属性里必须转义（防存储型 XSS），格式不对就兜底
+  const imgs = (images || [])
+    .map((i) => {
+      const mt = /^[\w.+-]+\/[\w.+-]+$/.test(String(i.mediaType || "")) ? i.mediaType : "application/octet-stream";
+      // 会话日志在盘上、agent 写得动：base64 字符集白名单 + 转义，双保险防属性逃逸（审查二轮 #5）
+      const b64 = String(i.data || "").replace(/[^A-Za-z0-9+/=]/g, "");
+      return `<img class="att-img" src="data:${esc(mt)};base64,${esc(b64)}">`;
+    })
+    .join("");
   const node = el(`<div class="msg msg-user"><div class="bubble">${md(text)}${imgs}</div>
     <button class="rw-btn" title="回退到这里：之后的对话不再进上下文；默认连这段的文件改动一起回滚（按住 Alt 只回退对话）">${icon("refresh", "ic ic-sm")}从这儿重来</button>
     <button class="fk-btn" title="从这里分叉出一条新会话：原会话完全不动，这句原话放回输入框">${icon("git", "ic ic-sm")}分叉</button></div>`);
@@ -410,6 +611,7 @@ function addUser(text, images) {
   node.querySelector(".rw-btn").onclick = (e) => rewindTo(node, e.altKey);
   node.querySelector(".fk-btn").onclick = () => forkTo(node);
   colEl().appendChild(node);
+  refreshTurnRail();
   scrollEnd(true);
 }
 
@@ -464,8 +666,12 @@ async function rewindRequest(at, withFiles) {
     return await api.rewind(S.sessionId, at, withFiles ? { withFiles: true } : {});
   } catch (e) {
     if (e.status === 409 && e.data?.needForce) {
-      const n = e.data.conflicts?.length || 0;
-      if (!confirm(`有 ${n} 个文件在这次回退覆盖的范围之后又被改过。仍要强制回退吗？（强制会把它们恢复到更早的样子）`)) throw new Error("已取消");
+      // 回退预览分级（v9.10）：安全会自动恢复；不安全的逐个写清原因，强制才覆盖
+      const unsafe = (e.data.conflicts || []).slice(0, 6).map((c) => `  · ${c.rel}（${c.since}）`).join("\n");
+      const more = (e.data.conflicts || []).length > 6 ? `\n  · … 等共 ${e.data.conflicts.length} 个` : "";
+      const safeN = (e.data.safe || []).length;
+      const ok = confirm(`这次回退涉及的文件：\n\n✅ 安全（会自动恢复）：${safeN} 个\n⚠️ 不安全（之后又被改过）：\n${unsafe}${more}\n\n仍要强制回退吗？（不安全的那几个会恢复到更早的样子）`);
+      if (!ok) throw new Error("已取消");
       return await api.rewind(S.sessionId, at, { withFiles: true, force: true });
     }
     throw e;
@@ -535,6 +741,71 @@ function addError(msg) {
   scrollEnd(true);
 }
 
+// 本轮生成统计（v9.10；速度算法与实时化 v9.11）：先在生成过程中实时滚动「≈tokens · tok/s · 秒数」，定稿换精确值
+let liveStatsEl = null;
+let liveStatsTimer = null;
+function liveStatsCompute(stats) {
+  const genMs = (stats.genMs || 0) + (stats.segStart ? Date.now() - stats.segStart : 0);
+  const genSec = Math.max(0.4, genMs / 1000);
+  const roundOut = Math.max(0, (S.tokens.output || 0) - stats.startUsage.output);
+  const est = roundOut > 0 ? roundOut : stats.estTok;
+  const approx = roundOut > 0 ? "" : "≈";
+  const tps = est / genSec;
+  const parts = ["生成中", `${approx}${Math.round(est)} tok`, `${approx}${tps.toFixed(tps >= 100 ? 0 : 1)} tok/s`, genSec < 10 ? genSec.toFixed(1) + "s" : Math.round(genSec) + "s"];
+  const roundIn = Math.max(0, (S.tokens.input || 0) - stats.startUsage.input);
+  const roundCached = Math.max(0, (S.tokens.cached || 0) - stats.startUsage.cached);
+  if (roundIn > 0 && roundCached > 0) parts.push(`缓存 ${Math.round((roundCached / roundIn) * 100)}%`);
+  return parts.join(" · ");
+}
+function ensureLiveStats(stats) {
+  if (!stats?.firstAt) return;
+  if (!liveStatsEl || !liveStatsEl.isConnected) {
+    liveStatsEl = el(`<div class="gen-stats live"></div>`);
+    clearInterval(liveStatsTimer);
+    liveStatsTimer = setInterval(() => {
+      if (liveStatsEl?.isConnected && runStats?.firstAt) liveStatsEl.textContent = liveStatsCompute(runStats);
+    }, 400);
+  }
+  const tail = colEl().lastElementChild;
+  if (tail && tail !== liveStatsEl) colEl().appendChild(liveStatsEl); // 永远垫底（新气泡/工具组出现时挪回来）
+  liveStatsEl.textContent = liveStatsCompute(stats);
+}
+function addRoundStats(stats) {
+  if (!stats || !stats.firstAt) {
+    if (liveStatsEl) { clearInterval(liveStatsTimer); liveStatsTimer = null; liveStatsEl.remove(); liveStatsEl = null; }
+    return;
+  }
+  const node = [...colEl().querySelectorAll(".msg.assistant")].at(-1);
+  const genMs = (stats.genMs || 0) + (stats.segStart ? Date.now() - stats.segStart : 0);
+  const genSec = Math.max(0.5, genMs / 1000);
+  const ttft = (stats.firstAt - stats.t0) / 1000;
+  const roundOut = Math.max(0, (S.tokens.output || 0) - stats.startUsage.output);
+  const roundIn = Math.max(0, (S.tokens.input || 0) - stats.startUsage.input);
+  const roundCached = Math.max(0, (S.tokens.cached || 0) - stats.startUsage.cached);
+  const tps = roundOut > 0 ? roundOut / genSec : 0;
+  const cps = stats.chars / genSec;
+  const parts = [
+    `首字 ${ttft < 10 ? ttft.toFixed(1) : Math.round(ttft)}s`,
+    `生成 ${genSec < 10 ? genSec.toFixed(1) : Math.round(genSec)}s`,
+  ];
+  parts.push(tps >= 1 ? `${tps.toFixed(tps >= 100 ? 0 : 1)} tok/s` : `约 ${Math.max(1, Math.round(cps))} 字/s`);
+  if (roundIn > 0 && S.tokens.cached) parts.push(`缓存命中 ${Math.round((roundCached / roundIn) * 100)}%`);
+  const strip = liveStatsEl?.isConnected ? liveStatsEl : el(`<div class="gen-stats"></div>`);
+  strip.classList.remove("live");
+  strip.textContent = parts.join(" · ");
+  clearInterval(liveStatsTimer);
+  liveStatsTimer = null;
+  liveStatsEl = null;
+  if (node) {
+    // 垫在「本轮尾部的卡片」（改动总览/检查卡/计划卡）之后、下一条消息之前——
+    // 原意就是「跑完在最后挂一行小字」，别插在改动卡前面（walk 跳过尾部非消息元素）
+    let anchor = node.nextElementSibling;
+    while (anchor && !anchor.classList.contains("msg") && !anchor.classList.contains("err-box")) anchor = anchor.nextElementSibling;
+    node.parentNode.insertBefore(strip, anchor);
+  } else colEl().appendChild(strip);
+  scrollEnd();
+}
+
 /* 欢迎页那句提示：工作区在设置里改完后要跟着变 */
 export function refreshWelcomeNote() {
   const n = $("#welcomeNote");
@@ -554,7 +825,8 @@ export function setShowThinking(on) {
 function addThink(before) {
   const node = el(`<details class="think" open><summary>
       <span class="th-mark">✻</span>
-      <span class="th-head">思考中…</span>
+      <span class="th-head">正在思考…</span>
+      <span class="th-peek"></span>
       ${icon("chevron-down", "ic ic-sm chev")}
     </summary><div class="th-body"></div></details>`);
   // 回复气泡在发送时就建好了，思考块要插在它前面才读得顺
@@ -563,17 +835,23 @@ function addThink(before) {
   scrollEnd();
   return node;
 }
+const tailOf = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(-90);
 function tickThink(node) {
   if (!node?.isConnected) return;
   const started = Number(node.dataset.started || 0);
   const sec = started ? Math.max(1, Math.round((Date.now() - started) / 1000)) : 0;
-  node.querySelector(".th-head").textContent = sec ? `思考中… ${sec} 秒` : "思考中…";
+  node.querySelector(".th-head").textContent = "正在思考…" + (sec > 4 ? ` ${sec} 秒` : "");
+  const peek = node.querySelector(".th-peek");
+  if (peek) peek.textContent = tailOf(node.querySelector(".th-body")?.textContent);
 }
 function finishThink(node, text, ms) {
   if (!node || !node.isConnected) return;
   node.open = false; // 正文来了就收起来，想看再点开
   const sec = ms ? Math.max(1, Math.round(ms / 1000)) : 0;
-  node.querySelector(".th-head").textContent = sec ? `已思考 ${sec} 秒` : "思考过程";
+  // 说法对齐 ZCode：思考 · 持续了 19 秒 / 持续了几秒；收起后摘要行显示思考的最后一段
+  node.querySelector(".th-head").textContent = sec > 4 ? `思考 · 持续了 ${sec} 秒` : sec ? "思考 · 持续了几秒" : "思考";
+  const peek = node.querySelector(".th-peek");
+  if (peek) peek.textContent = tailOf(text);
   const body = node.querySelector(".th-body");
   if (text) body.textContent = text;
   body.classList.add("done");
@@ -604,36 +882,154 @@ export function toggleDetails() {
   toast(anyClosed ? `已展开 ${all.length} 条工具调用` : "已收起全部工具调用", "ok");
 }
 
-/* ---- 工具调用条：单行、连续调用归一组、点开看参数与结果（对标 codex 的 • Ran …） ---- */
-function summaryOf(ev) {
+/* ---- 工具调用条（v0.9.10：对齐 ZCode 的渲染语言——单行暗字 + 动词标签 + 文件名小徽章 + 悬停箭头） ---- */
+// 工具 → 「正在… / 已…」动词（说法照 ZCode 的中文文案：正在读取 / 已编辑 / 已运行命令…）
+const VERBS = {
+  fs_read: ["正在读取", "已读取"],
+  fs_list: ["正在列出", "已列出"],
+  fs_search: ["正在搜索", "已搜索"],
+  fs_write: ["正在写入", "已写入"],
+  fs_edit: ["正在编辑", "已编辑"],
+  fs_move: ["正在移动", "已移动"],
+  fs_mkdir: ["正在新建目录", "已新建目录"],
+  fs_delete: ["正在删除", "已删除"],
+  shell_run: ["正在执行", "已运行命令"],
+  shell_bg: ["正在放后台", "已放后台"],
+  shell_jobs: ["正在查看任务", "已查看任务"],
+  shell_stop: ["正在停止任务", "已停止任务"],
+  git_status: ["正在查看状态", "已查看状态"],
+  git_diff: ["正在看差异", "已看差异"],
+  git_log: ["正在看历史", "已看历史"],
+  git_commit: ["正在提交", "已提交"],
+  git_push: ["正在推送", "已推送"],
+  git_pull: ["正在拉取", "已拉取"],
+  web_search: ["正在搜索", "已搜索"],
+  web_fetch: ["正在抓取网页", "已抓取网页"],
+  update_plan: ["正在列计划", "已列计划"],
+  spawn_subagent: ["正在派子任务", "子任务完成"],
+  skill: ["正在运行技能", "已运行技能"],
+  ask_user: ["正在询问", "已询问"],
+  run_checks: ["正在跑检查", "已跑检查"],
+  get_context_remaining: ["正在查上下文余量", "已查上下文余量"],
+  sys_info: ["正在看系统信息", "已看系统信息"],
+};
+const verbOf = (name, state) => {
+  if (name.startsWith("mcp__")) return state === "run" ? "正在调用" : "已调用";
+  const v = VERBS[name] || ["正在运行", "已完成"];
+  if (state === "run") return v[0];
+  if (state === "refused") return "已拒绝";
+  if (state === "bad") return v[1] + "（出错）";
+  return v[1];
+};
+// 文件类型小色点（不引图片，一个色块就够认）
+const EXT_CLS = { js: "f-js", mjs: "f-js", cjs: "f-js", ts: "f-ts", tsx: "f-ts", html: "f-html", htm: "f-html", css: "f-css", json: "f-json", md: "f-md", py: "f-py", sh: "f-sh", bat: "f-sh", ps1: "f-sh", yml: "f-yml", yaml: "f-yml", mjsx: "f-js" };
+const fileParts = (p) => {
+  const s = String(p || "").replace(/\\/g, "/");
+  const i = s.lastIndexOf("/");
+  return { name: i >= 0 ? s.slice(i + 1) : s, dir: i >= 0 ? s.slice(0, i + 1) : "" };
+};
+function chipOf(p) {
+  const { name, dir } = fileParts(p);
+  if (!name) return "";
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  return `<span class="t-chip"><i class="fdot ${EXT_CLS[ext] || ""}"></i>${esc(name)}</span>${dir ? `<span class="t-dir">${esc(dir)}</span>` : ""}`;
+}
+// 摘要行中间那截「目标」：文件 / 命令 / 查询 / 网页 / 子任务…
+function targetOf(ev) {
   const a = ev.args || {};
-  return String(a.path || a.command || a.query || a.task || a.message || a.url || a.name || "").slice(0, 100);
+  if (a.path) return chipOf(a.path);
+  if (a.src || a.dst) return `${chipOf(a.src || "")}${a.dst ? " → " + chipOf(a.dst) : ""}`;
+  if (a.command) return `<code class="t-cmd">${esc(String(a.command).slice(0, 90))}</code>`;
+  if (a.query) return `<span class="t-q">“${esc(String(a.query).slice(0, 60))}”</span>`;
+  if (a.url) return `<span class="t-url">${esc(String(a.url).slice(0, 70))}</span>`;
+  if (a.task) return `<span class="t-q">${esc(String(a.task).slice(0, 60))}</span>`;
+  if (a.questions?.length) return `<span class="t-q">${a.questions.length} 个问题</span>`;
+  if (a.items?.length) return `<span class="t-q">${a.items.length} 步计划</span>`;
+  const j = JSON.stringify(a || {});
+  return j && j !== "{}" ? `<span class="t-dir">${esc(j.slice(0, 60))}</span>` : "";
+}
+// 只读类工具（用于「查阅 · N 个文件…」分组头，说法照 ZCode 的 explore 桶）
+const RO_TOOLS = new Set(["fs_list", "fs_read", "fs_search", "sys_info", "git_status", "git_diff", "git_log", "web_search", "web_fetch", "get_context_remaining", "skill"]);
+// 工具卡组：连续的工具卡合成一组；组要插在「下一段文本的容器（空气泡）」之前——
+// 服务端每步定稿（assistant_message）后前端会建一个空气泡等下一段文本，
+// 工具卡属于「这一步与下一段文本之间」；插在空气泡前顺序才对（不然卡片会全堆到最底下）
+// 「下一段文本的容器」= 列里最后那个还没写字的 assistant 空气泡。
+// 不能只看 lastElementChild：实时统计行（v9.11 起会一直把自己垫到列尾）与改动卡/检查卡
+// 都可能悬在它后面，那样工具组会被 append 到最末——渲染成「正文在前、工具组在后」的错误
+// 顺序（领导报障的截图就是这：统计行下面吊着一组工具）。从后往前扫，跳过这些尾巴元素。
+function nextSlot() {
+  const list = colEl().querySelectorAll(".msg.assistant");
+  for (let i = list.length - 1; i >= 0; i--) {
+    const n = list[i];
+    const t = n.querySelector(".text");
+    const a = n.querySelector(".msg-acts");
+    if (!(t && t.textContent.trim()) && !(a && a.textContent.trim())) return n;
+  }
+  return null;
+}
+function insertBeforeSlot(node) {
+  const col = colEl();
+  const slot = nextSlot();
+  if (slot) col.insertBefore(node, slot);
+  else if (liveStatsEl?.isConnected) col.insertBefore(node, liveStatsEl); // 没空槽也别垫到统计行后面
+  else col.appendChild(node);
+  scrollEnd();
+  return node;
 }
 function toolGroup() {
-  const last = colEl().lastElementChild;
-  if (last && last.classList.contains("tools")) return last;
-  const box = el('<div class="tools"></div>');
-  colEl().appendChild(box);
+  const col = colEl();
+  const slot = nextSlot();
+  const beforeSlot = slot ? slot.previousElementSibling : col.lastElementChild;
+  if (beforeSlot && beforeSlot.classList.contains("tools")) return beforeSlot;
+  const box = el('<div class="tools"><div class="tools-head" hidden></div></div>');
+  if (slot) col.insertBefore(box, slot);
+  else if (liveStatsEl?.isConnected) col.insertBefore(box, liveStatsEl);
+  else col.appendChild(box);
+  scrollEnd();
   return box;
 }
+function updateToolsHead(box) {
+  const head = box.querySelector(".tools-head");
+  if (!head) return;
+  const cards = [...box.querySelectorAll(".tool")];
+  if (cards.length < 2 || !cards.every((c) => RO_TOOLS.has(c.dataset.tool))) {
+    head.hidden = true;
+    head.textContent = "";
+    return;
+  }
+  const b = { file: 0, list: 0, search: 0, web: 0 };
+  for (const c of cards) {
+    const n = c.dataset.tool;
+    if (n === "fs_read") b.file++;
+    else if (n === "fs_list") b.list++;
+    else if (n === "fs_search" || n === "web_search") b.search++;
+    else if (n === "web_fetch") b.web++;
+  }
+  const parts = [];
+  if (b.file) parts.push(`${b.file} 个文件`);
+  if (b.list) parts.push(`${b.list} 个列表`);
+  if (b.search) parts.push(`${b.search} 条搜索`);
+  if (b.web) parts.push(`${b.web} 个网页`);
+  head.hidden = false;
+  head.textContent = "查阅 · " + (parts.join("、") || `${cards.length} 步`);
+}
 function addTool(ev) {
-  const [label, cls] = T_STATE[ev._state || "pending"] || T_STATE.pending;
-  const a = ev.args || {};
-  const node = el(`<details class="tool" data-id="${esc(ev.id || "")}"><summary>
-      <span class="t-run"></span>
-      ${icon(T_ICON[ev.name] || "info", "ic ic-sm t-ic")}
-      <span class="t-name">${esc(ev.name)}</span>
-      <span class="t-sum">${esc(summaryOf(ev))}</span>
-      <span class="t-res"></span>
-      ${ev.doom ? `<span class="badge wait">重复第 ${ev.doom} 次</span>` : ""}
-      <span class="badge ${cls}">${label}</span>
+  const src = ev.name.startsWith("mcp__") ? `<span class="t-src">MCP</span>` : "";
+  const doom = ev.doom ? `<span class="t-src">第 ${ev.doom} 次重复</span>` : "";
+  const node = el(`<details class="tool" data-id="${esc(ev.id || "")}" data-tool="${esc(ev.name)}"><summary title="${esc(ev.name)}">
+      ${icon(T_ICON[ev.name] || (ev.name.startsWith("mcp__") ? "bot" : "info"), "ic ic-sm t-ic")}
+      <span class="t-kind">${verbOf(ev.name, "run")}</span>
+      ${targetOf(ev)}
+      ${src}${doom}
       ${icon("chevron-down", "ic ic-sm chev")}
     </summary><div class="t-body">
-      <div><div class="t-lb">参数</div><pre>${esc(JSON.stringify(a, null, 2))}</pre></div>
-      <div><div class="t-lb">结果</div><pre class="rres">执行中…</pre></div>
+      <div><div class="t-lb">参数</div><pre>${esc(JSON.stringify(ev.args || {}, null, 2))}</pre></div>
+      <div><div class="t-lb">结果<span class="t-ms"></span></div><pre class="rres">执行中…</pre></div>
     </div></details>`);
   node.dataset.started = Date.now();
-  toolGroup().appendChild(node);
+  const box = toolGroup();
+  box.appendChild(node);
+  updateToolsHead(box);
   scrollEnd();
   return node;
 }
@@ -648,19 +1044,18 @@ function inlineResult(text) {
 }
 
 function finishTool(node, ev) {
-  const [label, cls] = ev.denied ? T_STATE.refused : ev.ok === false ? T_STATE.err : T_STATE.done;
-  const b = node.querySelector(".badge");
-  b.textContent = label + (ev.ms ? ` · ${ev.ms}ms` : "");
-  b.className = "badge " + cls;
-  node.querySelector(".rres").textContent = ev.text || "";
-  const { inline, more } = inlineResult(ev.text);
-  const res = node.querySelector(".t-res");
-  if (res) {
-    res.textContent = inline ? (more > 1 ? `${inline} …（${more} 行）` : inline) : "";
-    res.className = "t-res" + (ev.ok === false || ev.denied ? " bad" : "");
+  const state = ev.denied ? "refused" : ev.ok === false ? "bad" : "ok";
+  const kind = node.querySelector(".t-kind");
+  if (kind) {
+    kind.textContent = verbOf(node.dataset.tool, state);
+    kind.classList.add(state);
   }
-  node.querySelector(".t-run")?.remove();
-  node.classList.add("done");
+  const ms = node.querySelector(".t-ms");
+  if (ms && ev.ms) ms.textContent = ` · 耗时 ${ev.ms}ms`;
+  const sum = node.querySelector("summary");
+  if (sum) sum.title = `${node.dataset.tool}${ev.ms ? " · " + ev.ms + "ms" : ""}`;
+  node.querySelector(".rres").textContent = ev.text || "";
+  node.classList.add("done", state);
   node.open = ev.ok === false || !!ev.denied;
   scrollEnd();
 }
@@ -671,8 +1066,7 @@ function addSubCard(name) {
       <span class="t-sum"></span><span class="badge wait">运行中</span>
       ${icon("chevron-down", "ic ic-sm chev")}
     </summary><div class="t-body"><div class="sub-body"></div></div></details>`);
-  colEl().appendChild(node);
-  scrollEnd();
+  insertBeforeSlot(node); // 和工具卡同一套插位规则：放在「下一段文本的容器」之前
   return node;
 }
 
@@ -684,7 +1078,7 @@ function changeRow(c) {
   const mark = CH_MARK[c.kind] || "M";
   const stat = c.add || c.del ? `<span class="ch-stat"><i>+${c.add || 0}</i><b>−${c.del || 0}</b></span>` : "";
   const pathTxt = c.kind === "move" && c.from ? `${c.from} → ${c.rel}` : c.rel;
-  const inner = `<span class="ch-mark ${c.kind}">${mark}</span>
+  const inner = `<span class="ch-mark ${esc(String(c.kind || ""))}">${mark}</span>
       <span class="ch-path" title="${esc(pathTxt)}">${esc(pathTxt)}</span>
       ${c.sub ? `<span class="ch-sub">子任务 ${esc(c.sub)}</span>` : ""}
       ${stat}`;
@@ -837,7 +1231,25 @@ function noteLine(text) {
 }
 
 /* ---- 计划卡 ---- */
+// 计划进度胶囊（v9.10）：状态条上「计划 2/5」，点它跳到计划卡（对标 ZCode 的状态胶囊优先级）
+function renderPlanChip(items) {
+  const chip = $("#sbPlan");
+  if (!chip) return;
+  const list = (items || []).filter((i) => i?.step);
+  if (!list.length) {
+    chip.hidden = true;
+    return;
+  }
+  const done = list.filter((i) => i.status === "done").length;
+  chip.hidden = false;
+  chip.textContent = `计划 ${done}/${list.length}`;
+  chip.classList.toggle("on", done < list.length);
+  chip.title = "当前计划进度（点它跳到计划卡）";
+  chip.onclick = () => colEl().querySelector(".plan")?.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
 export function renderPlan(items) {
+  renderPlanChip(items || []);
   if (!items || !items.length) return;
   S.plan = items;
   const done = items.filter((i) => i.status === "done").length;
@@ -887,6 +1299,7 @@ export function renderHistory(events) {
   }
   flushChanges();
   if (!colEl().children.length) renderWelcome();
+  refreshTurnRail();
   scrollEnd(true);
 }
 
@@ -902,7 +1315,7 @@ export function renderUsage() {
   const wrap = $("#ctxWrap");
   wrap.classList.toggle("empty", !tokens);
   $("#ctxFill").style.width = (tokens && limit ? Math.max(2, pct) : 0) + "%";
-  wrap.classList.toggle("warn", pct >= 70 && pct < 90);
+  wrap.classList.toggle("warn", pct >= 80 && pct < 90); // 与服务端自动压缩阈值（80%）对齐（审查 #24）
   wrap.classList.toggle("over", pct >= 90 || (limit && tokens > limit));
   const win = S.context?.windowTokens || b.windowTokens || 0;
   wrap.title = tokens
@@ -920,7 +1333,8 @@ export function renderUsage() {
   compact.disabled = !tokens;
 
   const total = S.tokens.input + S.tokens.output;
-  $("#usage").textContent = total ? `本轮 ${total} tokens` : "";
+  const cachePct = S.tokens.cached && S.tokens.input ? Math.round((S.tokens.cached / S.tokens.input) * 100) : 0;
+  $("#usage").textContent = total ? `本轮 ${total} tokens` + (cachePct ? ` · 缓存 ${cachePct}%` : "") : "";
   // 模式芯片以 S.mode 为准：状态条一刷新就顺带对齐（服务端中途改档、Shift+Tab、/mode 都覆盖到）
   if (lastRenderedMode !== S.mode) {
     lastRenderedMode = S.mode;
@@ -959,6 +1373,7 @@ export function renderAutoApproveBar() {
 
 let runTimer = null;
 let runStart = 0;
+let runStats = null; // 当前这一轮的生成统计（sendMessage 建立）：给「运行中」芯片实时显示首字与速度
 // 顶栏「运行中 N 秒」+ 停止：长任务时不用翻到底部输入框才知道它还在跑
 function renderRunChip() {
   const chip = $("#runChip");
@@ -974,7 +1389,14 @@ function renderRunChip() {
   clearInterval(runTimer);
   const tick = () => {
     const s = Math.round((Date.now() - runStart) / 1000);
-    $("#runText").textContent = "运行中 " + (s >= 60 ? Math.floor(s / 60) + " 分 " + (s % 60) + " 秒" : s + " 秒");
+    let text = "运行中 " + (s >= 60 ? Math.floor(s / 60) + " 分 " + (s % 60) + " 秒" : s + " 秒");
+    const st = runStats;
+    if (st?.firstAt) {
+      text += " · 首字 " + ((st.firstAt - st.t0) / 1000).toFixed(1) + "s";
+      const genMs = (st.genMs || 0) + (st.segStart ? Date.now() - st.segStart : 0); // 同口径：只算吐字段落
+      if (genMs > 400) text += " · ~" + Math.round(st.chars / (genMs / 1000)) + " 字/s";
+    }
+    $("#runText").textContent = text;
   };
   tick();
   runTimer = setInterval(tick, 1000);
@@ -1106,6 +1528,7 @@ function showConfirm() {
     $("#cfmNo").textContent = "跳过（不作答）";
     $("#cfmBody").innerHTML = renderAskForm(ev.args.questions);
     $("#cfmRoot").hidden = false;
+  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
     return;
   }
   // v0.9.9：工作区 hooks 的信任复核
@@ -1117,6 +1540,7 @@ function showConfirm() {
       `<div class="cfm-args">${esc((ev.args?.将执行 || []).join("\n"))}</div>` +
       `<p class="field-help">批准后本次运行一直有效；hooks.json 内容改了会重新问</p>`;
     $("#cfmRoot").hidden = false;
+  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
     return;
   }
   // 计划评审（计划模式里交上来的计划）：列步骤，按钮改成「批准执行 / 继续改计划」
@@ -1135,6 +1559,7 @@ function showConfirm() {
       w.textContent = ev.reason;
     }
     $("#cfmRoot").hidden = false;
+  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
     return;
   }
   yesBtn.textContent = "批准执行";
@@ -1152,6 +1577,7 @@ function showConfirm() {
   }
   $("#cfmNote").value = ""; // 上一单的附言不许带到下一单
   $("#cfmRoot").hidden = false;
+  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
 }
 async function resolveConfirm(approve, remember, scope) {
   const ev = queue.shift();
@@ -1526,7 +1952,7 @@ export function renderAttachments() {
   const box = $("#imgs");
   box.innerHTML = "";
   S.images.forEach((p, ix) => {
-    const n = el(`<div class="attach-item"><img src="${p.url}"><span>${p.mediaType.replace("image/", "")}</span><button class="x" title="移除">${icon("close", "ic ic-sm")}</button></div>`);
+    const n = el(`<div class="attach-item"><img src="${p.url}"><span>${esc(p.mediaType.replace("image/", ""))}</span><button class="x" title="移除">${icon("close", "ic ic-sm")}</button></div>`);
     n.querySelector(".x").onclick = () => { URL.revokeObjectURL(p.url); S.images.splice(ix, 1); renderAttachments(); };
     box.appendChild(n);
   });
@@ -1538,7 +1964,7 @@ export function renderAttachments() {
   box.hidden = !S.images.length && !S.texts.length;
   autoGrow();
 }
-function clearAttachments() {
+export function clearAttachments() {
   S.images.forEach((i) => URL.revokeObjectURL(i.url));
   S.images = [];
   S.texts = [];
@@ -1590,6 +2016,24 @@ export function autoGrow() {
   t.style.height = Math.min(t.scrollHeight, 190) + "px";
 }
 export function setInput(v) { txtEl().value = v; autoGrow(); focusInput(); }
+
+/* ---- 草稿持久化（v9.10）：按会话隔离存 localStorage，刷新/切会话不丢；发完自动清 ---- */
+const DRAFT_PREFIX = "ua_draft:";
+const draftScope = () => DRAFT_PREFIX + (S.sessionId || "__draft__");
+let draftTimer = null;
+function saveDraftNow() {
+  try {
+    const v = txtEl().value;
+    if (v.trim()) localStorage.setItem(draftScope(), v.slice(0, 20000));
+    else localStorage.removeItem(draftScope());
+  } catch {}
+}
+export function restoreDraft() {
+  try {
+    txtEl().value = localStorage.getItem(draftScope()) || "";
+    autoGrow();
+  } catch {}
+}
 // ↑ 翻历史：干净输入框按一下捞上一条，连续按继续往前翻
 export function recallPrev() {
   if (!sentHistory.length) return false;
@@ -1617,7 +2061,292 @@ export function pushHistory(text) {
   histIdx = -1;
 }
 function focusInput() { txtEl().focus(); }
-export function clearComposer() { palClose(); txtEl().value = ""; autoGrow(); histIdx = -1; }
+export function clearComposer() { palClose(); txtEl().value = ""; autoGrow(); histIdx = -1; saveDraftNow(); }
+
+/* ---- 选中回答里的文字 → 小浮层（v9.10）：引用到输入框 / 追问这句 ---- */
+function initSelectionMenu() {
+  const menu = $("#selMenu");
+  if (!menu || menu.__init) return;
+  menu.__init = true;
+  let lastText = "";
+  document.addEventListener("mouseup", (e) => {
+    if (menu.contains(e.target)) return;
+    setTimeout(() => {
+      const sel = window.getSelection();
+      const txt = sel?.toString().trim() || "";
+      const anchor = sel?.anchorNode?.parentElement;
+      const inAnswer = anchor?.closest?.(".msg.assistant .md");
+      if (!txt || txt.length < 2 || !inAnswer) {
+        menu.hidden = true;
+        return;
+      }
+      lastText = txt.slice(0, 1200);
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      menu.hidden = false;
+      const mw = menu.offsetWidth || 230;
+      const mh = menu.offsetHeight || 32;
+      const above = rect.top > mh + 12;
+      menu.style.left = Math.min(Math.max(8, rect.left + rect.width / 2 - mw / 2), window.innerWidth - mw - 8) + "px";
+      menu.style.top = (above ? rect.top - mh - 8 : rect.bottom + 8) + "px";
+    }, 0);
+  });
+  document.addEventListener("mousedown", (e) => {
+    if (!menu.contains(e.target)) menu.hidden = true;
+  });
+  document.addEventListener("scroll", () => (menu.hidden = true), true);
+  const quoteBtn = menu.querySelector('[data-act="quote"]');
+  const askBtn = menu.querySelector('[data-act="ask"]');
+  quoteBtn.onmousedown = (e) => e.preventDefault(); // 保住选区
+  askBtn.onmousedown = (e) => e.preventDefault();
+  quoteBtn.onclick = () => {
+    const cur = txtEl().value.trim();
+    setInput((cur ? cur + "\n\n" : "") + "> " + lastText.replace(/\n+/g, "\n> ").slice(0, 800) + "\n\n");
+    menu.hidden = true;
+    saveDraftNow();
+    toast("已引用到输入框", "ok");
+  };
+  askBtn.onclick = () => {
+    setInput("关于这段：\n> " + lastText.slice(0, 400).replace(/\n+/g, "\n> ") + "\n\n");
+    menu.hidden = true;
+    saveDraftNow();
+  };
+}
+
+/* ---- 会话内查找（Ctrl+F，v9.10）：CSS Custom Highlight API，不动 DOM ---- */
+let findState = { ranges: [], cur: -1 };
+const findSupported = () => typeof CSS !== "undefined" && !!CSS.highlights && typeof Highlight !== "undefined";
+export function openFind() {
+  const bar = $("#findBar");
+  if (!bar) return;
+  bar.hidden = false;
+  $("#findInput").focus();
+  $("#findInput").select();
+}
+function closeFind() {
+  const bar = $("#findBar");
+  if (bar) bar.hidden = true;
+  if (findSupported()) CSS.highlights.clear();
+  findState = { ranges: [], cur: -1 };
+}
+function runFind(q) {
+  const countEl = $("#findCount");
+  if (!findSupported()) {
+    if (countEl) countEl.textContent = "浏览器不支持高亮";
+    return;
+  }
+  CSS.highlights.clear();
+  findState = { ranges: [], cur: -1 };
+  q = String(q || "").trim();
+  if (!q) {
+    if (countEl) countEl.textContent = "";
+    return;
+  }
+  const needle = q.toLowerCase();
+  const walker = document.createTreeWalker(colEl(), NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => {
+      if (n.parentElement?.closest("input,textarea,script,style")) return NodeFilter.FILTER_REJECT;
+      return n.nodeValue && n.nodeValue.toLowerCase().includes(needle) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+  const all = [];
+  let node;
+  while ((node = walker.nextNode()) && all.length < 2000) {
+    const text = node.nodeValue.toLowerCase();
+    let idx = text.indexOf(needle);
+    while (idx >= 0 && all.length < 2000) {
+      const r = document.createRange();
+      r.setStart(node, idx);
+      r.setEnd(node, idx + needle.length);
+      all.push(r);
+      idx = text.indexOf(needle, idx + needle.length);
+    }
+  }
+  findState.ranges = all;
+  if (!all.length) {
+    if (countEl) countEl.textContent = "0 处";
+    return;
+  }
+  CSS.highlights.set("ua-find", new Highlight(...all));
+  if (countEl) countEl.textContent = `0/${all.length}`;
+  jumpFind(1);
+}
+function jumpFind(dir) {
+  const rs = findState.ranges;
+  if (!rs.length || !findSupported()) return;
+  findState.cur = (findState.cur + dir + rs.length) % rs.length;
+  CSS.highlights.set("ua-find-cur", new Highlight(rs[findState.cur]));
+  rs[findState.cur].startContainer.parentElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+  $("#findCount").textContent = `${findState.cur + 1}/${rs.length}`;
+}
+function initFind() {
+  const bar = $("#findBar");
+  if (!bar || bar.__init) return;
+  bar.__init = true;
+  $("#findInput").addEventListener("input", (e) => runFind(e.target.value));
+  $("#findInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      jumpFind(e.shiftKey ? -1 : 1);
+    }
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFind(); } // 别冒泡到全局 Esc 链，否则会顺手中止正在跑的一轮（审查 #23）
+  });
+  $("#findNext").onclick = () => jumpFind(1);
+  $("#findPrev").onclick = () => jumpFind(-1);
+  $("#findClose").onclick = () => closeFind();
+}
+
+/* ---- Cmd/Ctrl+K 命令台（v9.10）：分组 + 中英关键词搜索 + 键盘操作 ---- */
+function cmdkItems() {
+  const mode = (id) => {
+    const m = MODES.find((x) => x.id === id);
+    return { grp: "模式", title: "切到「" + m.name + "」", kw: id + " mode 权限 模式", run: () => { setMode(id); renderModeBtn(); setSendUI(); toast("已切到「" + m.name + "」", "ok"); } };
+  };
+  return [
+    { grp: "对话", title: "新会话", kw: "new chat 新建 清空", run: () => $("#newChat").click() },
+    { grp: "对话", title: "导出这次会话（Markdown）", kw: "export 导出 markdown 保存", run: () => exportSession() },
+    { grp: "对话", title: "压缩上下文", kw: "compact 压缩 context", run: () => doCompact() },
+    { grp: "对话", title: "回到最新", kw: "bottom 滚动 底部", run: () => scrollEnd(true) },
+    { grp: "导航", title: "搜索会话", kw: "search 搜索 会话", run: () => $("#sessSearch").focus() },
+    { grp: "导航", title: "切换侧栏", kw: "sidebar 侧栏 菜单", run: () => $("#menuBtn").click() },
+    { grp: "导航", title: "快捷键一览", kw: "keys shortcuts 快捷键 帮助 help", run: () => openKeysHelp() },
+    { grp: "外观", title: "切换明暗主题", kw: "theme dark light 主题 明暗", run: () => $("#themeBtn").click() },
+    { grp: "外观", title: "展开/收起思考过程", kw: "thinking 思考", run: () => toggleThinking() },
+    { grp: "外观", title: "展开/收起全部工具调用", kw: "details 工具 展开", run: () => toggleDetails() },
+    mode("confirm"),
+    mode("auto"),
+    mode("plan"),
+    mode("readonly"),
+    mode("full"),
+    { grp: "设置", title: "打开设置", kw: "settings 设置", run: () => $("#gearBtn").click() },
+    { grp: "设置", title: "设置 · 通用（工作区/额外目录）", kw: "settings general 工作区 目录", run: () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "general" } })) },
+    { grp: "设置", title: "设置 · 模型通道", kw: "settings model 模型 通道", run: () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "models" } })) },
+    { grp: "设置", title: "设置 · 权限", kw: "settings perm 权限", run: () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "perm" } })) },
+    { grp: "设置", title: "设置 · 联网（搜索钥匙/代理）", kw: "settings web 联网 代理 proxy 搜索", run: () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "web" } })) },
+    { grp: "设置", title: "设置 · 安全（密码/放行清单）", kw: "settings security 密码 安全 放行", run: () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "security" } })) },
+    { grp: "设置", title: "设置 · 扩展（MCP）", kw: "settings mcp 扩展 工具", run: () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "mcp" } })) },
+    ...(S.customCommands || []).map((c) => ({
+      grp: "自定义命令",
+      title: "/" + c.name,
+      kw: (c.description || "") + " " + (c.kind || ""),
+      run: () => { setInput("/" + c.name + " "); },
+    })),
+  ];
+}
+let cmdkList = [];
+let cmdkIdx = 0;
+export function openCmdk() {
+  const root = $("#cmdk");
+  if (!root) return;
+  root.hidden = false;
+  $("#cmdkInput").value = "";
+  renderCmdk("");
+  $("#cmdkInput").focus();
+}
+function closeCmdk() {
+  const root = $("#cmdk");
+  if (root) root.hidden = true;
+}
+function renderCmdk(q) {
+  const list = cmdkItems().filter((it) => {
+    if (!q) return true;
+    const hay = (it.title + " " + it.kw).toLowerCase();
+    return q.toLowerCase().split(/\s+/).every((w) => hay.includes(w));
+  });
+  cmdkList = list;
+  cmdkIdx = 0;
+  const box = $("#cmdkList");
+  const groups = [];
+  for (const it of list) {
+    let g = groups[groups.length - 1];
+    if (!g || g.name !== it.grp) {
+      g = { name: it.grp, items: [] };
+      groups.push(g);
+    }
+    g.items.push(it);
+  }
+  box.innerHTML =
+    groups
+      .map((g) => `<div class="cmdk-grp">${esc(g.name)}</div>` + g.items.map((it) => {
+        const i = list.indexOf(it);
+        return `<div class="cmdk-item ${i === cmdkIdx ? "on" : ""}" data-i="${i}">${esc(it.title)}<span class="cmdk-kw">${esc(it.kw.split(" ")[0])}</span></div>`;
+      }).join(""))
+      .join("") || `<div class="cmdk-empty">没有匹配的命令</div>`;
+  paintCmdk();
+}
+function paintCmdk() {
+  $$(".cmdk-item", $("#cmdkList")).forEach((n) => n.classList.toggle("on", Number(n.dataset.i) === cmdkIdx));
+  $$(".cmdk-item", $("#cmdkList")).forEach((n) => {
+    n.onclick = () => runCmdk(Number(n.dataset.i));
+    n.onmouseenter = () => { cmdkIdx = Number(n.dataset.i); paintCmdk(); };
+  });
+}
+function runCmdk(i) {
+  const it = cmdkList[i];
+  if (!it) return;
+  closeCmdk();
+  try {
+    it.run();
+  } catch {}
+}
+function initCmdk() {
+  const root = $("#cmdk");
+  if (!root || root.__init) return;
+  root.__init = true;
+  $("#cmdkInput").addEventListener("input", (e) => renderCmdk(e.target.value));
+  $("#cmdkInput").addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); cmdkIdx = Math.min(cmdkIdx + 1, cmdkList.length - 1); paintCmdk(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); cmdkIdx = Math.max(cmdkIdx - 1, 0); paintCmdk(); }
+    else if (e.key === "Enter") { e.preventDefault(); runCmdk(cmdkIdx); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeCmdk(); } // 同上：冒泡会命中「运行中 Esc=停止」
+  });
+  root.addEventListener("click", (e) => {
+    if (e.target === root || e.target.classList?.contains("cmdk-panel") === false && !e.target.closest(".cmdk-panel")) closeCmdk();
+  });
+}
+
+/* ---- 快捷键一览（Ctrl+/，v9.11）---- */
+const KEYS = [
+  ["Ctrl / ⌘ + K", "命令台（所有操作都能搜出来）"],
+  ["Ctrl / ⌘ + F", "在会话里查找（高亮 + 跳转）"],
+  ["Ctrl / ⌘ + B", "收起 / 展开左侧栏"],
+  ["Ctrl / ⌘ + /", "这张快捷键表"],
+  ["Ctrl / ⌘ + Shift + N", "新会话"],
+  ["Esc", "关浮层；没有浮层且正在跑 → 停止这一轮"],
+  ["Shift + Tab", "循环切换权限档"],
+  ["Enter / Shift + Enter", "发送 / 换行"],
+  ["↑ / ↓（输入框空时）", "翻历史输入"],
+  ["/ 或 @", "命令与文件补全"],
+  ["Alt + 点「从这儿重来」", "只回退对话，不动文件"],
+];
+export function openKeysHelp() {
+  const root = $("#keysRoot");
+  if (!root) return;
+  root.hidden = false;
+  const list = $("#keysList");
+  if (list && !list.__init) {
+    list.__init = true;
+    list.innerHTML = KEYS.map(([k, d]) => `<div class="keys-row"><kbd>${esc(k)}</kbd><span>${esc(d)}</span></div>`).join("");
+    root.addEventListener("click", (e) => {
+      if (!e.target.closest(".cmdk-panel")) root.hidden = true;
+    });
+  }
+}
+// Esc 优先关浮层：确认弹窗 → 命令台 → 快捷键表 → 查找栏 → 选中浮层；返回是否关了东西
+export function closeOverlays() {
+  // 确认弹窗排第一：Esc = 不运行/跳过，必须把裁决送回服务端——
+  // 老写法只 hidden 不裁决，这一单会一直悬着（服务端 120 秒超时才算数，界面等于装死）
+  const cfm = $("#cfmRoot");
+  if (cfm && !cfm.hidden) { resolveConfirm(false); return true; }
+  const cmdk = $("#cmdk");
+  if (cmdk && !cmdk.hidden) { closeCmdk(); return true; }
+  const keys = $("#keysRoot");
+  if (keys && !keys.hidden) { keys.hidden = true; return true; }
+  const find = $("#findBar");
+  if (find && !find.hidden) { closeFind(); return true; }
+  const menu = $("#selMenu");
+  if (menu && !menu.hidden) { menu.hidden = true; return true; }
+  return false;
+}
 
 /* ================= 模型通道（顶栏按钮由 picker 渲染） ================= */
 export function fillProviders(st) {
@@ -1630,18 +2359,55 @@ export function fillProviders(st) {
 
 /* ================= 初始化 ================= */
 export function initChat() {
+  initSelectionMenu(); // 选中回答文字的小浮层
+  initFind(); // Ctrl+F 会话内查找
+  initCmdk(); // Ctrl+K 命令台
+  // 「计划」快速切换：与权限档并列的一枚独立开关（学 ZCode 的 Plan 勾选；开=切到 plan 档，关=切回原档）
+  let prePlanMode = null;
+  const syncPlanQuick = () => {
+    const b = $("#planQuick");
+    if (b) b.classList.toggle("on", S.mode === "plan");
+  };
+  $("#planQuick").onclick = () => {
+    if (S.mode === "plan") {
+      setMode(prePlanMode || "confirm");
+      toast("已退出计划模式", "ok");
+    } else {
+      prePlanMode = S.mode;
+      setMode("plan");
+      toast("已切到计划模式：先出计划，批准后再动手", "ok");
+    }
+    renderModeBtn();
+    setSendUI();
+    syncPlanQuick();
+  };
+  syncPlanQuick();
+  window.addEventListener("resize", refreshTurnRail); // 导航条按消息列左缘定位，窗口变了跟一下
   // 滚动
   streamEl().addEventListener("scroll", () => { nearBottom = atBottom(); scrollEnd(); });
+  // 滚轮往上 = 明说要看前面的：立刻停跟随，别等滚动事件把十几像素的位移算成「还在底部」。
+  // （滚动条拖动本身没有 DOM 事件可监听，靠 atBottom 的小阈值兜住：拖过 10px 就停止吸底）
+  // 注意必须判「真的可滚动」：内容没溢出时滚一下滚轮不该把跟随关掉（否则「回到最新」无缘无故冒出来）
+  streamEl().addEventListener("wheel", (e) => {
+    const s = streamEl();
+    if (e.deltaY < 0 && nearBottom && s.scrollHeight > s.clientHeight) { nearBottom = false; scrollEnd(); }
+  }, { passive: true });
   $("#scrollBtn").onclick = () => { nearBottom = true; streamEl().scrollTop = streamEl().scrollHeight; $("#scrollBtn").hidden = true; };
 
   // 输入
-  txtEl().addEventListener("input", () => { autoGrow(); palUpdate(); });
+  txtEl().addEventListener("input", () => {
+    autoGrow();
+    palUpdate();
+    clearTimeout(draftTimer); // 草稿：停手 300ms 后落盘（按会话隔离）
+    draftTimer = setTimeout(saveDraftNow, 300);
+  });
+  window.addEventListener("beforeunload", saveDraftNow);
   txtEl().addEventListener("keydown", (e) => {
     if (palOpen()) {
       if (e.key === "ArrowDown") { e.preventDefault(); palIdx = (palIdx + 1) % pal.length; return palRender(); }
       if (e.key === "ArrowUp") { e.preventDefault(); palIdx = (palIdx - 1 + pal.length) % pal.length; return palRender(); }
       if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); return palPick(); }
-      if (e.key === "Escape") { e.preventDefault(); return palClose(); }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); return palClose(); }
     }
     // 空输入框按 ↑ 翻历史（跟终端一个手感）；光标在别处时 ↑ 还是正常移动光标
     if (e.key === "ArrowUp" && !e.shiftKey && !e.altKey && !palOpen()) {
@@ -1654,6 +2420,7 @@ export function initChat() {
     if (e.key === "ArrowDown" && histIdx >= 0 && (txtEl().selectionStart ?? 0) === txtEl().value.length) {
       if (recallNext()) { e.preventDefault(); return; }
     }
+    if (e.key === "Tab" && e.shiftKey) { e.preventDefault(); cycleMode(); return; } // Shift+Tab 循环权限档
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); return sendMessage(txtEl().value); }
   });
   // 粘贴：清掉不可见字符（提示词走私/伪装字符），命中时明确告诉用户
@@ -1717,10 +2484,8 @@ export function initChat() {
   // 模式/通道的切换统一由顶栏弹层发出事件，这里只负责刷新提示文案与发送按钮
   window.addEventListener("ua:mode-change", () => setSendUI());
   window.addEventListener("ua:model-change", () => api.saveSettings({ active: S.active }).catch(() => {}));
-
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { $("#cfmRoot").hidden = true; }
-  });
+  // Esc 关确认弹窗交给 app.js 的快捷键链（closeOverlays 第一优先级会把它裁决掉）——
+  // 这里不再单独监听，免得出现「这里先 hidden、链条看不到、接着把整轮 abort 掉」的打架。
   setSendUI();
   renderUsage();
 }

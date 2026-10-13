@@ -378,12 +378,15 @@ test("v7 新增：自动放行开关可存可取，且真的能免掉确认弹�
   }
 });
 
-test("子任务经服务器跑通（subagent_event 出现在 SSE）", async () => {
+test("子任务经服务器跑通（确认模式先弹确认→批准后 subagent_event 出现在 SSE）", async () => {
   const subTask = "MOCKSCRIPT:" + JSON.stringify([{ say: "子任务完成" }]);
-  const { events } = await chat({
-    message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "spawn_subagent", args: { task: subTask, name: "t1" } }, { say: "完成" }]) },
-    mode: "confirm",
-  });
+  // v9.13 起：spawn_subagent 在确认模式必过一次审（原先 medium 直接放行，「派子任务」开关形同虚设）——
+  // 这里顺带把新语义验掉：先弹确认，批准后子任务才跑
+  const events = await chatResolving(
+    { message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "spawn_subagent", args: { task: subTask, name: "t1" } }, { say: "完成" }]) }, mode: "confirm" },
+    async (ev) => (ev.name === "spawn_subagent" ? {} : null)
+  );
+  assert.ok(events.some((e) => e.type === "confirm_request" && e.name === "spawn_subagent"), "确认模式必须先弹一次");
   assert.ok(events.some((e) => e.type === "subagent_event"));
   const tr = events.find((e) => e.type === "tool_result" && e.name === "spawn_subagent");
   assert.match(tr?.text || "", /子任务完成/);
@@ -743,6 +746,7 @@ test("v8 新增：撤销会撞车时先拒一次，强制才覆盖", async () =>
   assert.equal(blocked.status, 409, "文件在改动之后又被改过 → 先拒");
   assert.equal(blocked.json.needForce, true);
   assert.equal(blocked.json.conflicts.length, 1);
+  assert.ok(Array.isArray(blocked.json.safe), "回退预览要分级：带上 safe 列表（v9.10）");
   assert.equal(fs.readFileSync(f, "utf8"), "v3 用户后来自己改的", "没批准不许动");
 
   const forced = await jjson("/api/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, ids: [cpId], force: true }) });
@@ -1589,4 +1593,108 @@ test("v9.9 权限存盘：总是允许（存盘）→ 进清单、可删", async
   const del = await jfetch("/api/perm-saved?prefix=" + encodeURIComponent("git status"), { method: "DELETE" });
   assert.equal(del.status, 200);
   assert.ok(!(await jjson("/api/perm-saved")).json.commands.includes("git status"));
+});
+
+/* ===== v0.9.10：额外可访问目录 / 代理设置 ===== */
+test("v9.10 设置：extraRoots 落盘可读、不存在的目录被拒、代理字段可取", async () => {
+  const extra = tmpDir();
+  const ok = await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ extraRoots: [extra], proxy: "http://127.0.0.1:7890" }) });
+  assert.equal(ok.status, 200, JSON.stringify(ok.json));
+  assert.deepEqual((ok.json.extraRoots || []).map((x) => x.toLowerCase()), [extra.toLowerCase()]);
+  assert.equal(ok.json.proxy, "http://127.0.0.1:7890");
+  const bad = await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ extraRoots: [path.join(extra, "nope-xyz")] }) });
+  assert.equal(bad.status, 400, "不存在的目录要拒：" + JSON.stringify(bad.json));
+  // 收尾还原
+  await postSettings({ extraRoots: [], proxy: "" });
+});
+
+test("v9.10 完全权限端到端：MOCKSCRIPT 直接读工作区外的文件", async () => {
+  const outside = tmpDir();
+  fs.writeFileSync(path.join(outside, "out.txt"), "外面的内容", "utf8");
+  const script = [{ tool: "fs_read", args: { path: path.join(outside, "out.txt") } }, { say: "读到了" }];
+  const r = await chat({ sessionId: "s-fullpath-" + Math.random().toString(36).slice(2, 7), mode: "full", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } });
+  const tr = r.events.find((e) => e.type === "tool_result" && e.name === "fs_read");
+  assert.ok(tr && tr.ok, "完全权限下应能读外部文件：" + JSON.stringify(tr));
+  assert.match(tr.text, /外面的内容/);
+});
+
+/* ===== v9.12：安全批（自查面 critical + 审计日志落地） ===== */
+test("v9.12 自查面 critical：新建 data/ 下的文件也要确认（超时被拒），并落审计", async () => {
+  const target = path.join(REPO, "data", "probe-surface.txt");
+  fs.rmSync(target, { force: true });
+  const r = await chat({
+    sessionId: "s-surface-" + Math.random().toString(36).slice(2, 7),
+    mode: "confirm",
+    provider: "Mock",
+    message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: target, content: "x" } }, { say: "写完了" }]) },
+  });
+  const req = r.events.find((e) => e.type === "confirm_request" && e.name === "fs_write");
+  assert.ok(req, "写 agent 自查面要弹确认：" + JSON.stringify(r.events.map((e) => e.type)));
+  assert.equal(req.risk, "critical", "风险要标成 critical");
+  assert.ok(!fs.existsSync(target), "没人批就不能建出来（弹窗超时自动拒绝）");
+
+  // 审计日志：这次超时拒绝要有一行；每行都要有基本字段
+  const audit = path.join(REPO, "data", "audit.jsonl");
+  assert.ok(fs.existsSync(audit), "审计文件应已写出");
+  const lines = fs
+    .readFileSync(audit, "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  assert.ok(
+    lines.some((l) => l.tool === "fs_write" && l.risk === "critical" && l.decision === "timeout" && l.mode === "confirm"),
+    "自查面超时拒绝要记审计：" + JSON.stringify(lines.slice(-3))
+  );
+  assert.ok(lines.every((l) => l.ts && l.mode && l.tool && l.decision), "每行都要有 ts/mode/tool/decision");
+});
+
+/* ===== v9.13：第二轮审查修复 ===== */
+test("v9.13 搜索钥匙：掩码回显 + 空值不覆盖（保存别的设置不许把钥匙清掉）", async () => {
+  await postSettings({ searchKeys: { tavily: "tv-secret-1", brave: "bv-secret-2" } });
+  let g = await jjson("/api/settings");
+  assert.equal(g.json.searchKeys.tavily, "•••已保存", "回显必须是掩码（审查 #10）");
+  assert.ok(!JSON.stringify(g.json).includes("tv-secret-1"), "明文不许回显");
+  // 前端保存时总会带上搜索钥匙字段——空值必须「不改」，不能整份覆盖（审查 #1）
+  await postSettings({ searchKeys: { tavily: "", brave: "" } });
+  g = await jjson("/api/settings");
+  assert.equal(g.json.searchKeys.tavily, "•••已保存", "空值=不改，钥匙要还在");
+  assert.equal(g.json.searchKeys.brave, "•••已保存");
+});
+
+test("v9.13 安全响应头：CSP / nosniff / DENY / no-referrer 全带上", async () => {
+  const r = await jfetch("/api/health");
+  assert.equal(r.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(r.headers.get("x-frame-options"), "DENY");
+  assert.equal(r.headers.get("referrer-policy"), "no-referrer");
+  assert.match(String(r.headers.get("content-security-policy")), /script-src 'self'/);
+  const page = await jfetch("/");
+  assert.match(String(page.headers.get("content-security-policy")), /default-src 'self'/);
+});
+
+test("v9.13 正在跑的会话不许删（409，与 rewind/fork 同口径）", async () => {
+  const sid = "s-delrun-" + Math.random().toString(36).slice(2, 7);
+  // 用 ping 占用约 3 秒（timeout 命令在 stdin 被重定向时会立即报错退出，hold 不住——踩过）
+  const script = [{ tool: "shell_run", args: { command: "ping -n 4 127.0.0.1 >nul" } }, { say: "好了" }];
+  const res = await jfetch("/api/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: sid, mode: "full", provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify(script) } }),
+  });
+  const rd = res.body.getReader();
+  await rd.read();
+  await new Promise((r) => setTimeout(r, 500));
+  const del = await jfetch("/api/session?id=" + encodeURIComponent(sid), { method: "DELETE" });
+  assert.equal(del.status, 409, "跑着的会话要拒删：" + JSON.stringify(await del.json().catch(() => ({}))));
+  await jfetch("/api/abort", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid }) });
+  for (;;) {
+    const { done } = await rd.read();
+    if (done) break;
+  }
 });

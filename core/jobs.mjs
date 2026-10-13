@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { assertCommandAllowed } from "./blacklist.mjs";
 
 const jobs = new Map(); // id → {id, command, cwd, pid, startedAt, status, code, endedAt, logFile}
 let seq = 0;
@@ -10,6 +11,11 @@ let seq = 0;
 const newId = () => `job-${Date.now().toString(36)}-${(++seq).toString(36)}`;
 
 export function startJob({ command, cwd, logDir, max = 20 }) {
+  assertCommandAllowed(command); // 黑名单是全局护栏：不管从哪条路进后台都得先过（v9.12 前这条漏了）
+  if (jobs.size >= max) {
+    // 配额只该卡「还在的」任务：早先从不清理，累计 20 个之后永久堵死，提示还让人去停（停了也不减）
+    for (const [id, j] of jobs) if (j.status !== "running") jobs.delete(id);
+  }
   if (jobs.size >= max) throw new Error(`后台任务太多（上限 ${max} 个），先停掉几个再开`);
   const running = [...jobs.values()].filter((j) => j.status === "running").length;
   if (running >= max) throw new Error(`同时在跑的后台任务到上限了（${max} 个），先停掉几个`);

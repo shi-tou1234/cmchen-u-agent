@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveInside, SandboxDenyError } from "../core/sandbox.mjs";
+import { resolveInside, isSelfSurface, SandboxDenyError } from "../core/sandbox.mjs";
 import { tmpDir } from "./helpers.mjs";
 
 test("白名单内相对/绝对路径放行", () => {
@@ -53,4 +53,32 @@ test("真实路径复查：junction 指向工作区内部照旧放行", (t) => {
     return;
   }
   assert.equal(resolveInside([ws], path.join(link, "in.txt"), ws), path.resolve(link, "in.txt"));
+});
+
+test("完全权限：通配根 '*' 不设边界（任意路径放行）", () => {
+  const ws = tmpDir();
+  assert.equal(resolveInside(["*"], "C:\\Windows\\System32\\drivers\\etc\\hosts", ws), "C:\\Windows\\System32\\drivers\\etc\\hosts");
+  assert.equal(resolveInside(["*"], "..\\..\\outside.txt", ws), path.resolve(ws, "..\\..\\outside.txt"));
+  // 空路径仍然拒（参数错误照查）
+  assert.throws(() => resolveInside(["*"], "", ws), SandboxDenyError);
+});
+
+/* ===== v9.12：agent 自查面判定 ===== */
+test("v9.12 isSelfSurface：命中 agent 自己身上（大小写不敏感），普通文件不命中", () => {
+  const ctx = { uaHome: "G:\\agent" };
+  const hit = [
+    "G:\\agent\\data\\settings.json",
+    "g:\\agent\\DATA\\x.json",
+    "G:\\agent\\.agent\\hooks.json",
+    "G:\\agent\\tools\\t.mjs",
+    "G:\\agent\\core\\a.mjs",
+    "G:\\agent\\public\\js\\app.js",
+    "G:\\agent\\runtime\\node\\node.exe",
+    "G:\\agent\\server.mjs",
+    "G:\\agent\\VERSIONS.json",
+  ];
+  for (const p of hit) assert.equal(isSelfSurface(p, ctx), true, p);
+  const miss = ["G:\\agent\\README.md", "G:\\agent\\docs\\x.md", "C:\\tmp\\x.txt", "G:\\agent-evil\\data\\x"];
+  for (const p of miss) assert.equal(isSelfSurface(p, ctx), false, p);
+  assert.equal(isSelfSurface("G:\\agent\\data\\x", {}), false, "没有 uaHome 就不判");
 });

@@ -340,7 +340,9 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
   const reqBody = bodyOpenaiChat(provider, messages, tools);
   let res = await postStream(url, headers, reqBody, signal);
   if (res.status === 400) {
-    // 某些兼容端点不认识 stream_options，去掉后重试一次
+    // 某些兼容端点不认识 stream_options，去掉后重试一次；
+    // 先把首个响应体消费掉（审查 #17：不消费会占着连接）
+    try { await res.body?.cancel(); } catch {}
     delete reqBody.stream_options;
     res = await postStream(url, headers, reqBody, signal);
   }
@@ -355,7 +357,8 @@ async function* streamOpenaiChat(provider, messages, tools, signal) {
     } catch {
       continue;
     }
-    if (j.usage) yield { type: "usage", input: j.usage.prompt_tokens || 0, output: j.usage.completion_tokens || 0 };
+    // 缓存命中 tokens：OpenAI 系在 prompt_tokens_details.cached_tokens；DeepSeek 在 prompt_cache_hit_tokens
+    if (j.usage) yield { type: "usage", input: j.usage.prompt_tokens || 0, output: j.usage.completion_tokens || 0, cached: j.usage.prompt_tokens_details?.cached_tokens || j.usage.prompt_cache_hit_tokens || 0 };
     const ch = j.choices?.[0];
     const d = ch?.delta;
     // 思考过程：不同网关字段名不一样，能认的全认（DeepSeek/GLM/Kimi 用 reasoning_content，
@@ -397,7 +400,8 @@ async function* streamOpenaiResponses(provider, messages, tools, signal) {
   const reqBody = bodyOpenaiResponses(provider, messages, tools);
   let res = await postStream(url, headers, reqBody, signal);
   if (res.status === 400 && reqBody.reasoning) {
-    // 有的网关不认 reasoning（思考摘要）字段，去掉后重试一次
+    // 有的网关不认 reasoning（思考摘要）字段，去掉后重试一次；同样先消费掉首个响应体
+    try { await res.body?.cancel(); } catch {}
     delete reqBody.reasoning;
     res = await postStream(url, headers, reqBody, signal);
   }
@@ -424,7 +428,9 @@ async function* streamOpenaiResponses(provider, messages, tools, signal) {
       calls.set(j.item.call_id, a);
       yield { type: "tool_delta", id: j.item.call_id, delta: "" };
     } else if (type === "response.completed" || type === "response.incomplete") {
-      if (j.response?.usage) yield { type: "usage", input: j.response.usage.input_tokens || 0, output: j.response.usage.output_tokens || 0 };
+      if (j.response?.usage) {
+        yield { type: "usage", input: j.response.usage.input_tokens || 0, output: j.response.usage.output_tokens || 0, cached: j.response.usage.input_tokens_details?.cached_tokens || 0 };
+      }
       stop = j.response?.status === "incomplete" ? "length" : "stop";
       break;
     } else if (type === "response.failed" || type === "error") {
@@ -489,7 +495,7 @@ async function* streamAnthropic(provider, messages, tools, signal) {
       if (j.delta?.stop_reason === "tool_use") stop = "tool_calls";
       else if (j.delta?.stop_reason === "end_turn") stop = "stop";
     } else if (type === "message_start") {
-      if (j.message?.usage) yield { type: "usage", input: j.message.usage.input_tokens || 0, output: 0 };
+      if (j.message?.usage) yield { type: "usage", input: j.message.usage.input_tokens || 0, output: 0, cached: j.message.usage.cache_read_input_tokens || 0 };
     } else if (type === "error") {
       yield { type: "error", message: j.error?.message || "anthropic 流失败" };
       return;

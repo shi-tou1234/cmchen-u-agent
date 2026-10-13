@@ -29,7 +29,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "0.9.9";
+const VERSION = "1.0.0";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -100,6 +100,8 @@ function loadState() {
     providers,
     active: base.active || settings.active || providers[0]?.name,
     workspace: settings.workspace || "",
+    extraRoots: Array.isArray(settings.extraRoots) ? settings.extraRoots.filter(Boolean).map(String) : [], // 额外可访问的目录（和主工作区同等对待）
+    proxy: String(settings.proxy || ""), // 联网工具用的 HTTP 代理（空 = 直连）
     searchKeys: vault.searchKeys || {},
     autoApprove: { ...DEFAULT_AUTO_APPROVE, ...(settings.autoApprove || {}), actions: { ...DEFAULT_AUTO_APPROVE.actions, ...((settings.autoApprove || {}).actions || {}) } },
     assist: settings.assist || "", // 轻量通道：起名/压缩这类杂活用，留空=跟随当前通道
@@ -115,7 +117,18 @@ function saveState(patch) {
   const providers = patch.providers || cur.providers;
   const active = patch.active ?? cur.active;
   const workspace = patch.workspace ?? cur.workspace;
-  const searchKeys = patch.searchKeys ?? cur.searchKeys;
+  // 搜索钥匙：空串/掩码 = 不改（跟 providers 一个口径）。前端每次保存都会带上这两个字段，
+  // 原先的「整份替换」会把用户已存的 Tavily/Brave 钥匙静默清掉（审查 #1 实锤）
+  const searchKeys = { ...(cur.searchKeys || {}) };
+  if (patch.searchKeys && typeof patch.searchKeys === "object") {
+    for (const [k, v] of Object.entries(patch.searchKeys)) {
+      const s = String(v ?? "").trim();
+      if (!s || s === MASK) continue;
+      searchKeys[k] = s.slice(0, 500);
+    }
+  }
+  const extraRoots = patch.extraRoots ?? cur.extraRoots;
+  const proxy = patch.proxy ?? cur.proxy;
   const autoApprove = patch.autoApprove ?? cur.autoApprove;
   const assist = patch.assist ?? cur.assist;
   const autoCompactAt = patch.autoCompactAt ?? cur.autoCompactAt;
@@ -126,7 +139,7 @@ function saveState(patch) {
   const vault = { providers: {}, searchKeys: searchKeys || {} };
   for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
   vaultSave(vault);
-  writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt, checks });
+  writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt, checks, extraRoots, proxy });
   stateCache = null; // 写盘了，缓存作废
   return loadState();
 }
@@ -162,7 +175,14 @@ function lockHash(pw, salt) {
 function lockVerify(pw) {
   const info = readJson(LOCK, null);
   if (!info) return false;
-  return crypto.timingSafeEqual(Buffer.from(lockHash(pw, info.salt)), Buffer.from(info.hash));
+  // 畸形 lock.json（hash 长度 ≠ 64）会让 timingSafeEqual 抛 ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH：
+  // 原先直接 500 且跳过失败计数；现在一律按「验不过」处理——照样吃 600ms 延迟与冷却（审查 #17）
+  if (typeof info.salt !== "string" || !/^[a-f0-9]{64}$/i.test(String(info.hash || ""))) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(lockHash(pw, info.salt)), Buffer.from(info.hash));
+  } catch {
+    return false;
+  }
 }
 function cookieOf(req) {
   const m = /(?:^|;\s*)ua_tok=([a-f0-9]{64})/.exec(req.headers.cookie || "");
@@ -179,6 +199,10 @@ function unlocked(req) {
     return false;
   }
   sessionTokens.set(tok, Date.now());
+  if (sessionTokens.size > 64) {
+    // 防「只增不减」（审查 #17）：量大了就把过期的清掉（解锁路径本来也会清一次）
+    for (const [t, at] of sessionTokens) if (Date.now() - at > TOKEN_TTL_MS) sessionTokens.delete(t);
+  }
   return true;
 }
 
@@ -186,6 +210,8 @@ function maskState(st) {
   return {
     ...st,
     providers: st.providers.map((p) => ({ ...p, secret: p.secret ? MASK : "" })),
+    // 搜索钥匙同样只回掩码（审查 #10 实测：原先明文回显，与设置页「已保存不回显」的承诺相反）
+    searchKeys: Object.fromEntries(Object.entries(st.searchKeys || {}).map(([k, v]) => [k, v ? MASK : ""])),
   };
 }
 
@@ -219,6 +245,24 @@ function approveHook(source) {
   writeJson(path.join(DATA, "hook-trust.json"), hookTrustCache);
 }
 const hookPromptDenied = new Set(); // 本进程内被拒过的 hooks 文件：别再反复弹
+
+// 审计日志（v9.12 落地，DESIGN 里一直承诺的）：门禁裁决与 full 模式下的执行，追加一行 JSONL。
+// 写不进去也不许影响主流程（挂 try）。
+const AUDIT = path.join(DATA, "audit.jsonl");
+function auditLine(entry) {
+  try {
+    fs.appendFileSync(AUDIT, JSON.stringify(entry) + "\n");
+  } catch {}
+}
+// 审计里的参数摘要：长内容掐头，别把日志撑爆
+const briefArgs = (a) => {
+  try {
+    const s = typeof a === "string" ? a : JSON.stringify(a ?? {});
+    return s.length > 300 ? s.slice(0, 300) + "…" : s;
+  } catch {
+    return "";
+  }
+};
 const sessionLoopGuard = new Map(); // sessionId → {lastSig, count}：防死循环的连续重复计数（跨轮保持）
 
 const MEMORY = path.join(DATA, "memory.md");
@@ -394,7 +438,7 @@ const LOG_TYPES = new Set(["user", "assistant_message", "reasoning", "tool_call"
 
 /* ---------- 检查点快照的路径解析与容量收拾 ---------- */
 // 哪些工具动了哪些路径 → 交给 checkpoints 拍快照；只快照工作区/U盘目录内的路径
-function snapPathsOf(name, args, st) {
+function snapPathsOf(name, args, st, anyPath = false) {
   const pick = SNAP_PATHS[name];
   if (!pick) return [];
   const out = [];
@@ -402,7 +446,7 @@ function snapPathsOf(name, args, st) {
     if (!raw) continue;
     let abs;
     try {
-      abs = resolveInside([st.workspace, UA_HOME], raw, st.workspace);
+      abs = resolveInside(anyPath ? ["*"] : [st.workspace, UA_HOME, ...(st.extraRoots || [])], raw, st.workspace);
     } catch {
       continue; // 越界的路径工具本身也会被拒，不拍
     }
@@ -646,6 +690,10 @@ async function handleChat(req, res, body) {
 
   const abort = new AbortController();
   running.set(sessionId, { abort, mode });
+  // 从这里到主循环的 finally 之间还有一段起始活（读日志、建上下文、起标题等）：
+  // 这段里抛错原先会把 running 里的句柄落下——这个会话从此永久 409（发消息、删除全被堵，领导报过"无法删除对话"）。
+  // 外层兜底 catch 保证任何路径都把锁摘掉。
+  try {
   // 多轮上下文：从会话日志重建历史（含 compact 摘要替换与回退裁剪），再拼上本条消息
   let pastEvents = sessions.read(sessionId);
   let history = buildHistory(pastEvents);
@@ -688,8 +736,10 @@ async function handleChat(req, res, body) {
   const ctx = {
     uaHome: UA_HOME,
     workspace: st.workspace,
+    extraRoots: st.extraRoots, // 设置里配的额外可访问目录（v9.10 接线修复：之前漏了，工具拿到的一直是空数组）
+    allowAnyPath: mode === "full", // 完全权限模式：不设路径边界（盘主人自己的明确选择）
     mode,
-    settings: { searchKeys: st.searchKeys, autoApprove: st.autoApprove },
+    settings: { searchKeys: st.searchKeys, autoApprove: st.autoApprove, proxy: st.proxy },
     provider,
     registry,
     signal: abort.signal,
@@ -706,6 +756,8 @@ async function handleChat(req, res, body) {
 
     sessionId,
     cmdPrefixes: [...new Set([...savedPrefixes(), ...(sessionCmdAllow.get(sessionId) || [])])],
+    // 审计：裁决/放行经此落盘（auditLine）；full 模式不弹窗，所以那边「全记」
+    audit: (e) => auditLine({ ts: new Date().toISOString(), session: sessionId, mode, ...e, args: briefArgs(e.args) }),
     hookTrust: hookIsTrusted,
     hookApprove: approveHook,
     loopGuard: (() => { const g = sessionLoopGuard.get(sessionId) || { lastSig: "", count: 0 }; sessionLoopGuard.set(sessionId, g); return g; })(),
@@ -714,7 +766,12 @@ async function handleChat(req, res, body) {
     confirm: (info) => {
       const id = genId("cfm");
       const p = new Promise((resolve) => {
-        const timer = setTimeout(() => resolve({ ok: false, note: "", timeout: true }), Number(process.env.UA_CONFIRM_TIMEOUT_MS) || 120000);
+        const timer = setTimeout(() => {
+          // 超时先把 pending 摘掉再返回拒绝（审查 #12）：留着的话 ① 每次超时泄漏一条含完整工具参数
+          // 的表项；② 两分钟后用户点「批准」会被当成有效裁决回 {ok:true}——假批准，实际早按拒绝走了
+          if (confirmGate.pending.get(id)?.timer === timer) confirmGate.pending.delete(id);
+          resolve({ ok: false, note: "", timeout: true });
+        }, Number(process.env.UA_CONFIRM_TIMEOUT_MS) || 120000);
         confirmGate.pending.set(id, { resolve, info: { ...info, id, ts: new Date().toISOString() }, timer });
       });
       // 网页可以给这句确认附一句话：批准时是补充要求，拒绝时是理由，都会转给模型
@@ -722,7 +779,7 @@ async function handleChat(req, res, body) {
     },
     // 改动前拍快照：返回的 finish() 由主循环在工具跑完后调用，记下「改完长什么样」
     snapshot: (tc) => {
-      const paths = snapPathsOf(tc.name, tc.args, st);
+      const paths = snapPathsOf(tc.name, tc.args, st, mode === "full");
       if (!paths.length) return null;
       pruneCheckpointsSoon();
       const { id } = checkpoints.begin(sessionId, { tool: tc.name, toolCallId: tc.toolCallId, turn: turnSeq, paths });
@@ -736,7 +793,7 @@ async function handleChat(req, res, body) {
     },
   };
 
-  let usageTotal = { input: 0, output: 0 };
+  let usageTotal = { input: 0, output: 0, cached: 0 };
   let replyText = ""; // 本轮最后一段助手正文，起标题时当素材
   let runMessages = messages;
   let fixRounds = 0;
@@ -762,24 +819,30 @@ async function handleChat(req, res, body) {
     // ── v0.9.9 UserPromptSubmit hooks：可以拦下这条消息，也可以往上下文里补一段 ──
     {
       const srcs = loadHookSources({ workspace: st.workspace, uaHome: UA_HOME });
+      const allowed = (s) => s.trusted || hookIsTrusted(s);
+      // 信任闸（v9.12 收紧）：任何来源的 hooks（含 U 盘那份）第一次见、或内容改过，都先弹一次确认——
+      // hooks 文件就在盘上、agent 也写得动它；「U 盘免信任」等于给「静默写一个文件」开持久执行后门。
+      // 放在 UserPromptSubmit 之前、且看「全部事件」：只管 PreToolUse 的 hooks 也能在这里过一次审，
+      // 不会出现「文件配了 hook 却永远等不到审批、静默不生效」的死角。
+      const untrusted = srcs.filter((s) => !allowed(s) && Object.keys(s.events).length && !hookPromptDenied.has(s.file));
+      if (untrusted.length) {
+        const files = untrusted.map((s) => s.file);
+        const lines = [];
+        for (const s of untrusted) for (const [ev, list] of Object.entries(s.events)) for (const h of list) lines.push(`${s.kind}·${ev}·${h.command} ${h.args.join(" ")}`);
+        const preview = [...new Set(lines)].slice(0, 6);
+        const reason = "项目或 U 盘自带的 hooks 会在你电脑上执行命令，先确认一次（按内容哈希记着；改了就再问）";
+        const { id: hid, done: hdone } = ctx.confirm({ tool: "hook_review", args: { 文件: files, 将执行: preview }, risk: "high", reason });
+        sse(res, { type: "confirm_request", confirmId: hid, name: "hook_review", args: { 文件: files, 将执行: preview }, risk: "high", reason });
+        const hv = await hdone;
+        const hok = hv && typeof hv === "object" ? !!hv.ok : !!hv;
+        if (hok) {
+          for (const s of untrusted) approveHook(s);
+        } else {
+          for (const f of files) hookPromptDenied.add(f);
+        }
+      }
       const matches = matchHooks(srcs, "UserPromptSubmit");
       if (matches.length) {
-        const allowed = (s) => s.trusted || hookIsTrusted(s);
-        const untrusted = matches.filter((m) => !allowed(m.source) && !hookPromptDenied.has(m.source.file));
-        if (untrusted.length) {
-          const files = [...new Set(untrusted.map((m) => m.source.file))];
-          const lines = untrusted.map((m) => `${m.source.kind}·${m.hook.command} ${m.hook.args.join(" ")}`).slice(0, 6);
-          const reason = "工作区自带的 hooks 会在你电脑上执行命令，先确认一次（按内容哈希记着；改了就再问）";
-          const { id: hid, done: hdone } = ctx.confirm({ tool: "hook_review", args: { 文件: files, 将执行: lines }, risk: "high", reason });
-          sse(res, { type: "confirm_request", confirmId: hid, name: "hook_review", args: { 文件: files, 将执行: lines }, risk: "high", reason });
-          const hv = await hdone;
-          const hok = hv && typeof hv === "object" ? !!hv.ok : !!hv;
-          if (hok) {
-            for (const m of untrusted) approveHook(m.source);
-          } else {
-            for (const f of files) hookPromptDenied.add(f);
-          }
-        }
         const hookEvents = [];
         const batch = await runHookBatch(
           matches,
@@ -806,7 +869,8 @@ async function handleChat(req, res, body) {
         if (ev.type === "usage") {
           usageTotal.input += ev.input || 0;
           usageTotal.output += ev.output || 0;
-          sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output });
+          usageTotal.cached += ev.cached || 0; // 缓存命中 tokens（各家字段不同，在 providers 里归一）
+          sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output, cached: usageTotal.cached });
           continue;
         }
         if (ev.type === "assistant_message") replyText = ev.text || replyText;
@@ -882,6 +946,10 @@ async function handleChat(req, res, body) {
   }
   // 流已关，起标题在后台跑：不拖慢这轮回复，写进 titles.json 后前端下次刷会话列表就能看到
   autoTitle(sessionId, text, replyText, provider, st).catch(() => {});
+  } catch (e) {
+    running.delete(sessionId); // 兜底（见上）：起始阶段的异常也要摘锁，再照旧交给请求级 catch 回 500
+    throw e;
+  }
 }
 
 function sendJson(res, code, obj) {
@@ -913,7 +981,16 @@ function readBody(req) {
   });
 }
 
+// 安全响应头（全体响应统一带上）：CSP 给 XSS 兜底（脚本只认同源文件——看门狗已移出内联脚本）、
+// nosniff 防内容嗅探、DENY + frame-ancestors 防被套 iframe、no-referrer 少漏 URL（审查 #15）
+const SEC_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "no-referrer",
+  "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+};
 const server = http.createServer(async (req, res) => {
+  for (const [k, v] of Object.entries(SEC_HEADERS)) res.setHeader(k, v);
   const u = new URL(req.url, "http://127.0.0.1");
   try {
     // Host 只认本机：服务只绑 127.0.0.1，但 DNS rebinding 能让恶意网页的域名解析到
@@ -1034,6 +1111,15 @@ const server = http.createServer(async (req, res) => {
         if (!fs.existsSync(patch.workspace)) return sendJson(res, 400, { error: `工作区目录不存在：${patch.workspace}` });
       }
       if (b.searchKeys !== undefined) patch.searchKeys = b.searchKeys;
+      if (b.extraRoots !== undefined) {
+        const arr = (Array.isArray(b.extraRoots) ? b.extraRoots : []).map((x) => String(x || "").trim()).filter(Boolean).slice(0, 10);
+        for (const p of arr) {
+          const abs = path.resolve(p);
+          if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) return sendJson(res, 400, { error: `额外目录不存在或不是文件夹：${abs}` });
+        }
+        patch.extraRoots = arr.map((p) => path.resolve(p));
+      }
+      if (b.proxy !== undefined) patch.proxy = String(b.proxy || "").trim().slice(0, 200);
       if (b.autoApprove !== undefined) patch.autoApprove = b.autoApprove;
       if (b.assist !== undefined) patch.assist = String(b.assist || "");
       if (b.autoCompactAt !== undefined) patch.autoCompactAt = Math.max(0, Math.min(0.95, Number(b.autoCompactAt) || 0));
@@ -1134,7 +1220,7 @@ const server = http.createServer(async (req, res) => {
       if (!rel) return sendJson(res, 400, { error: "缺少文件路径" });
       let abs;
       try {
-        abs = resolveInside([st.workspace, UA_HOME], rel, st.workspace);
+        abs = resolveInside([st.workspace, UA_HOME, ...(st.extraRoots || [])], rel, st.workspace);
       } catch (e) {
         return sendJson(res, 400, { error: e.message });
       }
@@ -1468,6 +1554,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "DELETE" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
+      if (running.has(id)) {
+        // 正在跑：顺手把这一轮停掉再拒（旧行为只回 409，前端还把失败吞了、谎报"已删除"——领导报"无法删除对话"）
+        try { running.get(id)?.abort?.abort(); } catch {}
+        return sendJson(res, 409, { error: "这个会话正在跑——已顺手帮你停止这一轮，等一两秒再点一次删除即可" });
+      }
       try {
         fs.rmSync(sessions.fileOf(id), { force: true });
       } catch {

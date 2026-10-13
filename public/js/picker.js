@@ -179,6 +179,7 @@ export function initPicker() {
       const setIdx = (v) => (isModel ? (modelIdx = v) : (modeIdx = v));
       const getIdx = () => (isModel ? modelIdx : modeIdx);
       const move = (dir) => {
+        if (!items.length) return; // 空列表按方向键：items[-1] 会抛 TypeError，弹层从此不响应（审查 #21）
         const cur = items.findIndex((b) => +b.dataset.i === getIdx());
         const next = Math.min(Math.max((cur < 0 ? 0 : cur) + dir, 0), items.length - 1);
         setIdx(+items[next].dataset.i);

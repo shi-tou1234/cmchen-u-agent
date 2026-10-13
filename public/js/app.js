@@ -46,6 +46,7 @@ function setLockUI(mode, info = {}) {
 function showLock(setup = false, info = {}) {
   setLockUI(setup ? "setup" : "unlock", info);
   $("#lock").classList.remove("hide");
+  $("#app")?.setAttribute("inert", ""); // 锁屏期间 Tab 也不许钻到后面的界面里（审查 #22）
   (setup ? $("#lkPw1") : $("#lkPw")).focus();
   if (info.cooldown > 0) startCooldown(info.cooldown);
 }
@@ -97,6 +98,7 @@ async function unlock(pw) {
     clearInterval(coolTimer);
     $("#lkGo").disabled = false;
     $("#lock").classList.add("hide");
+    $("#app")?.removeAttribute("inert");
     bootMain();
   } catch (e) {
     lockError(e.message || "密码不对");
@@ -115,6 +117,8 @@ async function unlock(pw) {
 
 /* ================= 会话侧栏 ================= */
 let allSessions = [];
+let sessSelect = null; // 批量管理模式：null = 关闭；Set = 已勾选的会话 id
+let sessVisible = []; // 当前列表里渲染出来的（搜索过滤后的）会话
 
 async function refreshSessions() {
   try { allSessions = await api.sessions(); } catch { return; }
@@ -124,10 +128,32 @@ async function refreshSessions() {
 function renderSessionList() {
   const box = $("#sessList");
   const q = $("#sessSearch").value.trim().toLowerCase();
-  const list = allSessions.filter((s) => !s.id.startsWith("sub-")).filter((s) => {
-    if (!q) return true;
-    return (s.title || "").toLowerCase().includes(q);
-  }).slice(0, 50);
+  const list = allSessions
+    .filter((s) => !s.id.startsWith("sub-"))
+    .filter((s) => {
+      if (!q) return true;
+      return (s.title || "").toLowerCase().includes(q);
+    })
+    // 排序纪律（学 ZCode）：运行中的会话钉最前；其余按时间倒序；时间相同用 id 兜底——
+    // 不能让流式事件频繁改 mtime 时两行来回跳
+    .sort((a, b) => {
+      const runA = a.id === S.sessionId && S.sending ? 1 : 0;
+      const runB = b.id === S.sessionId && S.sending ? 1 : 0;
+      if (runA !== runB) return runB - runA;
+      if (b.mtime !== a.mtime) return b.mtime - a.mtime;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    })
+    .slice(0, 50);
+  sessVisible = list;
+  const managing = !!sessSelect;
+  const ops = $("#sessOps");
+  ops.classList.toggle("man", managing);
+  if (managing) {
+    $("#sessOpsN").textContent = "已选 " + sessSelect.size;
+    $("#sessOpsAll").textContent = list.length && sessSelect.size >= list.length ? "取消全选" : "全选";
+    $("#sessOpsDel").disabled = !sessSelect.size;
+    $("#sessOpsExport").disabled = !sessSelect.size;
+  }
 
   refreshSessionCount(allSessions.filter((s) => !s.id.startsWith("sub-")).length);
   if (!list.length) {
@@ -140,13 +166,11 @@ function renderSessionList() {
   const today = list.filter((s) => isToday(s.mtime));
   const older = list.filter((s) => !isToday(s.mtime));
 
-  const row = (s) => `<div class="sess ${s.id === S.sessionId ? "on" : ""}" data-id="${esc(s.id)}">
-      ${icon("message", "ic ic-sm")}
+  const row = (s) => `<div class="sess ${s.id === S.sessionId ? "on" : ""} ${managing ? "man" : ""} ${sessSelect?.has(s.id) ? "sel" : ""}" data-id="${esc(s.id)}">
+      ${managing ? `<span class="sess-check">${sessSelect.has(s.id) ? "✓" : ""}</span>` : icon("message", "ic ic-sm")}
       <span class="t" title="${esc(s.title || "新会话")}">${esc(s.title || "新会话")}</span>
-      <span class="acts">
-        <button data-act="rename" title="重命名">${icon("pen", "ic ic-sm")}</button>
-        <button data-act="del" class="del" title="删除">${icon("trash", "ic ic-sm")}</button>
-      </span>
+      <span class="acts">${managing ? "" : `<button data-act="rename" title="重命名">${icon("pen", "ic ic-sm")}</button>
+        <button data-act="del" class="del" title="删除">${icon("trash", "ic ic-sm")}</button>`}</span>
     </div>`;
 
   box.innerHTML =
@@ -156,13 +180,75 @@ function renderSessionList() {
   $$(".sess", box).forEach((n) => {
     const id = n.dataset.id;
     n.onclick = (e) => {
+      if (sessSelect) {
+        // 批量模式：点哪条就勾哪条
+        sessSelect.has(id) ? sessSelect.delete(id) : sessSelect.add(id);
+        renderSessionList();
+        return;
+      }
       const act = e.target.closest("[data-act]");
       if (act) return;
       loadSession(id);
     };
-    n.querySelector('[data-act="rename"]').onclick = (e) => { e.stopPropagation(); renameRow(n, id); };
-    n.querySelector('[data-act="del"]').onclick = (e) => { e.stopPropagation(); deleteRow(n, id); };
+    if (!managing) {
+      n.querySelector('[data-act="rename"]').onclick = (e) => { e.stopPropagation(); renameRow(n, id); };
+      n.querySelector('[data-act="del"]').onclick = (e) => { e.stopPropagation(); deleteRow(n, id); };
+    }
   });
+}
+
+function setManage(on) {
+  sessSelect = on ? new Set() : null;
+  renderSessionList();
+}
+
+async function deleteSelectedSessions() {
+  const ids = [...(sessSelect || [])];
+  if (!ids.length) return;
+  if (!confirm(`删除选中的 ${ids.length} 条会话？不可恢复（它们对应的检查点也会一起清掉）`)) return;
+  const failedIds = new Set();
+  for (const id of ids) await api.dropSession(id).catch(() => { failedIds.add(id); }); // 失败不许吞：如实汇报
+  const touchedCurrent = ids.includes(S.sessionId) && !failedIds.has(S.sessionId);
+  sessSelect.clear();
+  toast(
+    failedIds.size ? `${ids.length - failedIds.size} 条已删除，${failedIds.size} 条没删掉（可能还在跑：先停止再删）` : `已删除 ${ids.length} 条会话`,
+    failedIds.size ? "err" : "ok"
+  );
+  if (touchedCurrent) { S.sessionId = null; newChat(); }
+  else refreshSessions();
+  renderSessionList();
+}
+
+// 导出所选会话：合并成一个 Markdown 文件下载（对话正文 + 工具调用的简要行）
+async function exportSelectedSessions() {
+  const ids = [...(sessSelect || [])];
+  if (!ids.length) return toast("先勾几条会话再导出", "err");
+  const parts = ["# u-agent 会话导出", `> ${new Date().toLocaleString("zh-CN")} · 共 ${ids.length} 条`, ""];
+  let done = 0;
+  for (const id of ids) {
+    const meta = allSessions.find((x) => x.id === id);
+    let j;
+    try { j = await api.session(id); } catch { continue; }
+    done++;
+    parts.push("---", "", `## ${meta?.title || id}`, `> ${new Date(meta?.mtime || Date.now()).toLocaleString("zh-CN")}`, "");
+    for (const ev of j.events || []) {
+      if (ev.type === "user" && !ev.auto) parts.push("**你：**", "", ev.text || "", "");
+      else if (ev.type === "assistant_message" && ev.text) parts.push("**u-agent：**", "", ev.text, "");
+      else if (ev.type === "tool_call") {
+        const hint = String(ev.args?.path || ev.args?.command || ev.args?.query || "").slice(0, 80);
+        parts.push(`- 工具 \`${ev.name}\`${hint ? " " + hint : ""}`);
+      } else if (ev.type === "plan" && ev.items?.length) parts.push(`- 计划：${ev.items.map((i) => i.step).join(" / ").slice(0, 200)}`);
+    }
+    parts.push("");
+  }
+  if (!done) return toast("这些会话读不出来", "err");
+  const blob = new Blob([parts.join("\n")], { type: "text/markdown;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `u-agent-会话导出-${new Date().toISOString().slice(0, 10)}.md`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  toast(`已导出 ${done} 条会话（Markdown）`, "ok");
 }
 
 function renameRow(node, id) {
@@ -197,24 +283,37 @@ function deleteRow(node, id) {
   cur.querySelector('[data-act="del"]').onclick = async (e) => {
     e.stopPropagation();
     clearTimeout(timer);
-    await api.dropSession(id).catch(() => {});
+    try {
+      await api.dropSession(id);
+    } catch (err) {
+      // 说真话：删失败就把原因摆出来（原先 catch 吞掉还谎报"已删除"——领导报"无法删除对话"的一半在这）
+      cur.dataset.confirm = "";
+      refreshSessions();
+      toast(err?.message || "删除失败", "err");
+      return;
+    }
     if (id === S.sessionId) newChat();
     else refreshSessions();
     toast("会话已删除", "ok");
   };
 }
 
+let loadSeq = 0; // 快速连点切换会话：只认最后一次请求的结果，过期响应丢掉（审查 #24 串台）
 async function loadSession(id) {
   if (S.sending) return;
+  const mySeq = ++loadSeq;
   try {
     const j = await api.session(id, S.provider || S.active);
+    if (mySeq !== loadSeq) return; // 已经又切到别的会话了，这份结果作废
     S.sessionId = id;
     S.tokens = { input: 0, output: 0 };
     if (j.budget) S.budget = j.budget;
     if (j.context) S.context = j.context;
-    chat.renderHistory(j.events);
-    chat.renderUsage();
-    const hit = allSessions.find((s) => s.id === id);
+  chat.renderHistory(j.events);
+  chat.renderUsage();
+  chat.restoreDraft(); // 草稿按会话隔离：切过来先把自己那份填回去（v9.10）
+  chat.clearAttachments(); // 附件不跟会话跑：A 会话贴的图不许静默带进 B（审查 #18）
+  const hit = allSessions.find((s) => s.id === id);
     setTitle(hit?.title || "新会话");
     refreshSessions();
   } catch (e) { toast(e.message, "err"); }
@@ -235,6 +334,8 @@ function newChat() {
   chat.clearStream();
   chat.renderWelcome("工作区：" + (S.workspace || "还没设置，去左下角「设置」里挑一个"));
   chat.renderUsage();
+  chat.restoreDraft(); // 新会话的草稿位（v9.10）
+  chat.clearAttachments(); // 附件不跨会话（审查 #18）
   refreshSessions();
   $("#sessList .sess")?.classList.remove("on");
   $("#txt").focus();
@@ -265,6 +366,7 @@ async function bootMain() {
       (info ? ` · ${info.hostname} 上已就绪` : "")
   );
   chat.renderUsage();
+  chat.restoreDraft(); // 开机把「新会话」的草稿填回来（v9.10；按会话隔离，别的会话切过去时各自恢复）
 
   if (!S.workspace) {
     setTimeout(() => openSettings({ panel: "general" }).catch(() => {}), 350);
@@ -275,20 +377,47 @@ function bindGlobal() {
   // 导航
   $("#newChat").onclick = newChat;
   $("#sessSearch").addEventListener("input", renderSessionList);
+  $("#sessManage").onclick = () => setManage(!sessSelect);
+  $("#sessOpsDone").onclick = () => setManage(false);
+  $("#sessOpsDel").onclick = () => deleteSelectedSessions();
+  $("#sessOpsExport").onclick = () => exportSelectedSessions();
+  $("#sessOpsAll").onclick = () => {
+    if (!sessSelect) return;
+    if (sessSelect.size >= sessVisible.length) sessSelect.clear();
+    else for (const s of sessVisible) sessSelect.add(s.id);
+    renderSessionList();
+  };
   $("#gearBtn").onclick = () => openSettings();
   $("#gearTop").onclick = () => openSettings();
-  $("#menuBtn").onclick = () => $("#sidebar").classList.toggle("open");
+  // 侧栏收起/展开：桌面点左上菜单键直接收起整列（状态记本地）；窄屏仍走抽屉
+  try { if (localStorage.getItem("ua_side") === "hidden") $("#app").classList.add("side-hidden"); } catch {}
+  $("#menuBtn").onclick = () => {
+    if (window.innerWidth <= 900) return $("#sidebar").classList.toggle("open");
+    const app = $("#app");
+    app.classList.toggle("side-hidden");
+    try { localStorage.setItem("ua_side", app.classList.contains("side-hidden") ? "hidden" : "show"); } catch {}
+  };
   document.addEventListener("click", (e) => {
     if (window.innerWidth > 900) return;
     if (e.target.closest("#sidebar") || e.target.closest("#menuBtn")) return;
     $("#sidebar").classList.remove("open");
   });
 
-  // 快捷键
+  // 快捷键（v9.11 扩充：命令台 / 查找 / 侧栏 / 快捷键表 + Esc 链）
   document.addEventListener("keydown", (e) => {
     const mod = e.ctrlKey || e.metaKey;
-    if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); $("#txt").focus(); }
-    if (mod && e.shiftKey && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
+    if (mod && !e.shiftKey && e.key.toLowerCase() === "k") { e.preventDefault(); return chat.openCmdk(); }
+    if (mod && !e.shiftKey && e.key.toLowerCase() === "f") { e.preventDefault(); return chat.openFind(); }
+    if (mod && !e.shiftKey && e.key.toLowerCase() === "b") { e.preventDefault(); return $("#menuBtn").click(); }
+    if (mod && (e.key === "/" || e.key === "?")) { e.preventDefault(); return chat.openKeysHelp(); }
+    if (mod && e.shiftKey && e.key.toLowerCase() === "n") { e.preventDefault(); return newChat(); }
+    if (e.key === "Escape") {
+      // 设置面板族自己处理 Esc
+      if (!$("#setRoot")?.hidden || !$("#dirRoot")?.hidden || !$("#wizRoot")?.hidden) return;
+      if (chat.closeOverlays()) return;
+      if (sessSelect) return setManage(false);
+      if (S.sending && !$("#txt").value.trim()) chat.abortRun(); // 没有浮层可关 + 正在跑 = 停止这一轮
+    }
   });
 
   window.addEventListener("ua:sessions-cleared", () => { S.sessionId = null; newChat(); });

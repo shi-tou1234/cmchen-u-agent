@@ -5,14 +5,14 @@ export const MODES = [
   { id: "auto", name: "自动审批", short: "自动", icon: "sparkle", desc: "常规读写直接放行；删除文件、运行命令这类高危操作仍会被拦下。" },
   { id: "plan", name: "先出计划", short: "计划", icon: "book", desc: "只做只读调研，先给一份步骤清单，你点头后再动手。" },
   { id: "readonly", name: "只读", short: "只读", icon: "file", desc: "完全不动文件系统，适合先摸清陌生项目的底细。" },
-  { id: "full", name: "完全权限", short: "完全", icon: "alert", desc: "删除、运行命令都不再询问。风险自负，全量记在会话日志里。" },
+  { id: "full", name: "完全权限", short: "完全", icon: "alert", desc: "文件不限工作区（任意路径可读写），删除、运行命令也都不再询问。风险自负，全量记在会话日志里。" },
 ];
 export const MODE_HINT = {
   confirm: "谨慎模式：动到文件会先问你一句 · Enter 发送 · Shift+Enter 换行 · / 看命令",
   readonly: "只读模式：只读不写，任何改动都会被拒绝",
   plan: "计划模式：只调研、只出方案，不会动手改东西",
   auto: "自动审批：常规操作直接做，删除和运行命令仍会拦下",
-  full: "完全权限：删除文件、运行命令都不再询问，请确认你在做什么",
+  full: "完全权限：文件不限工作区、删除与命令都不再询问，请确认你在做什么",
 };
 
 // 自动放行的细粒度开关：与 core/modes.mjs 的 ACTION_META 一一对应。

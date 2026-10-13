@@ -46,3 +46,18 @@ export function writeJson(file, obj) {
 export function isWindows() {
   return process.platform === "win32";
 }
+
+// 文本解码：先严格 UTF-8，失败按 GBK（中文 Windows 的 .txt/.bat/.ini 常见）。
+// 与 shellutil 的输出解码同一思路——文件工具原先硬编码 utf8，GBK 文件读出来是乱码、
+// 再写回就把内容永久弄坏了（审查 #3）。返回 { text, enc }，enc 供写回提示用。
+export function decodeTextSmart(buf) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  try {
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(b), enc: "utf-8" };
+  } catch {}
+  try {
+    return { text: new TextDecoder("gbk").decode(b), enc: "gbk" };
+  } catch {
+    return { text: b.toString("utf8"), enc: "utf-8?" };
+  }
+}
