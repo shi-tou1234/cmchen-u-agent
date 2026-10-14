@@ -6,6 +6,7 @@ import { initTheme } from "./theme.js";
 import * as chat from "./chat.js";
 import { initPicker } from "./picker.js";
 import { initSettings, openSettings, refreshSessionCount } from "./settings.js";
+import { initLang, setLang, getLang, t } from "./i18n.js";
 
 /* ================= 密码锁 =================
    密码存在 U 盘 data\lock.json：跟盘走、不跟机器走。同一只盘插到任何电脑都是同一个密码，
@@ -18,11 +19,11 @@ function setLockUI(mode, info = {}) {
   $("#lkWrap1").hidden = !setup;
   $("#lkWrap2").hidden = !setup;
   $("#lkWrap").hidden = setup;
-  $("#lkTitle").textContent = setup ? "给这只盘设一个密码" : "输入密码解锁";
+  $("#lkTitle").textContent = setup ? t("lock.setTitle") : t("lock.unlock");
   $("#lkSub").textContent = setup
     ? "这只盘还没设过密码——现在设置的人就是它的主人，之后插到任何电脑都要输这个密码。"
     : "所有配置与会话都留在这只 U 盘里，换台电脑不用重配";
-  $("#lkGo").textContent = setup ? "保存并进入" : "解锁";
+  $("#lkGo").textContent = setup ? t("lock.setBtn") : t("lock.unlockBtn");
 
   // 盘的状态提示：让人一眼看出「这是别人的盘 / 新盘」，不是每台机器重设一次
   const note = $("#lkDisk");
@@ -157,7 +158,7 @@ function renderSessionList() {
 
   refreshSessionCount(allSessions.filter((s) => !s.id.startsWith("sub-")).length);
   if (!list.length) {
-    box.innerHTML = `<div class="sess-empty">${q ? "没找到匹配的会话" : "还没有会话。<br>在上面输入框说句话就开始了。"}</div>`;
+    box.innerHTML = `<div class="sess-empty">${q ? t("side.noMatch") : t("side.empty") + "<br>" + t("side.emptyHint")}</div>`;
     return;
   }
 
@@ -332,7 +333,7 @@ function newChat() {
   S.tokens = { input: 0, output: 0 };
   setTitle("新会话");
   chat.clearStream();
-  chat.renderWelcome("工作区：" + (S.workspace || "还没设置，去左下角「设置」里挑一个"));
+  chat.renderWelcome();
   chat.renderUsage();
   chat.restoreDraft(); // 新会话的草稿位（v9.10）
   chat.clearAttachments(); // 附件不跨会话（审查 #18）
@@ -351,7 +352,7 @@ async function bootMain() {
 
   let info = null;
   try { info = await api.info(); } catch {}
-  if (info) $("#sideMeta").innerHTML = `<span class="dot"></span>${esc(info.hostname)} · ${info.tools} 个工具`;
+  if (info) $("#sideMeta").innerHTML = `<span class="dot"></span>${esc(info.hostname)} · ${t("side.tools", { n: info.tools })}`;
   chat.refreshCustomCommands(); // 自定义命令与技能（开机拉一次）
   try {
     const st = await api.settings();
@@ -361,10 +362,7 @@ async function bootMain() {
     S.assist = st.assist || "";
   } catch (e) { toast(e.message, "err"); }
 
-  chat.renderWelcome(
-    (S.workspace ? "工作区：" + S.workspace : "还没设置工作区，点左下角「设置」挑一个文件夹") +
-      (info ? ` · ${info.hostname} 上已就绪` : "")
-  );
+  chat.renderWelcome();
   chat.renderUsage();
   chat.restoreDraft(); // 开机把「新会话」的草稿填回来（v9.10；按会话隔离，别的会话切过去时各自恢复）
 
@@ -389,6 +387,7 @@ function bindGlobal() {
   };
   $("#gearBtn").onclick = () => openSettings();
   $("#gearTop").onclick = () => openSettings();
+  // （#sbWs 工作区胶囊的点击绑在 picker.js：点开就是换工作区的面板，不再直接跳设置）
   // 侧栏收起/展开：桌面点左上菜单键直接收起整列（状态记本地）；窄屏仍走抽屉
   try { if (localStorage.getItem("ua_side") === "hidden") $("#app").classList.add("side-hidden"); } catch {}
   $("#menuBtn").onclick = () => {
@@ -424,7 +423,10 @@ function bindGlobal() {
   window.addEventListener("ua:open-session", (e) => { if (e.detail?.id) loadSession(e.detail.id); });
   window.addEventListener("ua:open-settings", (e) => openSettings({ panel: e.detail?.panel }));
   window.addEventListener("ua:autoapprove-change", () => chat.renderAutoApproveBar());
-  window.addEventListener("ua:settings-saved", () => chat.refreshWelcomeNote());
+  window.addEventListener("ua:settings-saved", () => {
+    chat.refreshWelcomeNote(); // 工作区那颗胶囊要跟着变
+    chat.refreshCustomCommands(); // 工作区换了：命令/技能清单来自 .agent，得重拉
+  });
   S.onSessionTouched = () => refreshSessions();
 }
 
@@ -465,6 +467,7 @@ async function selfCheck() {
     showLock(false);
   };
   const steps = [
+    ["界面语言", initLang],
     ["主题", initTheme],
     ["对话区", chat.initChat],
     ["设置面板", initSettings],

@@ -59,7 +59,9 @@ export function md(src) {
   let para = [], quote = [], list = null, table = [];
 
   const flushPara = () => {
-    if (para.length) { out.push(`<p>${inline(para.join("<br>"))}</p>`); para = []; }
+    // 段内软换行：先按行 inline（转义在里面），再用真 <br> 连起来——
+    // 直接把 "<br>" join 进去再 inline 的话，会被 esc() 转成 &lt;br&gt;，页面上冒出字面 "<br>"（v9.14 修）
+    if (para.length) { out.push(`<p>${para.map((l) => inline(l)).join("<br>")}</p>`); para = []; }
   };
   const flushQuote = () => {
     if (quote.length) { out.push(`<blockquote>${mdLite(quote.join("\n"))}</blockquote>`); quote = []; }
@@ -91,9 +93,11 @@ export function md(src) {
   const flushAll = () => { flushPara(); flushQuote(); flushList(); flushTable(); };
 
   for (const raw of lines) {
-    const line = raw.replace(/\s+$/, "");
+    const line = raw.replace(/\s+$/,"");
     const codeMark = /^\u0000CODE(\d+)\u0000$/.exec(line.trim());
-    if (codeMark) { flushAll(); continue; }
+    // 代码块的占位符要真的推进 out：原来这儿只 flush 了一下就 continue，
+    // 占位符没进 out，结尾那次 replace 自然找不到它——整段代码就这样被吞了（v9.14 修）
+    if (codeMark) { flushAll(); out.push(line.trim()); continue; }
     if (!line.trim()) { flushAll(); continue; }
 
     const h = /^(#{1,6})\s+(.*)$/.exec(line);
@@ -127,8 +131,11 @@ export function md(src) {
 }
 
 function mdLite(src) {
-  // 引用块内部：简单按行包 <p>
-  return src.split(/\n{2,}/).map((p) => `<p>${inline(p)}</p>`).join("");
+  // 引用块内部：先按空行切段，段内软换行同样保留成 <br>（跟正文一个口径）
+  return src
+    .split(/\n{2,}/)
+    .map((p) => `<p>${p.split("\n").map((l) => inline(l)).join("<br>")}</p>`)
+    .join("");
 }
 
 function inline(s) {

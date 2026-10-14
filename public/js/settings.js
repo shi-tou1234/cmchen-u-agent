@@ -4,13 +4,15 @@ import { api } from "./api.js";
 import { S, setMode, MODES, ACTION_META, DEFAULT_AUTO_APPROVE } from "./state.js";
 import { $, $$, el, esc, icon, toast } from "./ui.js";
 import { fillProviders, showThinking, setShowThinking, refreshCustomCommands, doCheck } from "./chat.js";
-import { brandChip, chipOf } from "./picker.js";
+import { brandChip, chipOf, providerReady } from "./picker.js";
 import { notifyOn, setNotifyOn, askPermission, notifyGranted } from "./notify.js";
 import { CATALOG, GROUPS, providerFromPreset, presetById, matchPreset, protocolForModel, normalizeBaseURL } from "./catalog.js";
+import { t, getLang, setLang } from "./i18n.js";
 
 const PANELS = [
   { id: "general", label: "通用", icon: "monitor" },
   { id: "models", label: "模型", icon: "sparkle" },
+  { id: "persona", label: "人格", icon: "pen" },
   { id: "perm", label: "权限", icon: "shield" },
   { id: "memory", label: "记忆", icon: "brain" },
   { id: "web", label: "联网", icon: "globe" },
@@ -20,23 +22,36 @@ const PANELS = [
 ];
 
 const PROTOCOLS = [
-  ["mock", "离线演示（不用联网）"],
+  ["mock", "离线向导（不用联网）"],
   ["openai-chat", "OpenAI 兼容 · chat"],
   ["openai-responses", "OpenAI · responses"],
   ["anthropic", "Anthropic · messages"],
 ];
-const protoLabel = (v) => ({ mock: "离线演示", "openai-chat": "OpenAI 兼容", "openai-responses": "Responses", anthropic: "Anthropic" }[v] || v);
+const protoLabel = (v) => ({ mock: "离线向导", "openai-chat": "OpenAI 兼容", "openai-responses": "Responses", anthropic: "Anthropic" }[v] || v);
 
 let provs = [];
 let expanded = -1;
 let dirty = false;
 let onSaved = null;
-let extraRoots = []; // 额外可访问的目录（先存内存，点保存才写盘）
+let extraRoots = []; // 额外可访问的目录（先存内存，改动后自动写盘）
 let dirPickTarget = "ws"; // 目录选择器这次给谁挑：「ws」工作区 / 「extra」额外目录
+let autoSaveTimer = null;
 
+// 底部那行提示：既能报"会自动保存"，也能报保存结果/失败
+const dirtyTip = (text, cls = "") => {
+  const el = $("#dirtyHint");
+  if (!el) return;
+  el.className = "dirty" + (cls ? " " + cls : "");
+  el.textContent = text || "";
+  el.hidden = !text;
+};
+
+// 改动 = 自动排一次保存（领导要的：设置里不用再点「保存」）。停手 700ms 写一次盘。
 const markDirty = () => {
   dirty = true;
-  $("#dirtyHint").hidden = false;
+  dirtyTip(t("set.autoSaving"));
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(() => save({ auto: true }), 700);
 };
 
 // 开关改动先只落在内存里（点底部「保存」才写盘），但输入区状态条要立刻反映
@@ -45,10 +60,12 @@ const broadcastAA = () => window.dispatchEvent(new CustomEvent("ua:autoapprove-c
 /* ================= 打开 / 关闭 ================= */
 export function openSettings(opts = {}) {
   onSaved = opts.onSaved || null;
-  return loadAll().then(() => {
-    $("#setRoot").hidden = false;
-    selectPanel(opts.panel || "general");
-  });
+  return loadAll()
+    .then(() => loadPersona().catch(() => {}))
+    .then(() => {
+      $("#setRoot").hidden = false;
+      selectPanel(opts.panel || "general");
+    });
 }
 
 function closeSettings() {
@@ -59,10 +76,11 @@ function closeSettings() {
 
 async function loadAll() {
   dirty = false;
-  $("#dirtyHint").hidden = true;
+  dirtyTip(t("set.autoSaved")); // 常驻一句：告诉用户不用点「保存」
   try {
     const st = await api.settings();
     S.workspace = st.workspace || "";
+    S.voice = st.voice || { length: "default", style: "default", lang: "default" };
     $("#wsInput").value = S.workspace;
     wsHint();
     extraRoots = Array.isArray(st.extraRoots) ? [...st.extraRoots] : [];
@@ -186,6 +204,7 @@ function selectPanel(id) {
   $$("#setContent .panel").forEach((p) => (p.hidden = p.dataset.panel !== id));
   if (id === "mcp") refreshMcpPanel().catch(() => {});
   if (id === "security") refreshPermSaved().catch(() => {});
+  if (id === "persona") loadPersona().catch(() => {}); // 面板打开时刷新（文件可能被外面改过）
 }
 
 /* ================= 扩展（MCP） ================= */
@@ -239,7 +258,8 @@ async function refreshPermSaved() {
 }
 
 /* ================= 通道卡片 ================= */
-const isReady = (p) => (p.protocol === "mock" ? true : !!(p.baseURL && p.model && p.secret));
+// 能用的口径和弹层/服务端一致（picker.js 的 providerReady）：mock、地址+模型+钥匙，或本机/免钥匙的
+const isReady = (p) => providerReady(p);
 const stateLabel = (p) => {
   if (p.protocol === "mock") return { text: "离线可用", cls: "ok" };
   const pre = matchPreset(p);
@@ -678,25 +698,110 @@ function wizSave() {
   renderProviders();
   markDirty();
   $("#wizRoot").hidden = true;
-  toast(usable ? `已添加「${name}」并切到它，点底部保存生效` : `已添加「${name}」，记得点底部保存`, "ok");
+  toast(usable ? `已添加「${name}」并切到它（设置会自动保存）` : `已添加「${name}」（设置会自动保存）`, "ok");
 }
 
-/* ================= 保存 ================= */
-async function save() {
+/* ================= 人格与表达风格 ================= */
+// 学 openhanako 的做法：人格是一份跟着盘走的正文（data/persona.md）+ 几个风格档；
+// 预设文案只从服务端拿（core/persona.mjs 一处维护），前端不抄一份。
+let personaMeta = null;
+let personaTimer = null;
+
+async function loadPersona() {
+  const j = await api.persona();
+  personaMeta = j;
+  S.voice = j.voice || { length: "default", style: "default", lang: "default" };
+  const box = $("#personaBox");
+  if (box && document.activeElement !== box) box.value = j.text || "";
+  fillVoiceSelects();
+  renderPersonaPresets();
+}
+
+const personaLang = () => (($("#vLang") && $("#vLang").value) === "en" ? "en" : "zh");
+const uiLang = () => getLang();
+const pickLabel = (x) => (uiLang() === "en" && x.labelEn ? x.labelEn : x.label);
+
+function renderPersonaPresets() {
+  const box = $("#personaPresets");
+  if (!box || !personaMeta) return;
+  box.innerHTML =
+    `<button class="chip" data-id="">默认（不设定）</button>` +
+    personaMeta.presets.map((p) => `<button class="chip" data-id="${esc(p.id)}">${esc(pickLabel(p))}</button>`).join("");
+  // 当前正文和哪个预设对得上就把哪颗点亮（用户手改过就都不亮）
+  const cur = ($("#personaBox")?.value || "").trim();
+  $$(".chip", box).forEach((b) => {
+    const pre = personaMeta.presets.find((x) => x.id === b.dataset.id);
+    const hit = !b.dataset.id ? !cur : cur && [pre.zh, pre.en].some((t) => t.trim() === cur);
+    b.classList.toggle("on", !!hit);
+    b.onclick = () => {
+      const t = $("#personaBox");
+      t.value = pre ? pre[personaLang()] : "";
+      $$(".chip", box).forEach((x) => x.classList.toggle("on", x === b));
+      schedulePersonaSave();
+    };
+  });
+}
+
+function fillVoiceSelects() {
+  if (!personaMeta) return;
+  const mk = (sel, list, cur, defLabel) => {
+    const el = $(sel);
+    if (!el) return;
+    el.innerHTML = [{ id: "default", label: defLabel }, ...list].map((x) => `<option value="${x.id}">${esc(pickLabel(x))}</option>`).join("");
+    el.value = cur || "default";
+  };
+  const v = S.voice || {};
+  mk("#vLength", personaMeta.lengths, v.length, "默认（不限制）");
+  mk("#vStyle", personaMeta.styles, v.style, "默认（不干预）");
+  mk("#vLang", personaMeta.langs, v.lang, "默认（跟随对方）");
+}
+
+function schedulePersonaSave() {
+  clearTimeout(personaTimer);
+  const state = $("#personaState");
+  if (state) state.textContent = "改动会自动保存…";
+  personaTimer = setTimeout(async () => {
+    try {
+      const j = await api.savePersona($("#personaBox").value);
+      if (state) state.textContent = "已保存到 U 盘 data\\persona.md（" + j.chars + " 字）";
+    } catch (e) {
+      if (state) state.textContent = "保存失败：" + e.message;
+    }
+  }, 600);
+}
+
+/* ================= 保存（手动点按钮 / 改动后自动） ================= */
+// auto=true 时：不出成功 toast、不弹 confirm，失败只写在底部提示行里——打字打到一半不能弹窗打断
+async function save(opts = {}) {
+  const auto = !!opts.auto;
+  clearTimeout(autoSaveTimer);
   const cards = $$("#provList .prov");
   cards.forEach((n, ix) => readRow(n, provs[ix]));
 
-  if (!provs.length) return toast("至少要留一条通道", "err");
+  const bail = (msg) => {
+    dirty = true;
+    if (auto) dirtyTip(t("set.saveFailed", { msg }), "bad");
+    else toast(msg, "err");
+  };
+  if (!provs.length) return bail("至少要留一条通道");
   const names = provs.map((p) => p.name);
-  if (new Set(names).size !== names.length) return toast("通道名称重复了，请改一下", "err");
-  if (S.workspace !== $("#wsInput").value.trim() && !$("#wsInput").value.trim()) {
+  if (new Set(names).size !== names.length) return bail("通道名称重复了，请改一下");
+
+  // 工作区路径：改了才校验（目录得真的存在，服务端也会再查一遍）。
+  // 校验不过这一次就先不写它——不能因为一个还没打完的路径，把整份设置的自动保存卡住。
+  const ws = $("#wsInput").value.trim();
+  let wsOk = ws === S.workspace;
+  if (!wsOk) {
+    if (!ws) wsOk = false;
+    else wsOk = await api.browse(ws).then(() => true).catch(() => false);
+  }
+  if (!wsOk && !auto) {
     if (!confirm("还没选工作区，agent 就没有能动手的目录。仍要保存吗？")) return;
   }
 
   const body = {
     providers: provs,
     active: S.active || provs[0]?.name,
-    workspace: $("#wsInput").value.trim(),
     searchKeys: { tavily: $("#kTavily").value.trim(), brave: $("#kBrave").value.trim() },
     proxy: $("#kProxy").value.trim(),
     extraRoots,
@@ -704,7 +809,10 @@ async function save() {
     assist: $("#assistSel").value || "",
     autoCompactAt: Number($("#autoCompactSel").value) || 0,
     checks: { test: $("#chkTest").value.trim(), lint: $("#chkLint").value.trim(), auto: $("#chkAuto").checked },
+    voice: S.voice, // 人格风格三档（默认/简短/详细 等）
   };
+  if (wsOk) body.workspace = ws;
+
   const btn = $("#saveSet");
   btn.disabled = true;
   try {
@@ -715,21 +823,25 @@ async function save() {
     S.assist = st.assist || "";
     renderAutoApprove();
     broadcastAA();
-    $("#wsInput").value = S.workspace;
-    wsHint();
+    if (wsOk) {
+      $("#wsInput").value = S.workspace;
+      wsHint();
+    }
     extraRoots = Array.isArray(st.extraRoots) ? [...st.extraRoots] : extraRoots;
     renderExtraRoots();
     $("#kProxy").value = st.proxy || "";
     dirty = false;
-    $("#dirtyHint").hidden = true;
+    dirtyTip(wsOk ? t("set.saved") : t("set.saved") + "（工作区路径不存在，先没写进去）", wsOk ? "ok" : "bad");
+    if (!auto) toast("已保存到 U 盘", "ok");
     refreshCustomCommands(); // 工作区可能换了，命令/技能清单跟着刷新
     renderCustomInfo();
-    toast("已保存到 U 盘", "ok");
     onSaved && onSaved(st);
     // 工作区/通道变了，欢迎页那句提示要跟着改
     window.dispatchEvent(new CustomEvent("ua:settings-saved", { detail: st }));
   } catch (e) {
-    toast(e.message, "err");
+    dirty = true;
+    if (auto) dirtyTip(t("set.saveFailed", { msg: e.message }), "bad");
+    else toast(e.message, "err");
   } finally {
     btn.disabled = false;
   }
@@ -754,6 +866,14 @@ async function browseDir(p) {
   } catch (e) {
     list.innerHTML = `<div class="dir-empty">${esc(e.message)}</div>`;
   }
+}
+
+/* 目录浏览器入口：设置里的两个按钮 + 对话栏那颗「工作区」胶囊都走这里
+   target："ws" 选中写进设置面板的输入框（还得按保存）·"extra" 加额外目录 ·"ws-live" 选完立刻生效 */
+export function openDirBrowser(target = "ws", startPath = "") {
+  dirPickTarget = target;
+  $("#dirRoot").hidden = false;
+  browseDir(startPath || S.workspace || "");
 }
 
 /* ================= 权限 ================= */
@@ -813,15 +933,33 @@ export function initSettings() {
   $("#setNav").innerHTML = PANELS.map(
     (p, i) =>
       `${i === 0 ? '<div class="nav-sep">基础</div>' : i === 3 ? '<div class="nav-sep">能力</div>' : ""}` +
-      `<button data-panel="${p.id}">${icon(p.icon, "ic ic-sm")}${p.label}</button>`
+      `<button data-panel="${p.id}">${icon(p.icon, "ic ic-sm")}${t("set.nav." + p.id)}</button>`
   ).join("");
   $$("#setNav button").forEach((b) => (b.onclick = () => selectPanel(b.dataset.panel)));
   selectPanel("general");
 
-  $("#setRoot").addEventListener("click", (e) => { if (e.target.dataset.close) closeSettings(); });
-  $("#dirRoot").addEventListener("click", (e) => { if (e.target.dataset.close) $("#dirRoot").hidden = true; });
-  $("#wizRoot").addEventListener("click", (e) => { if (e.target.dataset.close) $("#wizRoot").hidden = true; });
+  // 点 X、点「取消/关闭」、点背景遮罩都关面板。
+  // 注意用 closest("[data-close]")：点 X 时事件目标是里面的 <svg>/<path>，不是按钮本身——
+  // 原来只认 e.target.dataset.close，点在图标线条上就关不掉了（领导 2026-10-14 点出来的）
+  for (const [root, close] of [
+    ["#setRoot", closeSettings],
+    ["#dirRoot", () => ($("#dirRoot").hidden = true)],
+    ["#wizRoot", () => ($("#wizRoot").hidden = true)],
+  ]) {
+    $(root).addEventListener("click", (e) => {
+      if (e.target.closest("[data-close]")) close();
+    });
+  }
   $("#setCancel").onclick = closeSettings;
+  // 界面语言：只存这台电脑（localStorage）；切完刷新一次，让空态首屏/状态条/会话列表这些渲染时取词的区域一起对齐
+  const langSel = $("#langSel");
+  if (langSel) {
+    langSel.value = getLang();
+    langSel.onchange = () => {
+      const changed = setLang(langSel.value);
+      if (changed) setTimeout(() => location.reload(), 120);
+    };
+  }
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (!$("#wizRoot").hidden) $("#wizRoot").hidden = true;
@@ -831,15 +969,13 @@ export function initSettings() {
 
   // 工作区
   $("#wsInput").addEventListener("input", markDirty);
-  $("#wsBrowse").onclick = () => { dirPickTarget = "ws"; $("#dirRoot").hidden = false; browseDir(S.workspace || ""); };
-  $("#extraAdd").onclick = () => {
-    dirPickTarget = "extra";
-    $("#dirRoot").hidden = false;
-    browseDir(extraRoots[extraRoots.length - 1] || S.workspace || "");
-  };
+  $("#wsBrowse").onclick = () => openDirBrowser("ws");
+  $("#extraAdd").onclick = () => openDirBrowser("extra", extraRoots[extraRoots.length - 1] || S.workspace || "");
+  // 输入框上方的「工作区」胶囊要能直接调出这个浏览器（picker.js 派发事件，这里没循环依赖）
+  window.addEventListener("ua:open-dir-browser", (e) => openDirBrowser(e.detail?.target || "ws"));
   $("#dirUp").onclick = async () => {
     const cur = $("#dirNow").value;
-    if (!cur || /^[A-Za-z]:\\?$/.test(cur)) return browseDir("");
+    if (!cur || /^[A-Za-z0-9]:\\?$/.test(cur)) return browseDir("");
     const r = await api.browse(cur).catch(() => null);
     browseDir(r?.parent || "");
   };
@@ -852,6 +988,12 @@ export function initSettings() {
       if (!extraRoots.includes(p) && extraRoots.length < 10) extraRoots.push(p);
       renderExtraRoots();
       toast("已加入额外目录：" + p, "ok");
+    } else if (dirPickTarget === "ws-live") {
+      // 从对话栏那颗胶囊进来的：选完立刻生效（走 picker.js 的 pickWorkspace，不用在这儿按保存）
+      dirPickTarget = "ws";
+      $("#dirRoot").hidden = true;
+      window.dispatchEvent(new CustomEvent("ua:ws-picked", { detail: { path: p } }));
+      return;
     } else {
       $("#wsInput").value = p;
       wsHint();
@@ -928,8 +1070,36 @@ export function initSettings() {
       toast(`记忆已保存（${j.chars} 字）`, "ok");
     } catch (e) { toast(e.message, "err"); }
   };
+  // 记忆整理：借一个模型把 memory.md 压成要点（学 openhanako 的"记忆编译"思路，点一下就行）
+  $("#memCompact").onclick = async () => {
+    const btn = $("#memCompact");
+    btn.disabled = true;
+    btn.textContent = "整理中…";
+    try {
+      const j = await api.memoryCompact();
+      $("#memBox").value = j.text || "";
+      toast(`整理好了：${j.before} → ${j.after} 字（用的 ${j.by}）`, "ok");
+    } catch (e) { toast(e.message, "err"); }
+    finally { btn.disabled = false; btn.textContent = "整理"; }
+  };
   $("#kTavily").addEventListener("input", markDirty);
   $("#kBrave").addEventListener("input", markDirty);
+  $("#kProxy").addEventListener("input", markDirty); // 原先漏了它：只改代理不点保存就白改
+
+  // 人格与表达风格
+  $("#personaBox").addEventListener("input", schedulePersonaSave);
+  $("#personaClear").onclick = () => {
+    $("#personaBox").value = "";
+    schedulePersonaSave();
+    renderPersonaPresets();
+  };
+  ["#vLength", "#vStyle", "#vLang"].forEach((sel) =>
+    $(sel).addEventListener("change", () => {
+      S.voice = { length: $("#vLength").value, style: $("#vStyle").value, lang: $("#vLang").value };
+      markDirty(); // 三项跟着设置一起自动保存
+      renderPersonaPresets(); // 语言切了，预设按钮填的正文也要跟着换语言
+    })
+  );
   $("#assistSel").addEventListener("change", markDirty);
   $("#autoCompactSel").addEventListener("change", markDirty);
   $("#chkTest").addEventListener("input", markDirty);
@@ -1014,7 +1184,7 @@ export function initSettings() {
     } catch (e) { toast(e.message, "err"); }
   };
 
-  $("#saveSet").onclick = save;
+  $("#saveSet").onclick = () => save(); // 手动兜底：等不及自动保存就点它
 }
 
 export function refreshSessionCount(n) {

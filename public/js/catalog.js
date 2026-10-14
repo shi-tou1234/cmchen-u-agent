@@ -190,9 +190,9 @@ export const CATALOG = [
     models: [], keyUrl: "", noKey: true, note: "任何 OpenAI 兼容的自建服务都能这么接",
   },
   {
-    id: "mock", name: "离线演示", short: "MK", color: "#8b919c", group: "local",
+    id: "mock", name: "离线向导", short: "MK", color: "#8b919c", group: "local",
     protocol: "mock", baseURL: "", models: ["mock-1"], keyUrl: "", noKey: true,
-    note: "不联网、不花钱，用来熟悉界面和验证工具链路",
+    note: "不联网、不花钱的指导小机器人：界面怎么用、活怎么派，问它",
   },
 ];
 

@@ -1,15 +1,17 @@
 // 对话区：消息渲染、SSE 收发、工具/计划卡、高危确认、斜杠命令、附件
 import { api, net } from "./api.js";
-import { S, setMode, MODES, MODE_HINT, ACTION_META } from "./state.js";
+import { S, setMode, MODES, MODE_HINT, MODE_HINT_EN, ACTION_META } from "./state.js";
 import { $, $$, el, esc, icon, md, toast, kb } from "./ui.js";
-import { renderModelBtn, renderModeBtn, cycleMode } from "./picker.js";
+import { renderModelBtn, renderModeBtn, cycleMode, openModelPop, openModePop, providerReady } from "./picker.js";
+import { t, getLang } from "./i18n.js";
 import { ping, askPermission } from "./notify.js";
 
+const taskLabel = (it) => (getLang() === "en" && it.tEn ? it.tEn : it.t);
 const T_ICON = {
   fs_list: "folder", fs_read: "file", fs_write: "file", fs_edit: "pen", fs_mkdir: "folder",
   fs_move: "file", fs_delete: "trash", fs_search: "search", shell_run: "term",
   git_status: "git", git_diff: "git", git_log: "git", git_commit: "git", git_push: "git", git_pull: "git",
-  web_search: "globe", web_fetch: "globe", spawn_subagent: "bot", sys_info: "hdd", update_plan: "sparkle",
+  web_search: "globe", web_fetch: "globe", spawn_subagent: "bot", sys_info: "hdd", update_plan: "sparkle", memory: "brain",
 };
 export const T_STATE = {
   run: ["已执行", "ok"], confirm: ["待确认", "wait"], deny: ["已拦截", "bad"],
@@ -173,6 +175,10 @@ export async function sendMessage(text, opts = {}) {
     doCheck(only);
     return;
   }
+  // 不带参数的命令：直接给反馈（调弹层 / 出状态卡），别让它落回 default 把输入框清空、像"回车没反应"
+  if (clean === "/mode") { clearComposer(); openModePop(); return; }
+  if (clean === "/model") { clearComposer(); openModelPop(); return; }
+  if (clean === "/help" || clean === "/status") { clearComposer(); showStatus(true); return; }
 
   let body = clean;
   const srcTexts = opts.texts || S.texts; // 排队消息用入队时的附件快照，别把之后贴的带进来（审查 #19）
@@ -511,44 +517,201 @@ function handleSub(ev, subs) {
 
 /* ================= 消息节点 ================= */
 export function clearStream() {
+  setHome(false);
   colEl().innerHTML = "";
   refreshTurnRail();
   renderPlanChip([]);
 }
 
-/* ---- 空会话首屏（v9.10）：时段问候 + 自适应字号 + 大 Logo 水印（上实下隐；图标暂用内置闪电标，等正式 logo） ---- */
-function greetingNow() {
-  const h = new Date().getHours();
-  if (h < 5) return "夜深了，悠着点";
-  if (h < 9) return "早上好";
-  if (h < 12) return "上午好";
-  if (h < 14) return "中午好";
-  if (h < 18) return "下午好";
-  if (h < 23) return "晚上好";
-  return "夜深了，悠着点";
+/* ---- 空会话首屏（v9.14）：学了 zai-org/ZCode 的草稿页
+   （packages/ui/src/v4/ConversationDraftEmptyState.tsx + ConversationDraftSuggestedPrompts.tsx）。
+   三件事对齐它：①时段问候居中、跨过 5/9/12/14/18/23 点自己换档；②输入框内联在问候下面、
+   推荐任务在其下方，整列在视口里竖居中（.main.home 这套布局在 app.css）；③推荐任务一屏 4 条、
+   顺序轮转，点一下填进输入框（不自动发送）。
+   发出第一句话后 .home 摘掉，输入框滑回底部——和 ZCode 一样的落位手感。 ---- */
+/* 首屏那个水印：一个字母 U（领导说机器人线稿看着诡异，点名"干脆做成一个字母"）。
+   细线描出字母的轮廓（学 ZCode 那个空心 Z 的做法），字母要够宽、上半截也要看得见；
+   颜色吃 currentColor、明暗主题共用，底部渐隐。 */
+const WELCOME_MARK = `<svg viewBox="0 0 400 320" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linejoin="round" aria-hidden="true">
+  <path d="M50 30V140A150 150 0 0 0 350 140V30H260V140A60 60 0 0 1 140 140V30Z"/>
+</svg>`;
+
+/* 招呼语：每个时段一组（学 Claude 的多变写法），每次进首屏从当档里挑一句、避免连着重复；
+   下面那行小字也从池子里挑——品牌那句留一条在里面就够了，不用每屏都念同一句。 */
+const GREETING_SLOTS = [
+  { from: 5, hellos: ["早上好，新的一天开始啦", "早上好，今天想做点什么？", "早上好，从哪儿开始？", "早上好呀，有什么要我帮忙的吗？"], hellosEn: ["Morning — fresh start", "Morning. What should we get done today?", "Morning. Where do we start?", "Morning! What can I do for you?"] },
+  { from: 9, hellos: ["上午好，有什么想让我帮忙的吗", "上午好，今天在忙什么？", "上午好，接着往下做？", "上午好，说句话我就开工"], hellosEn: ["Morning. What can I help with?", "What are you working on this morning?", "Picking up where we left off?", "Say the word and I'll start"] },
+  { from: 12, hellos: ["中午好，要不要先休息一下", "中午好，先歇会儿，我随时在", "中午好，要不要趁这会儿让我先跑着？", "中午好，先吃饭，活儿交给我"], hellosEn: ["Noon — take a break?", "Rest a bit; I'm here", "Want me to run something while you eat?", "Go eat. I'll hold it down"] },
+  { from: 14, hellos: ["下午好，接下来交给我吧", "下午好，接着干点什么？", "下午好，有什么要收尾的吗？", "下午好，我来搭把手"], hellosEn: ["Afternoon — leave it to me", "What are we onto this afternoon?", "Anything to wrap up?", "Afternoon. Need a hand?"] },
+  { from: 18, hellos: ["晚上好，今天辛苦啦", "晚上好，还想再推进点什么？", "晚上好，把今天的事收个尾？", "晚上好，我还在"], hellosEn: ["Evening — good work today", "Want to push a bit further?", "Wrapping up for the day?", "Evening. Still here"] },
+  { from: 23, hellos: ["夜深啦，别忘了照顾好自己", "夜深啦，忙完早点休息", "夜深啦，悠着点来", "夜深啦，我陪你把这段做完"], hellosEn: ["It's late — look after yourself", "Late night. Wrap up soon", "Late. Take it easy", "It's late; let's finish this stretch together"] },
+];
+const WELCOME_SUBS = [
+  "u-agent · 插在这台电脑上的便携 AI，只听 localhost 的话",
+  "说句话就开始：@ 带文件、/ 看命令、图直接拖进来",
+  "对话、钥匙、配置都留在这只 U 盘里，换台电脑接着用",
+  "动文件、跑命令之前会先问你（权限档在左下角）",
+];
+const WELCOME_SUBS_EN = [
+  "u-agent · a portable AI living on this USB drive, talks only to localhost",
+  "Just say what you need: @ for files, / for commands, drop images right in",
+  "Chats, keys and settings all stay on this drive — plug into another PC and continue",
+  "It asks before touching files or running commands (mode chip, bottom-left)",
+];
+
+// 挑一句（尽量不跟上一次重复）
+let lastHello = -1;
+let lastSub = -1;
+const pickLine = (arr, last) => {
+  if (arr.length < 2) return 0;
+  let i = Math.floor(Math.random() * arr.length);
+  if (i === last) i = (i + 1) % arr.length;
+  return i;
+};
+
+// 取当前时段的招呼语 + 小字（顺带把"下一次换档"的时间点算出来）
+function slotFor(h) {
+  let s = GREETING_SLOTS[GREETING_SLOTS.length - 1]; // 23:00–04:59 落在最后一档
+  for (const cand of GREETING_SLOTS) {
+    if (h >= cand.from) s = cand;
+    else break;
+  }
+  return s;
+}
+function greetingNow(date = new Date()) {
+  const slot = slotFor(date.getHours());
+  const en = getLang() === "en";
+  const hellos = (en && slot.hellosEn) || slot.hellos;
+  const subs = en ? WELCOME_SUBS_EN : WELCOME_SUBS;
+  lastHello = pickLine(hellos, lastHello);
+  lastSub = pickLine(subs, lastSub);
+  return { hello: hellos[lastHello], sub: subs[lastSub] };
+}
+// 下一次换档还有多久：边界整点加 1 秒，免得时钟抖动卡在边界上反复重排
+function nextGreetingDelay(from = new Date()) {
+  const to = new Date(from);
+  const next = GREETING_SLOTS.map((s) => s.from).find((h) => h > from.getHours());
+  if (next == null) {
+    to.setDate(to.getDate() + 1);
+    to.setHours(GREETING_SLOTS[0].from, 0, 1, 0);
+  } else to.setHours(next, 0, 1, 0);
+  return Math.max(1000, to - from);
+}
+let helloTimer = null;
+function scheduleGreeting() {
+  clearTimeout(helloTimer);
+  helloTimer = setTimeout(greetingTick, nextGreetingDelay());
+}
+function greetingTick() {
+  const node = $("#welcomeHello");
+  const subNode = $("#welcomeSub");
+  if (!node || !node.isConnected) return; // 首屏不在了（开跑了/换会话了），停表
+  const { hello, sub } = greetingNow();
+  if (node.textContent !== hello) node.textContent = hello;
+  if (subNode && subNode.textContent !== sub) subNode.textContent = sub;
+  scheduleGreeting();
 }
 
-export function renderWelcome(info) {
+/* 「试试这些任务」：一屏 4 条，换一批顺序轮转（池里每条都在有限轮次内轮得到） */
+const TASK_PAGE = 4;
+const TASK_POOL = [
+  { ic: "folder", t: "看一下工作区里都有什么文件", tEn: "List the files in the workspace" },
+  { ic: "pen", t: "在工作区新建 hello.txt，写一句话", tEn: "Create hello.txt in the workspace with a line of text" },
+  { ic: "globe", t: "搜一下今天值得关注的科技新闻", tEn: "Search for today's tech news worth knowing" },
+  { ic: "git", t: "把工作区的改动整理成一次 git 提交", tEn: "Turn the workspace changes into one git commit" },
+  { ic: "term", t: "看看这台电脑现在的磁盘和内存占用", p: "用 sys_info 看看这台电脑现在的磁盘和内存占用", tEn: "Check this PC's disk and memory usage" },
+  { ic: "search", t: "在工作区里全局搜一个关键词，告诉我它出现在哪几处", p: "在工作区里全局搜「TODO」，告诉我它出现在哪几处", tEn: "Search the workspace for a keyword and list where it appears" },
+  { ic: "file", t: "挑工作区里最长的一个文件读一遍，用三句话讲讲它", tEn: "Read the longest file in the workspace and summarize it in three sentences" },
+  { ic: "check", t: "跑一遍项目检查，把没过的地方说清楚", p: "跑一遍项目检查，把没过的地方说清楚", tEn: "Run the project checks and explain what fails" },
+  { ic: "bot", t: "派两个子代理分头调研同一件事，最后汇总给我", p: "派两个子代理分头调研「这个工作区现在最该改进的地方」，最后汇总给我", tEn: "Send two subagents after the same question and summarize" },
+  { ic: "image", t: "读一下工作区里的一张图片，解释它讲了什么", tEn: "Read an image in the workspace and explain what it shows" },
+  { ic: "trash", t: "找出工作区里没用的垃圾文件，先列清单，别动手删", tEn: "Find junk files in the workspace — list them first, do not delete" },
+  { ic: "sparkle", t: "你觉得这个工作区接下来最值得做的一件事是什么？", tEn: "What is the single most worthwhile thing to do in this workspace next?" },
+];
+let taskOffset = 0;
+let tasksHidden = false; // 点 ✕ 收起：这一页有效，刷新回来
+
+export function renderHomeTasks() {
+  const box = $("#homeTasks");
+  if (!box) return;
+  if (tasksHidden) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  const idx = [];
+  for (let k = 0; k < Math.min(TASK_PAGE, TASK_POOL.length); k++) idx.push((taskOffset + k) % TASK_POOL.length);
+  box.innerHTML =
+    `<div class="ht-head"><span>${esc(t("home.tasks"))}</span><span class="ht-ops">
+      <button id="htMore" title="${esc(t("home.more"))}">${icon("refresh", "ic ic-sm")}${esc(t("home.more"))}</button>
+      <button id="htHide" title="${esc(t("home.hide"))}">${icon("close", "ic ic-sm")}</button>
+    </span></div>` +
+    idx
+      .map(
+        (i) =>
+          `<button class="ht-item" data-i="${i}" title="${esc(t("home.pickTip"))}"><span class="ht-ic">${icon(
+            TASK_POOL[i].ic,
+            "ic ic-sm"
+          )}</span><span class="ht-text">${esc(taskLabel(TASK_POOL[i]))}</span></button>`
+      )
+      .join("");
+  box.hidden = false;
+  const pick = (i) => setInput(TASK_POOL[i].p || taskLabel(TASK_POOL[i]));
+  box.querySelectorAll(".ht-item").forEach((b) => (b.onclick = () => pick(Number(b.dataset.i))));
+  $("#htMore").onclick = () => {
+    taskOffset = (taskOffset + TASK_PAGE) % TASK_POOL.length;
+    renderHomeTasks();
+  };
+  $("#htHide").onclick = () => {
+    tasksHidden = true;
+    renderHomeTasks();
+  };
+}
+
+/* 首屏布局开关：.main.home 时 CSS 把问候/输入框/推荐任务整列竖居中；关掉是普通会话布局 */
+function setHome(on) {
+  const main = $(".main");
+  if (main) main.classList.toggle("home", !!on);
+  if (!on) {
+    clearTimeout(helloTimer);
+    helloTimer = null;
+    const box = $("#homeTasks");
+    if (box) {
+      box.hidden = true;
+      box.innerHTML = "";
+    }
+  }
+}
+
+/* 输入框在「居中」和「底部」之间换位时滑一段（ZCode 也是滑的，不然整块布局会硬跳一格） */
+const reducedMotion = () => !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+function captureComposerTop() {
+  const c = $("#composer");
+  return c && !reducedMotion() ? { node: c, top: c.getBoundingClientRect().top } : null;
+}
+function glideComposer(from) {
+  if (!from || !from.node.isConnected) return;
+  const dy = from.top - from.node.getBoundingClientRect().top; // 上面那次读的是旧位置，这次是新位置
+  if (Math.abs(dy) < 6) return;
+  from.node.animate([{ transform: `translateY(${Math.round(dy)}px)` }, { transform: "none" }], {
+    duration: 240,
+    easing: "cubic-bezier(.22,.61,.36,1)",
+  });
+}
+
+export function renderWelcome() {
+  const from = captureComposerTop();
+  setHome(true);
+  const g = greetingNow();
   colEl().innerHTML = `<div class="welcome">
-    <div class="welcome-hello">${greetingNow()}</div>
-    <div class="welcome-brand">
-      <img class="mark" src="/icon.png" alt="">
-      <div><h1>u-agent</h1><div class="sub">插在这台电脑上的便携 AI · 只听 localhost 的话</div></div>
-    </div>
-    <p class="muted" style="font-size:13.5px;max-width:640px">它能读写工作区里的文件、跑命令行、查资料、管 git，还能拆出子任务并行处理。所有配置和对话都留在这只 U 盘。</p>
-    <div class="prompt-grid">
-      <button class="prompt-card" data-p="看一下工作区里都有什么文件"><span class="lead">熟悉环境</span>看一下工作区里都有什么文件</button>
-      <button class="prompt-card" data-p="在工作区新建一个 hello.txt，写一句话"><span class="lead">动手试试</span>在工作区新建 hello.txt，写一句话</button>
-      <button class="prompt-card" data-p="搜索一下今天值得关注的科技新闻"><span class="lead">联网</span>搜索一下今天值得关注的科技新闻</button>
-      <button class="prompt-card" data-p="把工作区的改动整理成一次 git 提交"><span class="lead">版本管理</span>把工作区的改动整理成一次 git 提交</button>
-    </div>
-    <div class="welcome-note">${icon("info", "ic ic-sm")}<span id="welcomeNote">${esc(info || "")}</span></div>
+    <div class="welcome-mark">${WELCOME_MARK}</div>
+    <p class="welcome-hello" id="welcomeHello">${esc(g.hello)}</p>
+    <p class="welcome-sub" id="welcomeSub">${esc(g.sub)}</p>
   </div>`;
-  $$(".prompt-card", colEl()).forEach((b) => (b.onclick = () => {
-    $("#txt").value = b.dataset.p;
-    $("#txt").focus();
-    autoGrow();
-  }));
+  refreshWelcomeNote();
+  renderHomeTasks();
+  scheduleGreeting(); // 跨过时段边界时自己换一句
+  glideComposer(from);
 }
 
 /* ---- 回合导航条（v9.10）：会话左缘一列细条，鼠标扫过成"山峰"，点击直跳那个回合 ---- */
@@ -594,6 +757,7 @@ function refreshTurnRail() {
 }
 
 function addUser(text, images) {
+  const from = $(".welcome") ? captureComposerTop() : null; // 首屏那条：输入框该从中间落回底部
   if ($(".welcome")) clearStream();
   // mediaType 来自会话日志：日志就在盘上、agent 也写得动它——属性里必须转义（防存储型 XSS），格式不对就兜底
   const imgs = (images || [])
@@ -613,6 +777,7 @@ function addUser(text, images) {
   colEl().appendChild(node);
   refreshTurnRail();
   scrollEnd(true);
+  glideComposer(from);
 }
 
 /* ---- 只回退对话（不动文件） ---- */
@@ -806,11 +971,16 @@ function addRoundStats(stats) {
   scrollEnd();
 }
 
-/* 欢迎页那句提示：工作区在设置里改完后要跟着变 */
+/* 首页输入框上方那颗工作区 chip：改完设置要跟着变（chip 在首屏才显示，见 app.css 的 .sb-ws） */
 export function refreshWelcomeNote() {
   const n = $("#welcomeNote");
   if (!n) return;
-  n.textContent = S.workspace ? "工作区：" + S.workspace : "还没设置工作区，点左下角「设置」挑一个文件夹";
+  n.textContent = S.workspace ? t("composer.ws") + " · " + S.workspace : t("composer.wsUnset");
+  const chip = $("#sbWs");
+  if (chip)
+    chip.title = S.workspace
+      ? S.workspace + "\nagent 只在这个目录里读写文件；点一下去「设置 → 通用」里换一个"
+      : "还没设置工作区：agent 得先知道在哪个目录里干活。点一下去挑一个";
 }
 
 /* ---- 思考块：先流式展开，正文一来就收成「已思考 N 秒」（点开还能看） ---- */
@@ -1325,7 +1495,7 @@ export function renderUsage() {
     : "还没有对话内容";
 
   const bar = $("#ctxText");
-  if (!tokens) bar.textContent = "上下文空";
+  if (!tokens) bar.textContent = t("status.ctxEmpty");
   else if (pct >= 90) bar.textContent = `${kTok(tokens)} / ${kTok(limit)} · 该压缩了`;
   else bar.textContent = `${kTok(tokens)} / ${kTok(limit)} · ${pct}%`;
   const compact = $("#ctxCompact");
@@ -1350,7 +1520,7 @@ export function renderAutoApproveBar() {
   const aa = S.autoApprove || {};
   if (!aa.enabled) {
     chip.className = "sb-aa off";
-    chip.textContent = "自动放行：关";
+    chip.textContent = t("status.aaOff");
     chip.title = "任何改动都会先问你。去「设置 → 权限」里可以按动作单独放行";
     return;
   }
@@ -1358,14 +1528,15 @@ export function renderAutoApproveBar() {
   const risky = on.some((a) => a.id === "deleteFiles" || a.id === "execAll");
   chip.className = "sb-aa on" + (risky ? " risky" : "");
   if (!on.length) {
-    chip.textContent = "自动放行：无";
+    chip.textContent = t("status.aaNone");
     chip.title = "开启了，但一个动作都没勾 —— 等于全部要问";
   } else {
-    const head = on.slice(0, 2).map((a) => a.name).join("、");
-    chip.textContent = on.length > 2 ? `自动放行 ${head} 等 ${on.length} 项` : `自动放行 ${head}`;
+    const actName = (a) => (getLang() === "en" && a.nameEn ? a.nameEn : a.name);
+    const head = on.slice(0, 2).map(actName).join(getLang() === "en" ? ", " : "、");
+    chip.textContent = on.length > 2 ? t("status.aaEtc", { list: head, n: on.length }) : t("status.aaOn", { list: head });
     const max = Number(aa.maxRequests) || 0;
     chip.title =
-      "不弹窗直接执行：" + on.map((a) => a.name).join("、") +
+      "不弹窗直接执行：" + on.map(actName).join("、") +
       (max > 0 ? `；连续 ${max} 次后回来问一次` : "；不限次数") +
       (risky ? "\n⚠ 已放行高危动作（删文件 / 任何命令）" : "");
   }
@@ -1486,7 +1657,8 @@ export function setSendUI() {
   btn.classList.toggle("busy", S.sending);
   btn.innerHTML = S.sending ? icon("stop") : icon("send");
   btn.title = S.sending ? "停下当前这轮（想把话排着队说，直接按回车）" : "发送（Enter）";
-  $("#compHint").textContent = S.sending ? "正在跑：回车 = 排队接着说，点右侧按钮 = 停下" : MODE_HINT[S.mode] || "";
+  const hintMap = getLang() === "en" ? MODE_HINT_EN : MODE_HINT;
+  $("#compHint").textContent = S.sending ? t("composer.queued") : hintMap[S.mode] || "";
   $("#modeBtn").dataset.mode = S.mode;
 }
 
@@ -1658,16 +1830,18 @@ let pal = [], palIdx = 0;
 let palKind = "cmd";   // "cmd" 斜杠命令 | "file" @ 提及文件
 let palAt = 0;         // @ 或 / 在输入框里的起始位置
 let palSeq = 0;        // 并发请求的序号，防止先发的后到覆盖
+let palMoved = false;  // 用户是否用 ↑↓ 选过：没选过又候选很多时，回车别自作主张（打个 "/" 就回车不会误触 /new）
 let fileTimer = null;
 const fileCache = new Map();
 
 function palOpen() { return !$("#palette").hidden; }
 function palClose() { $("#palette").hidden = true; clearTimeout(fileTimer); palKind = "cmd"; }
-function palRender() {
+function palRender(hintOverride) {
   const box = $("#palette");
   if (!pal.length) { palClose(); return; }
-  const head =
-    palKind === "file"
+  const head = hintOverride
+    ? hintOverride
+    : palKind === "file"
       ? "工作区文件 · ↑↓ 选择，Enter 插入「@路径」，Esc 关闭"
       : "命令 · ↑↓ 选择，Enter 确认，Esc 关闭";
   box.innerHTML = `<div class="palette-head">${head}</div>` +
@@ -1696,6 +1870,7 @@ function atToken() {
 function palUpdate() {
   const t = txtEl();
   const v = t.value;
+  palMoved = false; // 输入变了：上一轮的方向键选择作废
 
   const at = atToken();
   if (at) {
@@ -1714,7 +1889,10 @@ function palUpdate() {
   if (cmd === "/mode") {
     pal = MODES.filter((m) => m.id.startsWith(rest)).map((m) => ({ cmd: m.id, show: "/mode " + m.id, desc: m.name }));
   } else if (cmd === "/model") {
-    pal = S.providers.map((p) => ({ cmd: p.name, show: "/model " + p.name, desc: p.model || "" }))
+    // 只列能用的通道（providerReady：mock、地址+模型+钥匙，或者本机/免钥匙的 Ollama 这类）
+    pal = S.providers
+      .filter((p) => providerReady(p))
+      .map((p) => ({ cmd: p.name, show: "/model " + p.name, desc: p.model || "" }))
       .filter((c) => c.cmd.toLowerCase().startsWith(rest));
   } else if (cmd === "/skill") {
     pal = (S.skills || [])
@@ -1757,6 +1935,14 @@ export function palPickSelected() { if (palOpen() && pal.length) palPick(); }
 function palPick() {
   const it = pal[palIdx];
   if (!it || it.disabled) return;
+  // 候选多于一条、又没按过 ↑↓：先别替他决定。打个「/」就回车不会误触 /new（原来会静默开新会话、像"啥也没发生"）
+  const usable = pal.filter((c) => !c.disabled);
+  const typed = palKind === "file" ? atToken()?.q || "" : txtEl().value.trim();
+  const exact = it.cmd === typed || "/" + it.cmd === typed || (palKind === "file" && "@" + it.cmd === typed);
+  if (!palMoved && usable.length > 1 && !exact) {
+    palRender(palKind === "file" ? "候选不止一条：↑↓ 选一条再回车" : "命令不止一条：↑↓ 选一条再回车（也可以把命令名打全）");
+    return;
+  }
 
   if (palKind === "file") {
     const t = txtEl();
@@ -1773,7 +1959,9 @@ function palPick() {
   }
 
   const v = txtEl().value;
-  const cmd = v.indexOf(" ") < 0 ? v : v.slice(0, v.indexOf(" "));
+  const typedCmd = v.indexOf(" ") < 0 ? v : v.slice(0, v.indexOf(" "));
+  // 执行拿「选中项的命令名」：打个 / 再用 ↑↓ 选 /mode 时，输入框里只有 "/"，不能拿它去 switch
+  const cmd = it.cmd && String(it.cmd).startsWith("/") ? it.cmd : typedCmd;
   if (it.show?.startsWith("/mode ")) { setMode(it.cmd); window.dispatchEvent(new CustomEvent("ua:mode-change", { detail: { mode: it.cmd } })); toast("已切到 " + it.desc, "ok"); clearComposer(); return; }
   if (it.show?.startsWith("/model ")) { S.active = it.cmd; window.dispatchEvent(new CustomEvent("ua:model-change", { detail: { name: it.cmd } })); clearComposer(); return; }
   if (it.show?.startsWith("/skill ")) {
@@ -1798,6 +1986,9 @@ function palPick() {
     case "/details": clearComposer(); toggleDetails(); return;
     case "/check": clearComposer(); doCheck(""); return;
     case "/goal": clearComposer(); doGoal(""); return;
+    // 不带参数的 /mode、/model：直接把对应弹层调出来（原来会清空输入框、什么都不发生，像个死键）
+    case "/mode": clearComposer(); openModePop(); return;
+    case "/model": clearComposer(); openModelPop(); return;
     case "/remember": $("#txt").value = "/remember "; focusInput(); return;
     case "/init": setInput("请通读工作区（用 fs_list / fs_search / fs_read），在工作区根目录生成一份 AGENTS.md：说明这个文件夹的用途、关键文件、常用命令和注意事项，精炼实用。"); return;
     default: clearComposer(); showStatus(true);
@@ -2404,8 +2595,8 @@ export function initChat() {
   window.addEventListener("beforeunload", saveDraftNow);
   txtEl().addEventListener("keydown", (e) => {
     if (palOpen()) {
-      if (e.key === "ArrowDown") { e.preventDefault(); palIdx = (palIdx + 1) % pal.length; return palRender(); }
-      if (e.key === "ArrowUp") { e.preventDefault(); palIdx = (palIdx - 1 + pal.length) % pal.length; return palRender(); }
+      if (e.key === "ArrowDown") { e.preventDefault(); palMoved = true; palIdx = (palIdx + 1) % pal.length; return palRender(); }
+      if (e.key === "ArrowUp") { e.preventDefault(); palMoved = true; palIdx = (palIdx - 1 + pal.length) % pal.length; return palRender(); }
       if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); return palPick(); }
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); return palClose(); }
     }

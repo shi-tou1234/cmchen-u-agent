@@ -47,6 +47,9 @@ export const api = {
   saveSettings: (patch) => post("/api/settings", patch),
   memory: () => get("/api/memory"),
   saveMemory: (text) => post("/api/memory", { text }),
+  memoryCompact: () => post("/api/memory-compact", {}), // 借模型把记忆压成要点
+  persona: () => get("/api/persona"), // 人格正文 + 预设 + 三档风格选项
+  savePersona: (text) => post("/api/persona", { text }),
 
   sessions: () => get("/api/sessions"),
   session: (id, provider) => get("/api/session?id=" + encodeURIComponent(id) + (provider ? "&provider=" + encodeURIComponent(provider) : "")),

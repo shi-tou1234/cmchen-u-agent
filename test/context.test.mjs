@@ -85,6 +85,22 @@ test("systemPrompt 注入：记忆 / 计划 / AGENTS.md", () => {
   assert.match(sp, /第一步/);
 });
 
+test("systemPrompt：被问「你是什么模型」要说清底层通道+模型（且不带钥匙）", () => {
+  const sp = systemPrompt({
+    workspace: "C:/w",
+    mode: "confirm",
+    provider: { name: "OpenCode Go", model: "deepseek-v4.1-flash", secret: "sk-should-not-leak" },
+  });
+  assert.match(sp, /你是 u-agent/);
+  assert.match(sp, /OpenCode Go/);
+  assert.match(sp, /deepseek-v4\.1-flash/);
+  assert.match(sp, /如实回答/, "要有「被问到就如实说」的指令");
+  assert.doesNotMatch(sp, /sk-should-not-leak/, "钥匙绝不能进提示词");
+  // 没传 provider 时也要有兜底说法（chat 之外的地方调用）
+  const sp2 = systemPrompt({ workspace: "C:/w", mode: "confirm" });
+  assert.match(sp2, /被问到/);
+});
+
 test("rewind：被回退的那段不进上下文，原位留一句说明", async () => {
   const { buildHistory, rewindRanges, isDropped } = await import("../core/context.mjs");
   const ev = (type, extra = {}, ts = 1) => ({ ts, type, ...extra });

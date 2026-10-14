@@ -422,3 +422,42 @@ test("v9.10 缓存命中：三家协议的字段都归一到 usage.cached", asyn
   assert.equal(u4.cached, 7, "Responses 系 input_tokens_details.cached_tokens");
   await up4.close();
 });
+
+test("离线向导：日常提问走一问一答（不鹦鹉学舌），认不出来给菜单；剧本优先", async () => {
+  const provider = { protocol: "mock" };
+  const ask = async (text) =>
+    (await collect(streamChat(provider, [{ role: "user", text }], [])))
+      .filter((e) => e.type === "text")
+      .map((e) => e.delta)
+      .join("");
+
+  // 带「当前时间」前缀的真实消息形状也要认
+  const ws = await ask("【当前时间】2026-10-14 14:00\n怎么换工作区");
+  assert.match(ws, /工作区/, "问工作区要答工作区的事");
+  assert.match(ws, /胶囊|打开文件夹/, "要指出界面上真实存在的入口");
+  assert.doesNotMatch(ws, /收到：/);
+
+  assert.match(await ask("钥匙怎么填"), /钥匙/);
+  assert.match(await ask("你是谁"), /离线向导/);
+  // 具体词压过泛词：「忘记密码」不该被「密码」以外的条目抢走
+  assert.match(await ask("忘记密码怎么办"), /删掉|重设/);
+
+  // 领导会拿大白话问（原话），别再掉进"没听懂"菜单
+  assert.match(await ask("给我介绍这个应用"), /u-agent/, "「介绍这个应用」要答总介绍");
+  assert.match(await ask("这个怎么用"), /工作区|接一/, "「这个怎么用」也要有正经回答");
+  assert.match(await ask("我怎么开始"), /第一步|①/);
+  assert.match(await ask("会不会把我的代码传出去"), /U 盘|传/, "隐私问题要答得明白");
+  assert.match(await ask("手机能连吗"), /127\.0\.0\.1|连不上/);
+  assert.match(await ask("跑一遍测试怎么弄"), /检查命令/);
+  assert.match(await ask("怎么换 工作区？"), /胶囊/, "带空格和标点也要认出来");
+
+  const menu = await ask("给我讲个笑话");
+  assert.match(menu, /添加通道/, "答不出来就给「你能问我什么」的菜单");
+  assert.doesNotMatch(menu, /收到：给我讲个笑话/, "不再是鹦鹉学舌");
+
+  // MOCKSCRIPT 与建文件演示的两条老路不能被向导抢掉
+  const scripted = await ask('MOCKSCRIPT:[{"say":"剧本优先"}]');
+  assert.equal(scripted, "剧本优先");
+  const demo = await collect(streamChat(provider, [{ role: "user", text: "帮我建文件 hello.txt" }], []));
+  assert.ok(demo.some((e) => e.type === "tool_start" && e.name === "fs_write"), "建文件仍走演示剧本");
+});
