@@ -6,13 +6,51 @@
 
 把本目录放进 U 盘，插上任意 **Windows 10/11 x64** 电脑：双击 `启动U-Agent.bat`，浏览器自动打开本地聊天页，agent 就能操作那台电脑上的文件。所有环境、配置、会话数据全部留在 U 盘目录内——宿主机**零安装、零配置、零残留**，拔盘即走。
 
-## 三步用法
+## 怎么把这个仓库跑起来（下载 → 配置）
 
-1. **装环境（只做一次）**：双击 `setup-uagent.bat`（需联网，约 1 分钟，自动从 npmmirror 下载便携版 node 22）
-2. **首次配置（只做一次）**：双击 `启动U-Agent.bat` → 浏览器打开后先设置启动密码（每次启动都要输）→ 点右上角「设置」→ 选工作区目录、选模型通道并填钥匙（加密保存在 U 盘里，以后永不再配）
-3. **日常使用**：插 U 盘 → 双击 `启动U-Agent.bat` → 开聊。换任何电脑都不用重装重配
+**先决条件**：一台 **Windows 10/11 x64** 电脑；第 ② 步需要联网（从 npmmirror 下便携版 Node，约 1 分钟）；之后用它干活需要能访问你所选的模型服务。**不需要预先装 Node，不需要 npm，不需要装任何东西。**
 
-模型走 OpenAI 兼容接口，内置三协议：**OpenAI Chat Completions / OpenAI Responses / Anthropic Messages**（24 家厂商预设，GLM、DeepSeek、OpenAI、Anthropic、OpenRouter、OpenCode Zen/Go、本机 Ollama 等，填钥匙即用）；没配 key 也能用 **Mock 模式**体验界面。
+### ① 把仓库弄到盘上（两种都行）
+
+```bat
+git clone https://github.com/shi-tou1234/cmchen-u-agent.git
+```
+
+或者：在本仓库页面点右上 **Code → Download ZIP**，解压。
+
+拿到的整个文件夹**放进 U 盘（或电脑上任意目录）就算"安装位置"**——放哪、文件夹叫什么名字都随意，脚本全部用相对路径，换盘符、换电脑都不用改配置。
+
+### ② 装环境（只做一次，需联网）
+
+双击 **`setup-uagent.bat`**：它会从 npmmirror 下载便携版 Node 22 到 `runtime\`，并校验 SHA256。这一步把运行时放进盘里，之后在任何电脑上跑都不依赖宿主机。
+
+### ③ 首次配置（只做一次）
+
+1. 双击 **`启动U-Agent.bat`** → 浏览器自动打开本地聊天页（默认 `http://127.0.0.1:3080`，端口被占会自动往后找，控制台里能看到实际地址）
+2. 页面先要求**设置启动密码**——密码跟着盘走，以后插到别的电脑还是这一个
+3. 点右上「**设置**」，把三件事配好：
+   - **通用 → 工作区**：挑一个文件夹。agent 默认只能读写这个目录和 U 盘（要放开别的目录，用同页的「额外目录」；「完全权限」模式则不设边界）
+   - **模型**：点「添加通道」→ 挑一家厂商 → 粘上钥匙 → 挑模型（20+ 家厂商，协议和服务地址都预置好了）。**先不想配钥匙也行**：直接留在内置的「离线向导」上，它会教你各种用法
+   - 顺手可看：**人格**（要不要给它定个说话人设与回答风格）、**界面语言**（中文 / English）
+4. 回到对话页，在输入框里说人话就能开工：`@` 提工作区文件、`/` 看命令、图片直接拖进来
+
+### ④ 日常使用
+
+插盘 → 双击 `启动U-Agent.bat` → 输密码 → 开聊。换任何电脑都不用重装重配。
+
+### 哪些东西不在 git 里（克隆下来是干净的源码）
+
+| 路径 | 是什么 | 从哪来 |
+|---|---|---|
+| `runtime\` | 便携版 Node 运行时（约 100 MB） | 第 ② 步 `setup-uagent.bat` 下载 |
+| `data\` | 会话日志、改动快照、密码锁、**加密的钥匙库** | 首次启动后自动生成 |
+| `config.json` | 模型通道列表（**不含钥匙**；钥匙加密存在 `data\vault.bin`） | 设置里保存时生成 |
+
+**卸载 / 搬家**：它不是安装出来的软件——**删掉整个文件夹就等于卸载干净**；把整个文件夹拷到新 U 盘/新电脑，就等于搬家完成（`data\` 里的会话和钥匙跟着走）。
+
+**安全提醒**：这只盘里带着你的密码锁和钥匙库，**只在这台电脑上开着的时候用**——服务只听 `127.0.0.1`，手机、局域网里别的机器都连不上（这是故意的）；盘别外借。
+
+模型走 OpenAI 兼容接口，内置三协议：**OpenAI Chat Completions / OpenAI Responses / Anthropic Messages**（24 家厂商预设，GLM、DeepSeek、OpenAI、Anthropic、OpenRouter、OpenCode Zen/Go、本机 Ollama 等，填钥匙即用）；没配 key 也能用内置的**离线向导**体验界面。
 
 像 OpenCode Zen / Go 这类**按模型分协议**的网关已经处理好：选中模型自动切协议（Claude 系→Anthropic、GPT/Grok 系→Responses、其余→OpenAI 兼容）、自动带上网关要求的会话标识、把整条接口地址粘进「服务地址」也会自动纠偏；连不上时报错会说清是钥匙、地址还是协议的问题。
 
@@ -53,7 +91,7 @@
 
 ## 原理与结构
 
-`node.exe`（便携，U 盘内）+ **零 npm 依赖**的 Node 脚本（只用内置模块，FAT32 U 盘免安装免编译）。内核设计参考 [deepseek-ai/deepseek-harness（dsh）](https://github.com/deepseek-ai/deepseek-harness) 的「Agent = Model + Harness、一切皆插件、工具风险审批、会话追加日志」；U 盘打包模式参考 [hermes-portable](https://github.com/yuluyangguang1/hermes-portable)、[portable-agent-usb](https://github.com/bnovik0v/portable-agent-usb) 等同类项目。
+`node.exe`（便携，U 盘内）+ **零 npm 依赖**的 Node 脚本（只用内置模块，FAT32 U 盘免安装免编译）。内核设计参考 [deepseek-ai/deepseek-harness（dsh）](https://github.com/deepseek-ai/deepseek-harness) 的「Agent = Model + Harness、一切皆插件、工具风险审批、会话追加日志」；U 盘打包模式参考 [hermes-portable](https://github.com/yuluyangguang1/hermes-portable)、[portable-agent-usb](https://github.com/bnovik0v/portable-agent-usb) 等同类项目；**完整出处与许可见文末「参考与致谢」与 [THIRD-PARTY.md](THIRD-PARTY.md)**。
 
 ```
 启动U-Agent.bat   双击入口（%~dp0 相对定位，换盘符免改）
@@ -110,6 +148,35 @@ runtime|data|config.json   运行时与数据（不进 git）
 - 模型思考会占输出额度（anthropic 协议默认开启，预算取输出上限的 1/4；嫌慢嫌贵可在通道卡里关掉，`/thinking` 只关显示）
 - shell 30 秒超时、输出 200KB 截断；只支持 Win10/11 x64
 
+## 参考与致谢
+
+代码是自研、零 npm 依赖写的，但不少设计与做法站在开源项目的肩膀上。按「借到什么程度」分两类——
+直接借过内容/文件的，按各自协议保留声明（许可原文见 [THIRD-PARTY.md](THIRD-PARTY.md)）；只借了设计想法的，列出来致谢。
+
+### 一、借用了内容或文件（按原协议保留声明）
+
+| 项目 | 协议 | 用到了什么 |
+|---|---|---|
+| [deepseek-ai/deepseek-harness **dsh**](https://github.com/deepseek-ai/deepseek-harness) | MIT | 内核设计：Agent = Model + Harness、高风险工具审批、会话追加日志、并行工具声明制 |
+| [yuluyangguang1/hermes-portable](https://github.com/yuluyangguang1/hermes-portable) | MIT | U 盘便携打包：启动脚本与「便携 node + 相对路径」的目录组织方式 |
+| [bnovik0v/portable-agent-usb](https://github.com/bnovik0v/portable-agent-usb) | MIT | 同上（便携打包思路与目录结构） |
+| [simple-icons](https://github.com/simple-icons/simple-icons) | CC0-1.0 | 厂商图标（通道卡与模型弹层的品牌图形取自它的 SVG 路径；图标与名称版权归各品牌，这里仅作品牌识别用） |
+| [sst/models.dev](https://github.com/sst/models.dev) | MIT | 模型上下文窗口 / 输出上限数据（`core/model-windows.mjs` 的来源） |
+| [Node.js](https://nodejs.org) | MIT | U 盘里的便携运行时（由 `setup-uagent.bat` 从 npmmirror 下载；发行包自带 LICENSE，整盘分发时别删） |
+
+### 二、只借了设计 / 做法（代码是对照设计重写的，没有整段复制）
+
+- [zai-org/ZCode](https://github.com/zai-org/ZCode)（Apache-2.0）——对话渲染设计语言（单行工具卡 + 动词标签 + 文件名徽章 + 悬停才出的箭头、思考行「思考 · 持续了 N 秒」、只读分组头「查阅 · N 个文件」）、空态首页的层次（居中问候 + 内联输入框 + 推荐任务 + 背后水印）、设置面板与命令台的信息架构
+- [liliMozi/openhanako](https://github.com/liliMozi/openhanako)（Apache-2.0）——人格与记忆的做法：人格 = 跟着 agent 走的可编辑文件 + 语言模板回落 + 预设；记忆 = 编译成有上限的产物 + 一键整理；以及「写人格的手艺」（行为规则胜过形容词、语言指纹、台词范例、去模板感）
+- [openai/codex](https://github.com/openai/codex)（Apache-2.0）——交互与工程做法：审批作用域、超长输出落盘可恢复、`/goal` 完成标准、`/init`
+- [sst/opencode](https://github.com/sst/opencode)（MIT）——厂商预设的组织方式（厂商 → 协议 + 服务地址 + 候选模型）、命令面板（Ctrl+K）
+- [MiniMax-AI/MiniMax-Code](https://github.com/MiniMax-AI/MiniMax-Code)（MIT）——Enter 排队接着说、回退对话等交互
+- [MoonshotAI/kimi-cli](https://github.com/MoonshotAI/kimi-cli)（Apache-2.0）——中断提醒、上下文压缩的取舍
+- Claude Code / Codex 的公开文档与产品交互 —— 细节参考（`/compact`、`/thinking`、Esc 语义、回退与分叉）
+
+> 第二类只影响「怎么做」，没有搬运代码；如果你要在自己的分支里直接搬上面某个仓库的文件，请在文件头留一行「来源 + 协议」，
+> 并按 MIT / Apache-2.0 的要求带上版权声明（Apache-2.0 还需保留 NOTICE）。
+
 ## License
 
-MIT © 2026 cmchen（[shi-tou1234](https://github.com/shi-tou1234)）。感谢 DeepSeek Harness（MIT）与各便携打包项目的开源贡献。
+MIT © 2026 cmchen（[shi-tou1234](https://github.com/shi-tou1234)）。
