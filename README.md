@@ -110,10 +110,6 @@ runtime|data|config.json   运行时与数据（不进 git）
 - 模型思考会占输出额度（anthropic 协议默认开启，预算取输出上限的 1/4；嫌慢嫌贵可在通道卡里关掉，`/thinking` 只关显示）
 - shell 30 秒超时、输出 200KB 截断；只支持 Win10/11 x64
 
-## Roadmap（对标 codex，已记账待排）
-
-OAuth 订阅登录（不填钥匙用会员）、按 hunk 逐个接受改动、后台常驻 shell（/ps）、设置面板长文案与工具卡的英文翻译补齐。
-
 ## License
 
 MIT © 2026 cmchen（[shi-tou1234](https://github.com/shi-tou1234)）。感谢 DeepSeek Harness（MIT）与各便携打包项目的开源贡献。
