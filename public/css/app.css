@@ -164,6 +164,13 @@ select.input { cursor: pointer; padding-right: 26px; appearance: none;
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 ul.dots { padding-left: 18px; color: var(--muted); font-size: 13px; }
+/* 人格面板：预设胶囊 + 三列风格下拉 */
+.chips { display: flex; flex-wrap: wrap; gap: 7px; }
+.chip { padding: 5px 12px; border: 1px solid var(--line); border-radius: 99px; background: var(--surface); color: var(--muted); font-size: 12.5px; cursor: pointer; }
+.chip:hover { border-color: var(--line-strong); color: var(--fg); }
+.chip.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.row-actions { display: inline-flex; gap: 8px; }
 ul.dots li { margin: 3px 0; }
 
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); margin-bottom: 14px; overflow: hidden; }
@@ -207,6 +214,10 @@ ul.dots li { margin: 3px 0; }
 
 .dirty { font-size: 12.5px; color: var(--warn); display: inline-flex; align-items: center; gap: 6px; }
 .dirty::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
+.dirty.ok { color: var(--ok); }
+.dirty.ok::before { background: var(--ok); }
+.dirty.bad { color: var(--danger); }
+.dirty.bad::before { background: var(--danger); }
 
 .toasts { position: fixed; right: 18px; bottom: 18px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; max-height: calc(100vh - 36px); overflow: hidden; }
 .toast {
@@ -292,20 +303,53 @@ ul.dots li { margin: 3px 0; }
 /* 内容列加宽一点（代码和 diff 更好读），底部多留白，最后一条消息不会被输入框压住 */
 .stream-inner { max-width: 940px; margin: 0 auto; padding: 20px 24px 140px; }
 
-.welcome { padding: 5vh 0 10px; }
-.welcome-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-.welcome-brand .mark { width: 40px; height: 40px; border-radius: 12px; background: var(--accent); color: #fff;
-  display: grid; place-items: center; box-shadow: var(--shadow-sm); }
-[data-theme="dark"] .welcome-brand .mark { color: var(--accent-fg); }
-.welcome-brand .mark .ic { width: 22px; height: 22px; stroke-width: 2; }
-.welcome h1 { font-size: 20px; font-weight: 650; letter-spacing: -.01em; }
-.welcome .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
-.prompt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 20px; }
-.prompt-card { text-align: left; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-lg);
-  background: var(--surface); color: var(--fg); font-size: 13px; line-height: 1.6; transition: border-color .13s, transform .13s, box-shadow .13s; }
-.prompt-card:hover { border-color: var(--accent); box-shadow: var(--shadow-sm); transform: translateY(-1px); }
-.prompt-card .lead { display: block; font-size: 11.5px; color: var(--faint); margin-bottom: 2px; }
-.welcome-note { margin-top: 18px; font-size: 12px; color: var(--faint); display: flex; align-items: center; gap: 6px; }
+/* ---------- 空态首页（v9.14 对齐 zai-org/ZCode 草稿页） ----------
+   问候 / 输入框 / 推荐任务是一列：.main.home 时整列在视口里竖居中（margin:auto 把顶部栏留在原位），
+   发出第一句话后摘掉 .home，输入框滑回底部当普通会话页用 */
+.main.home > .stream { flex: 0 1 auto; margin-top: auto; }
+.main.home > .composer-wrap { margin-bottom: auto; }
+.main.home .stream-inner { padding: 0 24px; }
+.main.home .statusbar .ctx, .main.home .statusbar #ctxCompact, .main.home .composer-hint { display: none; }
+.welcome { position: relative; text-align: center; padding: 0 0 30px; }
+/* 问候背后那枚水印（学 ZCode：图标压在问候下面、往上挪一点、底部渐隐、极淡）。
+   形状是线稿、颜色吃 currentColor，所以明暗主题共用一份；字号那行永远盖在它上面 */
+.welcome-mark { position: absolute; left: 50%; top: 50%; z-index: 0; width: min(64vw, 25rem); color: var(--fg); opacity: .15;
+  transform: translate(-50%, -60%); pointer-events: none; user-select: none;
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 72%, rgba(0,0,0,.45) 88%, transparent 98%);
+  mask-image: linear-gradient(to bottom, #000 0%, #000 72%, rgba(0,0,0,.45) 88%, transparent 98%); }
+.welcome-mark svg { display: block; width: 100%; height: auto; }
+[data-theme="dark"] .welcome-mark { opacity: .24; }
+.welcome-hello, .welcome-sub { position: relative; z-index: 1; }
+.welcome-hello { font-size: clamp(21px, 3.2vw, 30px); font-weight: 600; letter-spacing: .01em; margin: 0 0 9px; color: var(--fg); }
+.welcome-sub { font-size: 12.5px; color: var(--faint); margin: 0; }
+/* 工作区胶囊：输入框上方那行（状态条）的左起第一颗，首页和会话里都在——换工作区不用再跑一趟设置。
+   宽度用固定上限（别用百分比：它挂在 shrink-to-fit 的 .pop-anchor 上，百分比会解成很小的值，
+   字被挤成一个省略号——2026-10-14 领导报的「胶囊不显示文字」就是这个） */
+.sb-ws { display: inline-flex; align-items: center; gap: 6px; max-width: 360px; height: 24px; padding: 0 8px;
+  border: 1px solid var(--line); border-radius: 99px; background: var(--surface); color: var(--muted);
+  font-size: 12px; overflow: hidden; cursor: pointer; flex: 0 1 auto; min-width: 0; transition: border-color .13s, color .13s, background .13s; }
+.sb-ws:hover { border-color: var(--line-strong); color: var(--fg); background: var(--hover); }
+.sb-ws[aria-expanded="true"] { border-color: var(--accent); color: var(--fg); }
+.sb-ws .ic { color: var(--faint); flex: none; }
+.sb-ws .caret { opacity: .5; }
+.sb-ws span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pop-ws { width: 380px; }
+.pop-note { display: block; padding: 4px 10px 2px; font-size: 11.5px; color: var(--faint); }
+/* 推荐任务（ZCode 的 ConversationDraftSuggestedPrompts 列表式）：一屏 4 条 + 换一批 / 收起 */
+.home-tasks { max-width: 940px; margin: 4px auto 0; }
+.ht-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px 4px;
+  font-size: 12px; color: var(--faint); }
+.ht-ops { display: flex; align-items: center; gap: 2px; }
+.ht-ops button { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: var(--r-sm);
+  font-size: 11.5px; color: var(--faint); }
+.ht-ops button:hover { background: var(--hover); color: var(--fg); }
+.ht-item { display: flex; align-items: center; gap: 11px; width: 100%; padding: 9px 12px; border-radius: var(--r);
+  text-align: left; font-size: 13.5px; color: var(--fg); }
+.ht-item:hover { background: var(--hover); }
+.ht-ic { display: grid; place-items: center; width: 26px; height: 26px; flex: none; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--line); color: var(--muted); }
+.ht-item:hover .ht-ic { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.ht-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .msg { margin-bottom: 18px; }
 .msg-row { display: flex; gap: 10px; align-items: flex-start; }
@@ -392,9 +436,8 @@ ul.dots li { margin: 3px 0; }
 .keys-row { display: flex; align-items: center; gap: 12px; padding: 6px 10px; font-size: 13px; color: var(--muted); }
 .keys-row kbd { flex: none; min-width: 170px; font-family: var(--mono); font-size: 11.5px; color: var(--fg);
   background: var(--bg); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 6px; padding: 2px 8px; text-align: center; }
-/* 正式图标（领导提供）：品牌位 / 空态水印 / 关于页 */
+/* 正式图标（领导提供）：侧栏品牌位 / 关于页 */
 img.brand-mark { object-fit: cover; display: block; }
-.welcome-brand img.mark { width: 40px; height: 40px; border-radius: 10px; object-fit: cover; display: block; flex: none; }
 .about-brand img { width: 56px; height: 56px; border-radius: 14px; object-fit: cover; display: block; }
 /* ================= v9.10：十二件 UI 批（学 ZCode 开源实现） ================= */
 /* 回合导航条：会话左缘一列细条，鼠标扫过成"山峰"，点击直跳（fixed 定位，不随滚动走） */
@@ -458,9 +501,7 @@ img.brand-mark { object-fit: cover; display: block; }
   -webkit-mask-image: linear-gradient(90deg, transparent, #000 12%, #000 85%, transparent);
   mask-image: linear-gradient(90deg, transparent, #000 12%, #000 85%, transparent); }
 .think:not([open]) .th-peek { display: inline-block; }
-/* 空态首屏 v2：时段问候（大 Logo 水印已按领导反馈去掉） */
-.welcome { position: relative; }
-.welcome-hello { font-size: clamp(20px, 3.2vw, 30px); font-weight: 600; letter-spacing: .01em; margin: 2px 0 14px; color: var(--fg); }
+/* 空态首屏 v3 的样式统一在「空态首页」那一段（问候/输入框/推荐任务的竖居中布局） */
 .sess-ops { display: flex; justify-content: flex-end; align-items: center; min-height: 22px; margin: 0 10px 4px; font-size: 12px; }
 .sess-ops > button { font-size: 11.5px; color: var(--muted); padding: 2px 9px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); cursor: pointer; }
 .sess-ops > button:hover { color: var(--fg); border-color: var(--line-strong); }
@@ -826,6 +867,9 @@ img.brand-mark { object-fit: cover; display: block; }
 
 .wiz-head { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
 .wiz-head b { font-size: 14px; }
+/* 第一步要限制高度、让里面的 .vendor-list 自己滚：不然列表撑到 1100px 高，
+   被 sheet 的 overflow:hidden 从下面裁掉——看着就像「有些厂商没列出来」 */
+#wizStep1 { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 #wizStep2 { padding: 15px 16px; overflow-y: auto; flex: 1; }
 .adv summary { cursor: pointer; font-size: 12.5px; color: var(--muted); padding: 4px 0; }
 .adv summary:hover { color: var(--fg); }
@@ -856,7 +900,8 @@ img.brand-mark { object-fit: cover; display: block; }
     transition: transform .2s; box-shadow: var(--shadow-lg); }
   .sidebar.open { transform: none; }
   .hide-wide { display: inline-flex; }
-  .prompt-grid { grid-template-columns: 1fr; }
+  .main.home .stream-inner { padding: 0 16px; }
+  .sb-ws { max-width: 240px; }
   .sheet-body { grid-template-columns: 142px 1fr; }
 }
 @media (max-width: 620px) {
@@ -865,12 +910,19 @@ img.brand-mark { object-fit: cover; display: block; }
   .sheet-body { grid-template-columns: 1fr; }
   .sheet-nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
   .sheet-nav button { width: auto; white-space: nowrap; margin-bottom: 0; }
-  .grid-2, .prov-grid { grid-template-columns: 1fr; }
+  .grid-2, .grid-3, .prov-grid { grid-template-columns: 1fr; }
   .choice-list.two-col { grid-template-columns: 1fr; }
   .aa-desc { display: none; }
   .topbar-title { max-width: 34%; }
   .sb-aa { display: none; }
   .ctx-bar { width: 56px; }
+  /* 窄屏：工作区胶囊收窄但保留文字（当前目录得看得见），给发送键腾地方要靠其它芯片 */
+  .sb-ws { max-width: 150px; }
+  /* 输入条窄屏：模型名再收一档、「计划 / 附件」只留图标，别把发送键挤出屏幕 */
+  .composer-bar { flex-wrap: wrap; }
+  .tool-pill.pill-sm { max-width: 158px; }
+  .tool-pill.pill-sm .tool-pill-text { max-width: 96px; }
+  .pill-label { display: none; }
 }
 
 /* ---------- 6.6 思考过程（对标 Claude Code 的「已思考 N 秒」/ OpenCode 的 /thinking） ---------- */

@@ -18,6 +18,7 @@ import { loadCommands, loadSkills, skillsPromptSection, expandCommand } from "./
 import { MODES, DEFAULT_AUTO_APPROVE } from "./core/modes.mjs";
 import { McpHub } from "./core/mcp.mjs";
 import { loadHookSources, matchHooks, runHookBatch } from "./core/hooks.mjs";
+import { PERSONA_PRESETS, VOICE_LENGTHS, VOICE_STYLES, VOICE_LANGS, normalizeVoice } from "./core/persona.mjs";
 import { readJson, writeJson, writeFileAtomic, genId, truncate } from "./core/util.mjs";
 import { runChecks, fixPrompt, checkSummary, CHECKS_MAX_FIX } from "./core/checks.mjs";
 import { listJobs, jobLog, stopJob, runningCount, killAllJobs } from "./core/jobs.mjs";
@@ -29,7 +30,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 
 const sessions = new Sessions(path.join(DATA, "sessions"));
@@ -105,6 +106,8 @@ function loadState() {
     searchKeys: vault.searchKeys || {},
     autoApprove: { ...DEFAULT_AUTO_APPROVE, ...(settings.autoApprove || {}), actions: { ...DEFAULT_AUTO_APPROVE.actions, ...((settings.autoApprove || {}).actions || {}) } },
     assist: settings.assist || "", // 轻量通道：起名/压缩这类杂活用，留空=跟随当前通道
+    // 人格与表达风格（全默认 = 什么都不注入，模型原样输出）
+    voice: normalizeVoice(settings.voice),
     autoCompactAt: settings.autoCompactAt === 0 ? 0 : Number(settings.autoCompactAt) > 0 ? Number(settings.autoCompactAt) : 0.8, // 上下文涨到这个比例就自动压缩（0=关）
     // 改动后的自动检查：test / lint 命令行（在工作区里跑；auto=改过文件就自动跑，失败回喂模型自修）
     checks: { test: settings.checks?.test || "", lint: settings.checks?.lint || "", auto: settings.checks?.auto !== false },
@@ -132,6 +135,7 @@ function saveState(patch) {
   const autoApprove = patch.autoApprove ?? cur.autoApprove;
   const assist = patch.assist ?? cur.assist;
   const autoCompactAt = patch.autoCompactAt ?? cur.autoCompactAt;
+  const voice = patch.voice !== undefined ? normalizeVoice(patch.voice) : cur.voice;
   const checks = patch.checks
     ? { test: String(patch.checks.test || "").slice(0, 300), lint: String(patch.checks.lint || "").slice(0, 300), auto: patch.checks.auto !== false }
     : cur.checks;
@@ -139,7 +143,7 @@ function saveState(patch) {
   const vault = { providers: {}, searchKeys: searchKeys || {} };
   for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
   vaultSave(vault);
-  writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt, checks, extraRoots, proxy });
+  writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt, checks, extraRoots, proxy, voice });
   stateCache = null; // 写盘了，缓存作废
   return loadState();
 }
@@ -266,6 +270,7 @@ const briefArgs = (a) => {
 const sessionLoopGuard = new Map(); // sessionId → {lastSig, count}：防死循环的连续重复计数（跨轮保持）
 
 const MEMORY = path.join(DATA, "memory.md");
+const PERSONA = path.join(DATA, "persona.md"); // 人格正文（可编辑；空 = 不注入，走模型原样）
 const SPILL_DIR = path.join(DATA, "spill"); // 超长工具输出落盘的地方（给模型留一条可恢复的路径）
 
 // 超长工具结果：掐头去尾 + 全文落盘 + 告诉模型怎么读回来（对标 dsh 的 spill 策略，比纯截断友好）
@@ -294,6 +299,14 @@ const TITLES = path.join(DATA, "titles.json");
 const readMemory = () => {
   try {
     return fs.readFileSync(MEMORY, "utf8").slice(0, 4096);
+  } catch {
+    return "";
+  }
+};
+// 人格正文：一份可编辑的 md（学 openhanako：人格是跟着 agent 走的一层，文件放盘上、随手能改）
+const readPersona = () => {
+  try {
+    return fs.readFileSync(PERSONA, "utf8").slice(0, 4096);
   } catch {
     return "";
   }
@@ -747,6 +760,8 @@ async function handleChat(req, res, body) {
     state: lastPlan ? { plan: lastPlan } : {},
     autoCount: 0, // 本轮连续自动放行的次数（上限到了就回来问）
     memory: readMemory(),
+    persona: readPersona(), // 人格正文（空 = 不注入）
+    voice: st.voice, // 表达风格三档（默认/简短/详细 …）
     agentsMd: agentsMdOf(st.workspace),
     skillsText: skillsPromptSection(loadSkills({ workspace: st.workspace, uaHome: UA_HOME })), // 技能清单：只有名字与说明
     checks: st.checks, // test / lint 命令（run_checks 工具与轮末自动检查共用）
@@ -1123,6 +1138,7 @@ const server = http.createServer(async (req, res) => {
       if (b.autoApprove !== undefined) patch.autoApprove = b.autoApprove;
       if (b.assist !== undefined) patch.assist = String(b.assist || "");
       if (b.autoCompactAt !== undefined) patch.autoCompactAt = Math.max(0, Math.min(0.95, Number(b.autoCompactAt) || 0));
+      if (b.voice !== undefined) patch.voice = normalizeVoice(b.voice); // 人格/风格/语言（全默认=不注入）
       if (b.checks !== undefined) patch.checks = b.checks;
       const st = saveState(patch);
       return sendJson(res, 200, maskState(st));
@@ -1153,6 +1169,50 @@ const server = http.createServer(async (req, res) => {
       fs.mkdirSync(DATA, { recursive: true });
       fs.writeFileSync(MEMORY, t, "utf8");
       return sendJson(res, 200, { ok: true, chars: t.length });
+    }
+    // 人格：正文存 data/persona.md（可编辑），风格三档存 settings.voice。
+    // GET 一次把预设与选项都给前端（预设文案只在这一个地方维护，避免前后端各抄一份）
+    if (req.method === "GET" && u.pathname === "/api/persona") {
+      const st = loadState();
+      return sendJson(res, 200, {
+        text: readPersona(),
+        voice: st.voice,
+        presets: PERSONA_PRESETS,
+        lengths: VOICE_LENGTHS,
+        styles: VOICE_STYLES,
+        langs: VOICE_LANGS,
+      });
+    }
+    if (req.method === "POST" && u.pathname === "/api/persona") {
+      const b = await readBody(req);
+      const t = String(b.text || "").slice(0, 4000);
+      fs.mkdirSync(DATA, { recursive: true });
+      writeFileAtomic(PERSONA, t); // 原子写：这个文件每轮都要读
+      return sendJson(res, 200, { ok: true, chars: t.length });
+    }
+    // 记忆整理（学 openhanako 的"记忆编译"思路，缩到 u-agent 的体量）：
+    // 让轻量通道把 memory.md 压成要点，用户点一下就行；省 token、也让记忆更干净
+    if (req.method === "POST" && u.pathname === "/api/memory-compact") {
+      const st = loadState();
+      const cur = readMemory();
+      if (!cur.trim()) return sendJson(res, 400, { error: "记忆还是空的，不用整理" });
+      const provider = pickAssist(st, st.providers.find((p) => p.name === st.active));
+      if (!provider) return sendJson(res, 400, { error: "没有可用的模型通道（整理要借一个模型跑一遍）" });
+      const prompt =
+        "下面是一份「跨会话记忆」清单（agent 用来记住主人的偏好与约定）。请把它压缩整理成更短的要点：\n" +
+        "· 保留：长期有效的偏好、约定、事实、称呼、项目关键信息\n" +
+        "· 合并重复的、删掉临时的和已经过时的\n" +
+        "· 用 markdown 列表输出，每条一句话，最多 12 条；不要解释、不要前言\n\n" +
+        "原文：\n" + cur;
+      try {
+        const out = (await askOnce(provider, prompt, 60000)).slice(0, 4000).trim();
+        if (!out) return sendJson(res, 400, { error: "模型没吐出内容，换个通道再试" });
+        fs.mkdirSync(DATA, { recursive: true });
+        writeFileAtomic(MEMORY, out.endsWith("\n") ? out : out + "\n");
+        return sendJson(res, 200, { ok: true, before: cur.length, after: out.length, text: readMemory(), by: provider.name });
+      } catch (e) {
+        return sendJson(res, 500, { error: "整理失败：" + (e.message || e) });
+      }
     }
     // 本机信息与 U 盘位置（给设置页「这台电脑 / 关于」用）
     if (req.method === "GET" && u.pathname === "/api/info") {
