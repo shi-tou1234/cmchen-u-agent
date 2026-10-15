@@ -121,6 +121,10 @@ export function commandSegments(cmd) {
   return out.map((x) => x.trim()).filter(Boolean);
 }
 
+// 「只读」也得看参数：命令名再无害，配上越界路径就是偷看（审查 #7 同族；领导 2026-10-15 复审点出）
+const ABS_PATH = /(^|[\s"'=])([a-zA-Z]:[\\/]|\\\\|\/(?!\/))/; // C:\ / \\server\ / 以 / 开头
+const DOTDOT = /(^|[\s"'=])\.\.([\\/]|$)/; // ..\ 或 ../
+const ENV_DUMP = /^\s*(set|env)\s*$/i; // 裸 set（cmd 倒全部环境变量）/ 裸 env —— 环境变量里可能有钥匙
 export function isSafeCommand(cmd) {
   const segs = commandSegments(cmd);
   if (!segs.length) return false;
@@ -128,6 +132,8 @@ export function isSafeCommand(cmd) {
   return segs.every((seg) => {
     if (seg.includes(">")) return false;
     if (RISKY_TOKEN.test(seg)) return false;
+    if (ABS_PATH.test(seg) || DOTDOT.test(seg)) return false; // type C:\Users\…\id_rsa、cat ../../secret 都不算只读
+    if (ENV_DUMP.test(seg)) return false;
     return SAFE_CMD.test(seg);
   });
 }

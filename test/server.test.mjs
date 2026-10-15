@@ -523,6 +523,18 @@ test("缓存占比不会超 100%：网关把「命中」和「新输入」分开
   assert.ok(u.cached <= u.input, "占比必须 ≤ 100%");
 });
 
+test("CSRF：写操作带外站 Origin 一律 403，本机/无 Origin 照常", async () => {
+  const body = JSON.stringify({ workspace: wsDir });
+  const bad = await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json", origin: "https://evil.example" }, body });
+  assert.equal(bad.status, 403, "跨站来源要拒");
+  const badLock = await jfetch("/api/lock-set", { method: "POST", headers: { "content-type": "application/json", origin: "https://evil.example" }, body: JSON.stringify({ password: "hacked" }) });
+  assert.equal(badLock.status, 403, "免鉴权路径（lock-set）同样要拒");
+  const good = await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json", origin: BASE }, body });
+  assert.equal(good.status, 200, "本机页面照常可用");
+  const native = await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body });
+  assert.equal(native.status, 200, "没有 Origin 的原生客户端（curl）照常可用");
+});
+
 test("验收Q：覆盖写 confirm_request 带 diff 预览", async () => {
   await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir }) });
   const sid = "s-preview-test";

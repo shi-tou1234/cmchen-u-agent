@@ -33,6 +33,43 @@ export function rewindRanges(events) {
 
 export const isDropped = (ranges, i) => ranges.some((r) => i > r.atIndex && i < r.marker);
 
+// tool_call 与 tool_result 配平（严格网关的硬要求：assistant 里每个 tool_call 都必须有对应结果，
+// 否则下一轮请求直接 400）。会话被中止/崩在工具执行中间时，日志里就会留下"有调用没结果"——
+// 这里补一条合成结果；顺序按 tool_calls 排（回填顺序也要对）。多出来的孤儿 tool 消息一并丢掉。
+function pairToolCalls(msgs) {
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m.role !== "assistant" || !m.toolCalls?.length) continue;
+    const byId = new Map();
+    let j = i + 1;
+    while (j < msgs.length && msgs[j].role === "tool") {
+      if (!byId.has(msgs[j].toolCallId)) byId.set(msgs[j].toolCallId, msgs[j]);
+      j++;
+    }
+    const have = j - (i + 1);
+    const filled = m.toolCalls.map((tc) => byId.get(tc.id) || {
+      role: "tool",
+      toolCallId: tc.id,
+      toolName: tc.name,
+      text: "（这一步没有产生结果：这一轮在工具执行途中被中断，实际是否已生效未知——需要时先检查现状）",
+    });
+    // 数量/顺序都可能不对：整块换掉（只在真的不配平时才动，保持原样时零开销）
+    const same = have === m.toolCalls.length && m.toolCalls.every((tc, k) => msgs[i + 1 + k]?.toolCallId === tc.id);
+    if (!same) msgs.splice(i + 1, have, ...filled);
+    i += filled.length;
+  }
+  // 孤儿 tool 消息（前面找不到对应调用）：删掉（严格网关同样会 400）
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role !== "tool") continue;
+    let owner = null;
+    for (let k = i - 1; k >= 0; k--) {
+      if (msgs[k].role === "assistant" && msgs[k].toolCalls?.length) { owner = msgs[k]; break; }
+      if (msgs[k].role === "user") break;
+    }
+    if (!owner || !owner.toolCalls.some((tc) => tc.id === msgs[i].toolCallId)) msgs.splice(i--, 1);
+  }
+}
+
 // 会话事件 → 统一消息数组。
 // 轮次归属：assistant_message 与紧随的 tool_call/tool_result 属同一轮，合并成
 // assistant{text, toolCalls} + tool 消息各一条，避免把一个回合拆成多条 assistant。
@@ -108,6 +145,7 @@ export function buildHistory(events, at = null) {
     }
   }
   flushCur(events.length);
+  pairToolCalls(msgs);
   if (compact) {
     // 合成消息放在最前面：摘要 + 压缩时特意留住的「更早那段的最近用户原话」
     msgs.unshift({ role: "system", text: `【更早对话的摘要，供延续上下文】\n${compact.summary}` });

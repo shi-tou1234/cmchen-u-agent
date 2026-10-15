@@ -2,7 +2,7 @@
 import { api, net } from "./api.js";
 import { S, setMode, MODES, MODE_HINT, MODE_HINT_EN, ACTION_META } from "./state.js";
 import { $, $$, el, esc, icon, md, toast, kb, tok } from "./ui.js";
-import { renderModelBtn, renderModeBtn, cycleMode, openModelPop, openModePop, openDepthPop, providerReady } from "./picker.js";
+import { renderModelBtn, renderModeBtn, renderDepthBtn, cycleMode, openModelPop, openModePop, openDepthPop, providerReady } from "./picker.js";
 import { t, getLang } from "./i18n.js";
 import { ping, askPermission } from "./notify.js";
 
@@ -466,9 +466,10 @@ function handleEvent(ev, c) {
     case "auto_fix": noteLine("自动检查没过，已把输出交给它接着修（第 " + ev.round + " 轮）"); break;
     case "confirm_request": queueConfirm(ev); break;
     case "subagent_event": handleSub(ev, c.subs); break;
-    case "error": clearReconnect(c); finishAi(c.getStream()); addError(ev.message); toast(ev.message, "err"); ping("出错了", ev.message); break;
+    case "error": clearReconnect(c); stopThink(c); finishAi(c.getStream()); addError(ev.message); toast(ev.message, "err"); ping("出错了", ev.message); break;
     case "done": {
       clearReconnect(c);
+      stopThink(c); // 中止/断流时思考块还开着的话，别让「正在思考… N 秒」一直涨下去
       const node = c.getStream();
       const empty = !node.querySelector(".text").textContent && !c.getFull();
       if (empty) node.remove();
@@ -900,6 +901,17 @@ function finishAi(node, text) {
     node.querySelector(".msg-acts").innerHTML = `<button data-act="copy">${icon("copy", "ic ic-sm")}复制</button>`;
   }
   scrollEnd();
+}
+
+// 结束思考块（不改变已挂好的文本，只停计时器 + 收尾）——done / error 两条收尾路径都要走一遍
+function stopThink(c) {
+  if (!c?.think?.node) return;
+  finishThink(c.think.node, c.think.text, Date.now() - (c.think.started || Date.now()));
+  clearInterval(c.think.timer);
+  c.think.node = null;
+  c.think.text = "";
+  c.think.started = 0;
+  c.think.timer = null;
 }
 
 function addError(msg) {
@@ -2640,7 +2652,18 @@ export function initChat() {
     insertAtCaret(clean);
     toast(`粘贴内容里有 ${dirty} 个不可见字符，已清掉（防提示词走私）`, "err");
   });
-  $("#send").onclick = () => (S.sending ? abortRun() : sendMessage(txtEl().value));
+  // 发送键一发出去就变"停止"：手快双击（第二次点击在生成刚开始时）不该被当成"停止"——
+  // 500ms 内的第二次点击直接忽略（真要停就再点一下，或者用顶栏那颗明确的「停止」）
+  let sendAt = 0;
+  $("#send").onclick = () => {
+    const now = Date.now();
+    if (S.sending) {
+      if (now - sendAt < 500) return;
+      return abortRun();
+    }
+    sendAt = now;
+    sendMessage(txtEl().value);
+  };
   $("#runStop").onclick = () => abortRun();
   $("#sbJobs").onclick = () => toggleJobsPanel();
   refreshJobs();
@@ -2689,8 +2712,12 @@ export function initChat() {
   // 模式（本地记住上次选择，非法值回落到默认）
   if (!MODES.some((m) => m.id === S.mode)) setMode("confirm");
   // 模式/通道的切换统一由顶栏弹层发出事件，这里只负责刷新提示文案与发送按钮
-  window.addEventListener("ua:mode-change", () => setSendUI());
-  window.addEventListener("ua:model-change", () => api.saveSettings({ active: S.active }).catch(() => {}));
+  window.addEventListener("ua:mode-change", () => { renderModeBtn(); setSendUI(); });
+  window.addEventListener("ua:model-change", () => {
+    renderModelBtn(); // 命令面板切模型时，胶囊也要立刻跟着变（原来得刷新页面）
+    renderDepthBtn(); // 思考深度的档位列表跟着模型换
+    api.saveSettings({ active: S.active }).catch(() => {});
+  });
   // Esc 关确认弹窗交给 app.js 的快捷键链（closeOverlays 第一优先级会把它裁决掉）——
   // 这里不再单独监听，免得出现「这里先 hidden、链条看不到、接着把整轮 abort 掉」的打架。
   setSendUI();

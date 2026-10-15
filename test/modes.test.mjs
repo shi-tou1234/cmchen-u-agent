@@ -107,6 +107,22 @@ test("v7 安全命令判定：只读放行，带副作用的一律不放", () =>
   }
 });
 
+test("安全命令：命令名再无害，越界路径 / .. / 裸 set·env 都不算只读", async () => {
+  const { isSafeCommand } = await import("../core/modes.mjs");
+  // 还是只读的（相对路径、工作区内）
+  assert.ok(isSafeCommand("type hello.txt"));
+  assert.ok(isSafeCommand("cat README.md"));
+  assert.ok(isSafeCommand("dir"));
+  assert.ok(isSafeCommand("git status"));
+  // 越界读：绝对路径、上级目录、环境变量倾倒 —— 都要人点确认（勾了"跑安全命令"也不能静默跑）
+  assert.ok(!isSafeCommand("type C:\\Users\\me\\.ssh\\id_rsa"), "绝对路径不算只读");
+  assert.ok(!isSafeCommand("cat /etc/passwd"), "POSIX 绝对路径不算只读");
+  assert.ok(!isSafeCommand("cat ..\\..\\secret.txt"), ".. 不算只读");
+  assert.ok(!isSafeCommand("set"), "裸 set（倒全部环境变量）不算只读");
+  assert.ok(!isSafeCommand("env"), "裸 env 不算只读");
+  assert.ok(!isSafeCommand("type C:\\Users\\me\\.ssh\\id_rsa | findstr KEY"), "复合命令里有一段越界就整条不算");
+});
+
 test("v7 gateWith：套餐没要求确认时，开关不起作用", () => {
   // full 直接放行、readonly 直接拒绝，都不该被自动放行改写
   assert.deepEqual(gateWith("full", "high", { toolName: "fs_delete", autoApprove: aa({ deleteFiles: true }) }), { g: "run", auto: false });

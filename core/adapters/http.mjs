@@ -132,15 +132,36 @@ export function friendlyUpstreamError(status, body, provider) {
   return `模型服务返回 HTTP ${status}：${tail || "（没有正文）"}`;
 }
 
+// 空闲看门狗：网关"连上了但不吐字"是真实会发生的（尤其高峰期限流），原来只有用户 Esc 能救。
+// UA_STREAM_IDLE_MS 可调（默认 120s，够慢模型的首字；测试里改小）。
+const idleMsOf = () => (Number(process.env.UA_STREAM_IDLE_MS) > 0 ? Number(process.env.UA_STREAM_IDLE_MS) : 120000); // 调用时读：模块加载时读的话，测试/运行期改不了（踩过两次）
+
 async function* sseLines(res) {
+  const IDLE_MS = idleMsOf();
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
   while (true) {
     let chunk;
     try {
-      chunk = await reader.read();
+      chunk = IDLE_MS > 0
+        ? await new Promise((resolve, reject) => {
+            // 每次读都重新计时：只要还在吐字就不算卡死；超过 IDLE_MS 没一个字 → 断开
+            const timer = setTimeout(() => {
+              reader.cancel().catch(() => {});
+              const err = new Error(`模型连着但 ${Math.max(1, Math.round(IDLE_MS / 1000))} 秒没有吐任何内容，已断开（可以重发这一条，或稍后再试）`);
+              err.retryable = true; // 还没吐出内容 → 外层重试壳会自动重连
+              reject(err);
+            }, IDLE_MS);
+            reader.read().then(
+              (r) => { clearTimeout(timer); resolve(r); },
+              (e) => { clearTimeout(timer); reject(e); }
+            );
+          })
+        : await reader.read();
     } catch (e) {
+      if (e?.name === "AbortError") throw e;
+      if (e?.retryable) throw e; // 看门狗自己抛的，直接往上走
       // 流跑到一半被掐断（网关超时、断网）：说清楚是"中途断了"，不是"连不上"。
       // 标成可重试——外层重试壳只在「还什么都没吐出来」时才敢重发
       if (e?.name === "AbortError") throw e;
@@ -158,6 +179,7 @@ async function* sseLines(res) {
       if (line.startsWith("data:")) yield line.slice(5).trim();
     }
   }
+  buf += decoder.decode(); // 收尾 flush：多字节字符正好卡在最后一片时，不 flush 会丢字
   if (buf.trim().startsWith("data:")) yield buf.trim().slice(5).trim();
 }
 

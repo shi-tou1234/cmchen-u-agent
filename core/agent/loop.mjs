@@ -26,6 +26,13 @@ function envMaxSteps() {
   const n = Number(process.env.UA_MAX_STEPS);
   return Number.isFinite(n) && n > 0 ? n : Infinity;
 }
+// 长任务软提醒：跑到这些步数时给模型一句"要不要收尾"，**只是提醒、绝不硬停**（硬上限已退役）。
+// 对标 ZCode 的可选 toolCallWarningThreshold（默认不提醒，这里给了两个档；UA_STEP_WARN 可覆盖，如 "3,5"）
+const stepWarnOf = () => (process.env.UA_STEP_WARN || "60,150")
+  .split(",")
+  .map((x) => Number(x.trim()))
+  .filter((n) => Number.isFinite(n) && n > 0); // 调用时读（测试要能改）
+
 // 重复调用的提醒：首次跨过 3 次提醒一句；整个用户轮次最多提醒 3 次，避免提醒本身变成上下文噪音
 // （对标 ZCode 的 repeatedToolCallWarningThreshold=3 与 maxBudgetWarningsPerTurn=3）
 const REPEAT_WARN_AT = 3;
@@ -379,10 +386,19 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
           }
         }
       }
+      // 软提醒：跑够步数就往最后一条工具结果里附一句（随结果一起落盘 → 下一轮重建一致，缓存前缀不乱）
+      const warnAt = stepWarnOf().find((n) => n === steps);
       for (let idx = 0; idx < ended.toolCalls.length; idx++) {
         const tc = ended.toolCalls[idx];
         // 结果已经过 spill 处理（该落的盘都落了），这里只做个保险截断
-        history.push({ role: "tool", toolCallId: tc.id, toolName: tc.name, text: truncate(results[idx] ?? "（这一步没有产生结果）", 48000) });
+        let text = results[idx] ?? "（这一步没有产生结果）";
+        if (warnAt && idx === ended.toolCalls.length - 1) {
+          text += `\n\n<system-reminder>这一轮已经连续跑了 ${steps} 步。如果接近完成，请收尾并给出结论；如果还有事没做完，说明下一步要做什么再继续。不要为了凑步数而重复已经做过的事。</system-reminder>`;
+          yield { type: "tool_result", id: tc.id, name: tc.name, ok: true, text, soft: true };
+          history.push({ role: "tool", toolCallId: tc.id, toolName: tc.name, text: truncate(text, 48000) });
+          continue;
+        }
+        history.push({ role: "tool", toolCallId: tc.id, toolName: tc.name, text: truncate(text, 48000) });
       }
     }
     // 只有 UA_MAX_STEPS 调试闸被显式设过才会走到这里；默认无上限时循环由「模型不再要工具」结束
