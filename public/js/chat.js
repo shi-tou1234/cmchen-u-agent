@@ -1,8 +1,8 @@
 // 对话区：消息渲染、SSE 收发、工具/计划卡、高危确认、斜杠命令、附件
 import { api, net } from "./api.js";
 import { S, setMode, MODES, MODE_HINT, MODE_HINT_EN, ACTION_META } from "./state.js";
-import { $, $$, el, esc, icon, md, toast, kb } from "./ui.js";
-import { renderModelBtn, renderModeBtn, cycleMode, openModelPop, openModePop, providerReady } from "./picker.js";
+import { $, $$, el, esc, icon, md, toast, kb, tok } from "./ui.js";
+import { renderModelBtn, renderModeBtn, cycleMode, openModelPop, openModePop, openDepthPop, providerReady } from "./picker.js";
 import { t, getLang } from "./i18n.js";
 import { ping, askPermission } from "./notify.js";
 
@@ -178,6 +178,7 @@ export async function sendMessage(text, opts = {}) {
   // 不带参数的命令：直接给反馈（调弹层 / 出状态卡），别让它落回 default 把输入框清空、像"回车没反应"
   if (clean === "/mode") { clearComposer(); openModePop(); return; }
   if (clean === "/model") { clearComposer(); openModelPop(); return; }
+  if (clean === "/depth") { clearComposer(); openDepthPop(); return; } // 思考深度：跟 /model 一样就地弹
   if (clean === "/help" || clean === "/status") { clearComposer(); showStatus(true); return; }
 
   let body = clean;
@@ -334,7 +335,7 @@ function handleEvent(ev, c) {
       // 自动压缩（服务端在发问之前做的）：说一声并刷新用量条
       if (ev.auto) {
         if (ev.after) S.budget = ev.after;
-        toast("上下文快满了，已自动压缩：" + kTok(ev.before?.tokens || 0) + " → " + kTok(ev.after?.tokens || 0) + " tokens", "ok");
+        toast("上下文快满了，已自动压缩：" + tok(ev.before?.tokens || 0) + " → " + tok(ev.after?.tokens || 0) + " tokens", "ok");
       }
       break;
     }
@@ -881,8 +882,8 @@ function rewindLine(r) {
 }
 
 function addStream() {
+  // 助手消息不再带头像图标（领导点名去掉那个「闪电」）：整块回答直接铺开，靠留白分界
   const node = el(`<div class="msg assistant"><div class="msg-row">
-      <span class="avatar-mark">${icon("sparkle", "ic ic-sm")}</span>
       <div class="msg-body"><div class="md"><span class="text"></span><span class="cursor"></span></div><div class="msg-acts"></div></div>
     </div></div>`);
   colEl().appendChild(node);
@@ -1474,30 +1475,43 @@ export function renderHistory(events) {
 }
 
 /* ================= 用量 / 提示 ================= */
-// 上下文占用按「这个模型真实能吃多少 token」显示（窗口数据来自 models.dev），不再拿写死的字数吓人
-const kTok = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n || 0));
-
+// 上下文占用按「这个模型真实能吃多少 token」显示（窗口数据来自 models.dev），不再拿写死的字数吓人。
+// 分母用模型窗口（deepseek 就是 1M）——可用预算（留 25% 给输出与工具结果）放在提示气泡里说清楚；
+// 条上那道刻度就是自动压缩的触发点，越过它服务端下一轮就自己压。
 export function renderUsage() {
   const b = S.budget || {};
   const tokens = b.tokens || 0;
-  const limit = b.limitTokens || 0;
-  const pct = limit ? Math.min(100, Math.round((tokens / limit) * 100)) : b.pct || 0;
+  const limit = b.limitTokens || 0; // 可用预算（窗口的 75%）
+  const win = S.context?.windowTokens || b.windowTokens || limit || 0;
+  const pct = win ? Math.min(100, Math.round((tokens / win) * 100)) : b.pct || 0;
   const wrap = $("#ctxWrap");
   wrap.classList.toggle("empty", !tokens);
-  $("#ctxFill").style.width = (tokens && limit ? Math.max(2, pct) : 0) + "%";
-  wrap.classList.toggle("warn", pct >= 80 && pct < 90); // 与服务端自动压缩阈值（80%）对齐（审查 #24）
-  wrap.classList.toggle("over", pct >= 90 || (limit && tokens > limit));
-  const win = S.context?.windowTokens || b.windowTokens || 0;
+  $("#ctxFill").style.width = (tokens && win ? Math.max(2, pct) : 0) + "%";
+  // 颜色/状态仍按「预算是多少」判：到自动压缩阈值变黄，吃满预算变红（与服务端行为一致）
+  const compactAt = Number(S.autoCompactAt) > 0 ? Number(S.autoCompactAt) * limit : 0;
+  wrap.classList.toggle("warn", !!compactAt && tokens >= compactAt && tokens < limit);
+  wrap.classList.toggle("over", !!limit && tokens >= limit);
+  // 刻度 = 自动压缩触发点（占窗口的百分比）
+  const tick = $("#ctxTick");
+  if (tick) {
+    const at = compactAt && win ? Math.min(100, Math.max(0, (compactAt / win) * 100)) : 0;
+    tick.style.display = at ? "" : "none";
+    tick.style.left = at + "%";
+  }
   wrap.title = tokens
-    ? `本轮上下文约 ${tokens.toLocaleString()} tokens，可用预算 ${limit.toLocaleString()}（模型窗口 ${win.toLocaleString()}${
-        S.context?.source ? " · " + S.context.source : ""
-      }）${Number(S.autoCompactAt) > 0 ? `；到 ${Math.round(Number(S.autoCompactAt) * 100)}% 会自动压缩` : "；自动压缩已关闭"}${pct >= 90 ? " —— 也可以现在就点「压缩」" : ""}`
+    ? `本轮上下文约 ${tokens.toLocaleString()} tokens；模型窗口 ${win.toLocaleString()}（${
+        S.context?.source ? S.context.source + " · " : ""
+      }可用预算 ${limit.toLocaleString()}，留 25% 给输出与工具结果）${
+        compactAt ? `；到约 ${Math.round(compactAt).toLocaleString()} 会自动压缩（条上的刻度）` : "；自动压缩已关闭"
+      }${limit && tokens >= limit ? " —— 已经吃满预算，点「压缩」腾地方" : ""}${
+        Number(S.keepTokens) > 0 ? `；压缩只摘要更早的部分，最近约 ${Math.round(Number(S.keepTokens) / 1000)}k token 的原文会留着` : "；压缩后只留摘要"
+      }`
     : "还没有对话内容";
 
   const bar = $("#ctxText");
   if (!tokens) bar.textContent = t("status.ctxEmpty");
-  else if (pct >= 90) bar.textContent = `${kTok(tokens)} / ${kTok(limit)} · 该压缩了`;
-  else bar.textContent = `${kTok(tokens)} / ${kTok(limit)} · ${pct}%`;
+  else if (limit && tokens >= limit) bar.textContent = `${tok(tokens)} / ${tok(win)} · 该压缩了`;
+  else bar.textContent = `${tok(tokens)} / ${tok(win)} · ${pct}%`;
   const compact = $("#ctxCompact");
   compact.classList.toggle("hot", wrap.classList.contains("over"));
   compact.disabled = !tokens;
@@ -1794,6 +1808,7 @@ const CMDS = [
   { cmd: "/new", desc: "开始新会话" },
   { cmd: "/mode", desc: "切换权限模式", sub: "mode" },
   { cmd: "/model", desc: "切换模型通道", sub: "model" },
+  { cmd: "/depth", desc: "调思考深度（档位跟着模型走，就地切）", sub: "depth" },
   { cmd: "/compact", desc: "压缩上下文；后面可以接要求，如「/compact 保留接口细节」" },
   { cmd: "/export", desc: "把这次会话导出成 Markdown 文件" },
   { cmd: "/thinking", desc: "显示 / 隐藏模型的思考过程" },

@@ -298,6 +298,96 @@ test("Mock：剧本里写 think 会先吐思考过程（离线演示也能看效
   assert.match(evs.filter((e) => e.type === "text").map((e) => e.delta).join(""), /好的/);
 });
 
+/* ===== 2026-10-15：思考深度（通道级三档，对标 ZCode 的 reasoning depth）===== */
+test("思考深度：聊天接口按档位发 reasoning_effort（默认一个字不加、关 = none）", async () => {
+  const up = await mockUpstream((req, res) => {
+    sse(res, [
+      { choices: [{ delta: { content: "好" } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+      { usage: { prompt_tokens: 1, completion_tokens: 1 }, choices: [] },
+    ]);
+  });
+  const base = { protocol: "openai-chat", baseURL: up.url, model: "glm-5.3", secret: "k" };
+  try {
+    await collect(streamChat(base, [{ role: "user", text: "hi" }], [])); // 默认
+    await collect(streamChat({ ...base, thinkDepth: "high" }, [{ role: "user", text: "hi" }], []));
+    await collect(streamChat({ ...base, thinkDepth: "off" }, [{ role: "user", text: "hi" }], []));
+    await collect(streamChat({ ...base, thinkDepth: "wide" }, [{ role: "user", text: "hi" }], [])); // 认不出的档位 = 不干预
+    assert.equal(up.requests[0].body.reasoning_effort, undefined, "默认不该加任何思考字段");
+    assert.equal(up.requests[1].body.reasoning_effort, "high");
+    assert.equal(up.requests[2].body.reasoning_effort, "none");
+    assert.equal(up.requests[3].body.reasoning_effort, undefined, "脏档位要归一成「不干预」");
+  } finally {
+    await up.close();
+  }
+});
+
+test("思考深度：网关不认 reasoning_effort 时自动去掉重试一次", async () => {
+  const up = await mockUpstream((req, res) => {
+    const b = up.requests.at(-1).body;
+    if (b.reasoning_effort) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "unknown field reasoning_effort" } }));
+      return;
+    }
+    sse(res, [
+      { choices: [{ delta: { content: "重试成功" } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ]);
+  });
+  const provider = { protocol: "openai-chat", baseURL: up.url, model: "some-gateway-model", secret: "k", thinkDepth: "mid" };
+  try {
+    const evs = await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+    assert.equal(up.requests.length, 2, "应该重试了一次");
+    assert.equal(up.requests[0].body.reasoning_effort, "medium");
+    assert.equal(up.requests[1].body.reasoning_effort, undefined, "重试那次要把这个字段去掉");
+    assert.ok(evs.some((e) => e.type === "text" && e.delta === "重试成功"), "重试后的正文要正常吐出");
+  } finally {
+    await up.close();
+  }
+});
+
+test("思考深度：responses 协议发 reasoning.effort，关档不发 reasoning", async () => {
+  const up = await mockUpstream((req, res) => {
+    sse(res, [{ type: "response.output_text.delta", delta: "ok" }, { type: "response.completed", response: { status: "completed" } }]);
+  });
+  const base = { protocol: "openai-responses", baseURL: up.url, model: "gpt-5.5", secret: "k" };
+  try {
+    await collect(streamChat({ ...base, thinkDepth: "mid" }, [{ role: "user", text: "hi" }], []));
+    await collect(streamChat({ ...base, thinkDepth: "off" }, [{ role: "user", text: "hi" }], []));
+    assert.equal(up.requests[0].body.reasoning?.effort, "medium");
+    assert.equal(up.requests[0].body.reasoning?.summary, "auto", "摘要开关要保留");
+    assert.equal(up.requests[1].body.reasoning, undefined, "关档 = 整个 reasoning 都不发");
+  } finally {
+    await up.close();
+  }
+});
+
+test("思考深度（anthropic）：档位映射成思考预算，关档/模型不支持就不发", async () => {
+  const up = await mockUpstream((req, res) => {
+    sse(res, [{ type: "message_start", message: { usage: { input_tokens: 1 } } }, { type: "message_stop" }]);
+  });
+  const base = { protocol: "anthropic", baseURL: up.url, model: "claude-sonnet-5-5", secret: "k" };
+  const high = { ...base, thinkDepth: "high" };
+  const max = { ...base, thinkDepth: "max" };
+  const off = { ...base, thinkDepth: "off" };
+  const unsupported = { protocol: "anthropic", baseURL: up.url, model: "gpt-4o", secret: "k", thinkDepth: "high" };
+  try {
+    await collect(streamChat(high, [{ role: "user", text: "hi" }], []));
+    await collect(streamChat(max, [{ role: "user", text: "hi" }], []));
+    await collect(streamChat(off, [{ role: "user", text: "hi" }], []));
+    await collect(streamChat(unsupported, [{ role: "user", text: "hi" }], []));
+    const b = (i) => up.requests[i].body;
+    assert.equal(b(0).thinking?.budget_tokens, 16384, "高档 = 16384 预算");
+    assert.equal(b(1).thinking?.budget_tokens, 32768, "最高档 = 32768 预算");
+    assert.ok(b(0).max_tokens > b(0).thinking.budget_tokens, "max_tokens 要大于思考预算");
+    assert.equal(b(2).thinking, undefined, "关档不发 thinking");
+    assert.equal(b(3).thinking, undefined, "表说不支持的模型，选了也不发");
+  } finally {
+    await up.close();
+  }
+});
+
 /* ===== v9.8：流式重试壳（429/5xx/断流 → 退避重连 + reconnecting 事件） ===== */
 test("v9.8 Retry-After 解析：秒数与 HTTP 日期都认", () => {
   const res = (v) => ({ headers: { get: () => v } });

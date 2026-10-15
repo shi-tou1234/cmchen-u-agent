@@ -29,6 +29,17 @@ export function kb(n) {
   return n >= 1024 * 1024 ? (n / 1048576).toFixed(1) + " MB" : Math.round(n / 1024) + " KB";
 }
 
+// token 数按人话写：1,000,000 → 1M、750,000 → 750k、12,345 → 12k（上下文用量与模型窗口都用它）
+export function tok(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e6) {
+    const x = v / 1e6;
+    return (Number.isInteger(x) ? x : x.toFixed(2)) + "M";
+  }
+  if (v >= 1000) return (v / 1000).toFixed(v >= 10000 ? 0 : 1) + "k";
+  return String(v);
+}
+
 /* ---------- Toast ---------- */
 let toastBox = null;
 export function toast(msg, type = "") {

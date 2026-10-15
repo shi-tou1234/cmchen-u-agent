@@ -1,7 +1,7 @@
 // 上下文重建与预算：轮次合并、compact 替换、估算
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildHistory, budgetOf, estTokens, compactPrompt } from "../core/context.mjs";
+import { buildHistory, budgetOf, estTokens, compactPrompt, tailStartIndex } from "../core/context.mjs";
 import { systemPrompt } from "../core/agent-loop.mjs";
 
 const ev = (type, extra = {}) => ({ ts: "2026-10-12T00:00:00Z", type, ...extra });
@@ -41,6 +41,70 @@ test("buildHistory：compact 之前的轮次被摘要替代", () => {
   assert.ok(flat.includes("第二轮"), "压缩之后的轮次保留");
 });
 
+test("buildHistory：compact 的 atIndex 是「保留尾段」的起点——尾段原文照常重建（2026-10-15 新语义）", () => {
+  const events = [
+    ev("user", { text: "很长的第一轮" }),
+    ev("assistant_message", { text: "第一轮回复" }),
+    ev("user", { text: "第二轮：这条要原样留着" }),
+    ev("assistant_message", { text: "第二轮回复也留着" }),
+    ev("compact", { v: 2, summary: "旧事已摘要", atIndex: 2, keptTokens: 15000 }),
+  ];
+  const msgs = buildHistory(events);
+  assert.match(msgs[0].text, /旧事已摘要/, "摘要要放在最前面");
+  const flat = JSON.stringify(msgs);
+  assert.ok(!flat.includes("很长的第一轮"), "边界之前的旧内容被摘要替代");
+  assert.ok(flat.includes("第二轮：这条要原样留着"), "边界起的事件（保留下来的尾段）要原样重建");
+  assert.ok(flat.includes("第二轮回复也留着"), "尾段里的助手回复也要在");
+});
+
+test("buildHistory(events, at)：at 记录每条消息的事件下标（压缩换算边界用）", () => {
+  const events = [
+    ev("user", { text: "甲" }),
+    ev("assistant_message", { text: "乙" }),
+    ev("user", { text: "丙" }),
+  ];
+  const at = [];
+  const msgs = buildHistory(events, at);
+  assert.equal(msgs.length, at.length, "一条消息对应一个下标");
+  assert.deepEqual(at, [0, 1, 2]);
+});
+
+test("tailStartIndex：从最后一轮往前整轮累计（只落在 user 上，至少保最后一轮）", () => {
+  const events = [
+    ev("user", { text: "第一轮" }),
+    ev("assistant_message", { text: "答一" }),
+    ev("user", { text: "第二轮" }),
+    ev("assistant_message", { text: "答二" }),
+    ev("user", { text: "第三轮" }),
+    ev("assistant_message", { text: "答三" }),
+  ];
+  // 预算够大：三轮都留住 → 起点是第一轮（下标 0）
+  assert.equal(tailStartIndex(events, 10000), 0);
+  // 预算只够最后一轮：起点 = 第三轮的 user（下标 4）
+  assert.equal(tailStartIndex(events, 4), 4);
+  // 最后一轮本身超预算也照样保（不然压缩完手上什么都没有）
+  assert.equal(tailStartIndex(events, 1), 4);
+  // 0 = 不保留（老行为）
+  assert.equal(tailStartIndex(events, 0), events.length);
+  // floorIndex：上一份摘要已经覆盖的部分不再捞回来
+  assert.equal(tailStartIndex(events, 10000, 4), 4);
+});
+
+test("compactPrompt：七段式交接模板 + 滚动更新上一份摘要", () => {
+  const msgs = [{ role: "user", text: "帮我把端口改成 8080" }, { role: "assistant", text: "改好了" }];
+  const p1 = compactPrompt(msgs);
+  for (const h of ["## 目标", "## 要求与边界", "## 已定的决定", "## 进度", "## 下一步", "## 相关文件", "## 不能丢的上下文"]) {
+    assert.ok(p1.includes(h), `模板要有 ${h}`);
+  }
+  assert.ok(p1.includes("帮我把端口改成 8080"), "待摘要的原文要在里面");
+  assert.ok(!p1.includes("更新成一份合并后的新摘要"), "首次压缩不该走更新模式");
+  const p2 = compactPrompt(msgs, { prevSummary: "## 目标\n- 改端口" });
+  assert.ok(p2.includes("更新成一份合并后的新摘要"), "有上一份摘要时要走合并模式");
+  assert.ok(p2.includes("## 目标\n- 改端口"), "上一份摘要要作为底稿带上");
+  const p3 = compactPrompt(msgs, { instruction: "保住 API 细节" });
+  assert.ok(p3.includes("保住 API 细节"), "用户点名要保住的东西要带上");
+});
+
 test("budgetOf / estTokens", () => {
   assert.equal(estTokens("12345"), 2);
   // 中日韩字符按 1 字 1 token 估（旧版按 2.5 字/token 一律折算，中文场景会低估）
@@ -60,16 +124,20 @@ test("budgetOf / estTokens", () => {
   assert.ok(roomy.pct < 10);
 });
 
-test("compactPrompt：保留最近几条不动，旧内容进提示词", () => {
-  const msgs = [
-    { role: "user", text: "很旧的消息A" },
-    { role: "assistant", text: "很旧的回复A" },
-    { role: "user", text: "较新的消息B" },
-    { role: "assistant", text: "较新的回复B" },
+test("compactPrompt：传进来什么就摘要什么（尾段取舍归 tailStartIndex，2026-10-15 起）", () => {
+  const events = [
+    ev("user", { text: "很旧的消息A" }),
+    ev("assistant_message", { text: "很旧的回复A" }),
+    ev("user", { text: "较新的消息B" }),
+    ev("assistant_message", { text: "较新的回复B" }),
   ];
-  const p = compactPrompt(msgs, 2);
-  assert.match(p, /很旧的消息A/);
-  assert.ok(!p.includes("较新的消息B"), "保留的尾部不进摘要请求");
+  const keepFrom = tailStartIndex(events, 2); // 预算只够最后一轮 → 边界落在「较新的消息B」
+  const at = [];
+  const msgs = buildHistory(events, at);
+  const older = msgs.slice(0, msgs.findIndex((_, i) => at[i] >= keepFrom));
+  const p = compactPrompt(older);
+  assert.match(p, /很旧的消息A/, "被摘要的那段要在提示词里");
+  assert.ok(!p.includes("较新的消息B"), "留在上下文里的尾段不该再进摘要请求");
 });
 
 test("systemPrompt 注入：记忆 / 计划 / AGENTS.md", () => {

@@ -1,4 +1,4 @@
-// 派生独立子 agent：独立上下文、继承模式、最多 15 步、不允许再嵌套
+// 派生独立子 agent：独立上下文、继承模式、不允许再嵌套（步数与主循环同一套兜底：不再限步数，靠重复调用提醒与用户中断收口）
 import path from "node:path";
 import { runAgent } from "../core/agent-loop.mjs";
 import { Sessions } from "../core/sessions.mjs";
@@ -34,6 +34,9 @@ export default {
       // 子任务里的重复调用会污染父会话的 loopGuard，反之亦然）
       loopGuard: { lastSig: "", count: 0 },
       autoCount: 0,
+      // 父会话的轮中压缩不能拿子任务当对象（它读的是父会话的日志，会把子任务的本地历史换成父会话的）：
+      // 显式关掉。子任务上下文真撑满时，会在子任务里报错、作为工具结果回报给主 agent 处理。
+      midTurnCompact: undefined,
       emit: (e) => ctx.emit({ type: "subagent_event", name, sessionId: sid, event: e }),
     };
     for await (const ev of runAgent({

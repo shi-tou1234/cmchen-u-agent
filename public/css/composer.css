@@ -1,0 +1,115 @@
+/* ============================================================
+   u-agent · composer.css — 输入区 + 输入区上方状态条 + 开关
+   （2026-10-15 从原 app.css 按段切出；<link> 顺序=原文顺序，级联不受影响）
+   ============================================================ */
+/* ---------- 7 输入区 ---------- */
+.composer-wrap { padding: 10px 24px 12px; background: var(--bg); position: relative; }
+.composer { max-width: 940px; margin: 0 auto; background: var(--surface); border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg); transition: border-color .13s, box-shadow .13s; }
+.composer:focus-within { border-color: var(--accent); box-shadow: var(--shadow-sm); }
+.composer.drag { border-color: var(--accent); border-style: dashed; background: var(--accent-soft); }
+.composer textarea { display: block; width: 100%; border: 0; outline: none; background: none; resize: none;
+  padding: 12px 14px 4px; font: 14px/1.7 var(--sans); max-height: 190px; overflow-y: auto; }
+.composer textarea::placeholder { color: var(--faint); }
+.composer-bar { display: flex; align-items: center; gap: 8px; padding: 6px 9px 9px 10px; }
+.ghost-btn { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 9px; border-radius: var(--r-sm);
+  font-size: 12.5px; color: var(--muted); }
+.ghost-btn:hover { background: var(--hover); color: var(--fg); }
+.usage-text { font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.send-btn { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); color: var(--accent-fg);
+  display: grid; place-items: center; transition: transform .1s, background .13s; }
+.send-btn:hover { background: var(--accent-hover); }
+.send-btn:active { transform: scale(.94); }
+.send-btn.busy { background: var(--danger); color: #fff; }
+.composer-hint { max-width: 940px; margin: 6px auto 0; font-size: 11.5px; color: var(--faint); min-height: 16px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.attach-list { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px 0; }
+.attach-item { position: relative; display: flex; align-items: center; gap: 7px; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: var(--r-sm); font-size: 12px; color: var(--muted); background: var(--surface-2); }
+.attach-item img { width: 34px; height: 34px; object-fit: cover; border-radius: 5px; display: block; }
+.attach-item .x { width: 18px; height: 18px; border-radius: 50%; background: var(--line-strong); color: var(--surface);
+  display: grid; place-items: center; font-size: 11px; }
+.attach-item .x:hover { background: var(--danger); color: #fff; }
+
+.jump-btn { position: absolute; right: 26px; bottom: 108px; z-index: 6; padding: 6px 13px; border-radius: 99px;
+  background: var(--elev); border: 1px solid var(--line-strong); color: var(--muted); font-size: 12px; box-shadow: var(--shadow); }
+.jump-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+.palette { position: absolute; left: 50%; transform: translateX(-50%); bottom: 100%; margin-bottom: -4px;
+  width: 560px; max-width: 92%; background: var(--elev); border: 1px solid var(--line-strong); border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg); overflow: hidden; z-index: 20; animation: pal-in .12s ease-out; }
+@keyframes pal-in { from { opacity: 0; transform: translate(-50%, 6px); } }
+.palette-head { padding: 8px 14px; font-size: 11.5px; color: var(--faint); border-bottom: 1px solid var(--line); }
+.pal-item { display: flex; align-items: baseline; gap: 14px; padding: 8px 14px; cursor: pointer; font-size: 13px; }
+.pal-item.file { align-items: center; gap: 9px; }
+.pal-item.file .p-cmd { flex: 1 1 auto; min-width: 0; color: var(--fg); font-family: var(--mono); font-size: 12.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pal-item.off { opacity: .6; cursor: default; }
+.pal-item.off .p-cmd { color: var(--faint); }
+.pal-item .p-cmd { min-width: 116px; color: var(--accent); font-family: var(--mono); font-size: 12.5px; }
+.pal-item .p-desc { color: var(--muted); font-size: 12.5px; }
+.pal-item.on { background: var(--accent-soft); }
+.pal-empty { padding: 14px; color: var(--faint); font-size: 12.5px; }
+
+/* ---------- 7.5 输入区上方状态条 ---------- */
+/* 一眼看清两件事：现在什么权限、上下文还剩多少。都做成可点的，省得回设置里翻 */
+.statusbar { max-width: 940px; margin: 0 auto 7px; display: flex; align-items: center; gap: 10px;
+  font-size: 12px; color: var(--faint); min-height: 24px; }
+.sb-mode { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px 0 7px;
+  border-radius: 99px; border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+  font-size: 12px; transition: border-color .13s, color .13s, background .13s; }
+.sb-mode b { font-weight: 600; }
+.sb-mode:hover { border-color: var(--line-strong); color: var(--fg); background: var(--hover); }
+.sb-mode .caret { opacity: .45; }
+.sb-mode[data-mode="full"] { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); color: var(--danger); }
+.sb-mode[data-mode="auto"] { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); color: var(--warn); }
+.sb-mode[data-mode="readonly"], .sb-mode[data-mode="plan"] { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); color: var(--ok); }
+
+.sb-aa { display: inline-flex; align-items: center; gap: 6px; max-width: 300px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.sb-aa::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); flex: none; }
+.sb-aa.on::before { background: var(--ok); }
+.sb-aa.on.risky { color: var(--warn); }
+.sb-aa.on.risky::before { background: var(--warn); }
+.sb-aa.off { opacity: .75; }
+
+.ctx { display: inline-flex; align-items: center; gap: 7px; }
+.ctx.empty .ctx-bar { display: none; }
+.ctx-bar { position: relative; width: 92px; height: 5px; border-radius: 99px; background: var(--active); overflow: hidden; flex: none; }
+.ctx-bar #ctxFill { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 99px;
+  transition: width .3s ease, background .3s ease; }
+/* 自动压缩触发点：条上那道刻度（位置由 JS 按「阈值 × 预算 ÷ 窗口」算，通常落在 60%） */
+.ctx-bar #ctxTick { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--faint); opacity: .75; }
+.ctx.warn .ctx-bar #ctxFill { background: var(--warn); }
+.ctx.over .ctx-bar #ctxFill { background: var(--danger); }
+.ctx.over .ctx-text { color: var(--danger); font-weight: 500; }
+.ctx-text { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ghost-btn.hot { color: var(--danger); background: var(--danger-soft); }
+.ghost-btn:disabled { opacity: .4; cursor: default; }
+.ghost-btn:disabled:hover { background: none; color: var(--muted); }
+
+/* ---------- 7.6 开关（总开关 / 细粒度放行） ---------- */
+.switch, .aa-switch { display: inline-flex; align-items: center; cursor: pointer; user-select: none; position: relative; }
+.switch { gap: 9px; }
+.switch input, .aa-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch .track, .aa-switch .track { width: 38px; height: 22px; border-radius: 99px; flex: none; position: relative;
+  background: var(--active); border: 1px solid var(--line-strong); transition: background .16s, border-color .16s; }
+.switch .track::after, .aa-switch .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: #fff; box-shadow: var(--shadow-sm); transition: transform .16s ease; }
+.switch input:checked + .track, .aa-switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+.switch input:checked + .track::after, .aa-switch input:checked + .track::after { transform: translateX(16px); }
+.switch input:focus-visible + .track, .aa-switch input:focus-visible + .track { box-shadow: var(--ring); }
+.switch b { font-size: 12.5px; font-weight: 500; color: var(--muted); }
+
+.aa-list { display: grid; gap: 1px; transition: opacity .16s; }
+.aa-list.off { opacity: .4; pointer-events: none; }
+/* 单行布局：七项开关一屏能看完，不用在设置里翻来翻去 */
+.aa-item { display: flex; align-items: center; gap: 11px; padding: 8px 10px; border-radius: var(--r); cursor: pointer; }
+.aa-item:hover { background: var(--hover); }
+.aa-name { flex: none; min-width: 72px; font-size: 13px; font-weight: 600; }
+.aa-desc { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aa-tag { margin-left: auto; flex: none; font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+.aa-item.risky .aa-tag { color: var(--warn); }
+.aa-item.risky .aa-name { color: color-mix(in srgb, var(--danger) 72%, var(--fg)); }
+

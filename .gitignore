@@ -1,7 +1,7 @@
 # 运行时与数据全在 U 盘、不进 git（重新产出：双击 setup-uagent.bat）
 runtime/
 data/
-app/
+/app/   # 只忽略顶层 app/（原来写裸 app/ 会连带忽略 public/js/app/，2026-10-15 拆登录页时踩到）
 node_modules/
 .workbuddy/
 config.json

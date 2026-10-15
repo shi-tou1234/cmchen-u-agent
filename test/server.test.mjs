@@ -258,10 +258,22 @@ test("验收M：设置回显不含钥匙原文", async () => {
 });
 
 test("验收N：用户可见文件无 api key 字样", () => {
-  const files = ["public/index.html", "public/css/app.css", ...fs.readdirSync(path.join(REPO, "public/js")).map((f) => "public/js/" + f), "README.md"];
+  // 递归走 public/（2026-10-15 起把它拆成了 public/js/app/ + public/css/* 多文件，
+  // 老的"一层 readdir + 写死 css/app.css"会踩到新目录，直接读目录会 EINVAL）
+  const walk = (dir) => {
+    const out = [];
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) out.push(...walk(p));
+      else if (/\.(js|css|html)$/.test(e.name)) out.push(p);
+    }
+    return out;
+  };
+  const files = [...walk(path.join(REPO, "public")), path.join(REPO, "README.md")];
+  assert.ok(files.length > 5, "要真扫到东西（至少 index.html + 几个 js/css）");
   for (const f of files) {
-    const txt = fs.readFileSync(path.join(REPO, f), "utf8").toLowerCase();
-    assert.ok(!/api[-_ ]?key/.test(txt), `${f} 不应含 api key 字样`);
+    const txt = fs.readFileSync(f, "utf8").toLowerCase();
+    assert.ok(!/api[-_ ]?key/.test(txt), `${path.relative(REPO, f)} 不应含 api key 字样`);
   }
 });
 
@@ -406,22 +418,39 @@ import http from "node:http";
 
 function startUpstream() {
   const requests = [];
+  let midturnFired = 0; // 标记剧本只演一次：压缩后模型若又去读同一个文件，不能无限循环
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
+      let parsed = {};
       try {
-        requests.push(JSON.parse(body || "{}"));
-      } catch {
-        requests.push({});
-      }
+        parsed = JSON.parse(body || "{}");
+      } catch {}
+      requests.push(parsed);
       res.writeHead(200, { "content-type": "text/event-stream" });
-      for (const c of [
-        { choices: [{ delta: { content: "好的，我记住了。" } }] },
-        { choices: [{ delta: {}, finish_reason: "stop" }] },
-        { usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [] },
-      ])
-        res.write("data: " + JSON.stringify(c) + String.fromCharCode(10, 10));
+      // 「轮中压缩」用例的剧本：第一次见到带标记的用户消息 → 先读大文件（把上下文顶过阈值）；
+      // 之后的请求（含压缩后的那一次）都回普通文本 → 收尾。其余用例照旧只回一句文本。
+      const msgs = parsed.messages || [];
+      const lastMsg = msgs[msgs.length - 1];
+      const lastText = typeof lastMsg?.content === "string" ? lastMsg.content : JSON.stringify(lastMsg?.content || "");
+      const wantBigRead = midturnFired === 0 && lastMsg?.role === "user" && lastText.includes("MIDTURN-E2E");
+      if (wantBigRead) midturnFired++;
+      // 「保留尾段」用例：带 KEEP-TAIL-E2E 的对话回一句专属回声（每轮各不相同，好断言"这轮的回复还在/没了"）；
+      // 摘要请求（内容里有「交接摘要」）不能走这条，否则摘要会变成回声
+      const wantEcho = !wantBigRead && lastMsg?.role === "user" && lastText.includes("KEEP-TAIL-E2E") && !/交接摘要/.test(lastText);
+      const chunks = wantBigRead
+        ? [
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_big", type: "function", function: { name: "fs_read", arguments: JSON.stringify({ path: "big.txt" }) } }] } }] },
+            { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+            { usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [] },
+          ]
+        : [
+            { choices: [{ delta: { content: wantEcho ? "回声：" + ((lastText.match(/KEEP-TAIL-E2E ([^\n]{0,20})/) || [, "?"])[1]) : "好的，我记住了。" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+            { usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [] },
+          ];
+      for (const c of chunks) res.write("data: " + JSON.stringify(c) + String.fromCharCode(10, 10));
       res.write("data: [DONE]" + String.fromCharCode(10, 10));
       res.end();
     });
@@ -1101,7 +1130,7 @@ test("v9.1 新增：计划跨轮存活（下一轮的请求里带着上一轮立
 test("v9.1 新增：上下文到阈值自动压缩（用轻量通道摘要旧轮次）", async () => {
   const sid = "s-autocompact";
   const small = { name: "SmallWin", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k", contextWindow: 12000 };
-  await postSettings({ providers: [...EXAMPLE_PROVIDERS, small, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "SmallWin", workspace: wsDir, assist: "Up", autoCompactAt: 0.5 });
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, small, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "SmallWin", workspace: wsDir, assist: "Up", autoCompactAt: 0.5, keepTokens: 1000 });
   // 灌几轮长文本：12000 窗口 → 预算 9000、阈值 4500 tokens；每轮 6000 字中文 ≈ 6000 token
   const seen = [];
   for (let i = 1; i <= 4; i++) {
@@ -1113,7 +1142,11 @@ test("v9.1 新增：上下文到阈值自动压缩（用轻量通道摘要旧轮
   assert.ok(auto.after.tokens < auto.before.tokens, "压完要更小");
   assert.match(sessionLog(sid), /"type":"compact".*"auto":true/, "自动压缩要落盘（带 auto 标记）");
   const after = await jjson("/api/session?id=" + encodeURIComponent(sid) + "&provider=SmallWin");
-  assert.ok(after.json.budget.tokens < 4500, `压缩后应回落到阈值以下，实际 ${after.json.budget.tokens}`);
+  // 2026-10-15 起压缩会保留最近一段原文（默认 15k，按模型预算封顶），所以不再保证"压到阈值以下"：
+  // 真正的不变式 = 比压前小（旧轮次变成摘要）+ 落回窗口预算内 + 最近那轮的原文还在
+  assert.ok(auto.after.tokens < auto.before.tokens, `压完要更小：${auto.before.tokens} → ${auto.after.tokens}`);
+  assert.ok(after.json.budget.tokens < 9000, `压缩后不该还在窗口预算边上，实际 ${after.json.budget.tokens}`);
+  assert.match(sessionLog(sid), /第4轮/, "最近那轮的原文要留着（保留尾段）");
   // 关掉后：继续灌长文本，也不该再自动压
   await postSettings({ autoCompactAt: 0 });
   const seen2 = [];
@@ -1123,6 +1156,45 @@ test("v9.1 新增：上下文到阈值自动压缩（用轻量通道摘要旧轮
   }
   assert.ok(!seen2.some((e) => e.type === "compact" && e.auto), "关掉后不该再自动压缩");
   await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "", autoCompactAt: 0.8 });
+});
+
+test("v1.1.1 新增：单轮不限步数后，长任务中途到阈值先压缩再继续（轮中压缩）", async () => {
+  const sid = "s-midcompact-" + Math.random().toString(36).slice(2, 7);
+  const small = { name: "SmallWin", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k", contextWindow: 12000 };
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, small, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "SmallWin", workspace: wsDir, assist: "Up", autoCompactAt: 0.3 });
+  // 预算 9000 → 阈值 2700 token；第一步读一个 12000 字的大文件（≈12000 token）→ 第 2 步请求前应触发轮中压缩
+  fs.writeFileSync(path.join(wsDir, "big.txt"), "内容".repeat(6000));
+  const { events } = await chat({ sessionId: sid, mode: "confirm", provider: "SmallWin", message: { text: "MIDTURN-E2E 先看看大文件" } });
+  const mid = events.find((e) => e.type === "compact" && e.mid);
+  assert.ok(mid, "第 2 步请求前应先压一遍：" + JSON.stringify(events.map((e) => e.type)));
+  assert.equal(mid.auto, true);
+  assert.ok(mid.after.tokens < mid.before.tokens, `压完要更小：${mid.before.tokens} → ${mid.after.tokens}`);
+  assert.match(sessionLog(sid), /"type":"compact".*"mid":true/, "轮中压缩要落盘（带 mid 标记）");
+  const done = events.find((e) => e.type === "done");
+  assert.ok(done, "压完这一轮照常跑完（要有 done）");
+  assert.ok(!done.stopped && !done.aborted, "既没被硬停、也没被中止");
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "", autoCompactAt: 0.8 });
+});
+
+test("v1.1.1 新增：压缩保留最近原文——更早的轮次进摘要，最近这段原样留着（对标 OpenCode）", async () => {
+  const sid = "s-keeptail-" + Math.random().toString(36).slice(2, 7);
+  const small = { name: "SmallWin", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k", contextWindow: 12000 };
+  // 保留预算 3000：每轮约 2000 token → 只留最后一轮，前两轮进摘要
+  await postSettings({ providers: [...EXAMPLE_PROVIDERS, small, { name: "Up", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "k" }], active: "SmallWin", workspace: wsDir, assist: "Up", autoCompactAt: 0, keepTokens: 3000 });
+  const pad = (n) => "内容".repeat(n); // 每 2 字 ≈ 2 token
+  for (const [i, word] of [[1, "第一件"], [2, "第二件"], [3, "第三件"]]) {
+    await chat({ sessionId: sid, mode: "confirm", provider: "SmallWin", message: { text: `KEEP-TAIL-E2E ${word}：` + pad(1000) } });
+  }
+  const c = await jjson("/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Up" }) });
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  await chat({ sessionId: sid, mode: "confirm", provider: "SmallWin", message: { text: "继续" } });
+  const last = UP.requests.at(-1);
+  const flat = JSON.stringify(last.messages || []);
+  assert.match(flat, /更早对话的摘要/, "压缩后请求要带摘要标记");
+  assert.ok(flat.includes("回声：第三件"), "最近一轮的助手回复要原样留着（保留尾段）");
+  assert.ok(!flat.includes("回声：第一件"), "更早那轮的助手回复已被摘要替代");
+  assert.match(sessionLog(sid), /"type":"compact".*"v":2/, "压缩事件带新版标记（v2：保留尾段 + 滚动摘要）");
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, assist: "", autoCompactAt: 0.8, keepTokens: 15000 });
 });
 
 /* ===== v0.9.2：输出落盘可恢复 + 本会话命令放行 + 防死循环 ===== */

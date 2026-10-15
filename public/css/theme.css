@@ -1,0 +1,126 @@
+/* ============================================================
+   u-agent · theme.css — 设计令牌 + 基础（滚动条 / 选中色 / 字体栈）
+   （2026-10-15 从原 app.css 按段切出；<link> 顺序=原文顺序，级联不受影响）
+   ============================================================ */
+/* ============================================================
+   u-agent 界面样式
+   目录：1 设计令牌  2 基础  3 通用组件  4 布局骨架
+        5 会话侧栏  6 消息流  7 输入区  8 弹窗/设置  9 响应式
+   ============================================================ */
+
+/* ---------- 1 设计令牌 ----------
+   主题取自领导 D 盘博客（Astro「momo」的 src/styles/variables.css）：
+   暖纸底色 + 棕调强调色 + 楷体字标 + 宋体正文 + 圆角三档 + 棕调阴影。
+   只换值、不动变量名——所有既有规则自动跟着换装。 */
+:root {
+  color-scheme: light;
+  --bg: #f8f0dd;
+  --surface: #fdf7e9;
+  --surface-2: #f7efd8;
+  --elev: #fffdf6;
+  --hover: #f1e6d0;
+  --active: #eaddc2;
+  --line: #e5d6b8;
+  --line-strong: #d8c49c;
+  --fg: #2c2416;
+  --muted: #6a5c48;
+  --faint: #8b7355;
+  --accent: #8b4513;
+  --accent-hover: #74380e;
+  --accent-fg: #fffaf0;
+  --accent-soft: rgba(139, 69, 19, 0.1);
+  --ok: #2f7d3a;
+  --ok-soft: rgba(47, 125, 58, 0.12);
+  --warn: #ad8002;
+  --warn-soft: rgba(173, 128, 2, 0.12);
+  --danger: #c0392b;
+  --danger-soft: rgba(192, 57, 43, 0.1);
+  --diff-add: #eaf2dc;
+  --diff-del: #fbe5e1;
+  --seg-on: #fffdf6;
+  --selection: #fae2b5;
+
+  --r-sm: 8px;
+  --r: 12px;
+  --r-lg: 18px;
+  --r-xl: 22px;
+  --shadow-sm: 0 1px 2px rgba(139, 69, 19, .08);
+  --shadow: 0 6px 18px rgba(139, 69, 19, .1);
+  --shadow-lg: 0 20px 50px rgba(139, 69, 19, .18);
+  --ring: 0 0 0 3px var(--accent-soft);
+
+  --sans: -apple-system, "Segoe UI Variable Display", "Segoe UI", system-ui, Roboto,
+          "Microsoft YaHei UI", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", "Sarasa Mono SC", Consolas, "Microsoft YaHei UI", monospace;
+  /* 楷体：品牌字标与页面大标题（博客顶栏 logo 的字体；Windows 自带楷体，不用打包字体文件） */
+  --kai: "Ma Shan Zheng", "Kaiti SC", "STKaiti", "KaiTi", "楷体", "AR PL UKai CN", serif;
+  /* 正文（回答正文）：跟博客正文同一条衬线栈——思源宋体 / 宋体 / Georgia */
+  --reading: "Noto Serif SC", "Songti SC", "STSong", "Source Han Serif SC", "Noto Serif CJK SC",
+             "STZhongsong", "SimSun", Georgia, "Times New Roman", serif;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #1a1612;
+  --surface: #241f18;
+  --surface-2: #201b15;
+  --elev: #2a241c;
+  --hover: #2a2420;
+  --active: #332b22;
+  --line: #3d3428;
+  --line-strong: #4d4234;
+  --fg: #e8ddd0;
+  --muted: #a89880;
+  --faint: #8b7d68;
+  --accent: #e0a060;
+  --accent-hover: #f0b478;
+  --accent-fg: #241a10;
+  --accent-soft: rgba(224, 160, 96, .14);
+  --ok: #86c98a;
+  --ok-soft: rgba(134, 201, 138, .13);
+  --warn: #e5c06a;
+  --warn-soft: rgba(229, 192, 106, .13);
+  --danger: #ef8b8f;
+  --danger-soft: rgba(239, 139, 143, .13);
+  --diff-add: #24321f;
+  --diff-del: #3a2320;
+  --seg-on: #3a3125;
+  --selection: #44361a;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .35);
+  --shadow: 0 6px 18px rgba(0, 0, 0, .4);
+  --shadow-lg: 0 20px 50px rgba(0, 0, 0, .55);
+  --ring: 0 0 0 3px var(--accent-soft);
+}
+
+/* ---------- 2 基础 ---------- */
+*, *::before, *::after { box-sizing: border-box; }
+* { margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.65 var(--sans);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button { background: none; border: 0; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+::selection { background: var(--selection); }
+code, pre, kbd { font-family: var(--mono); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.sprite { display: none; }
+.ic { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.8;
+      stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.ic-sm { width: 14px; height: 14px; }
+.muted { color: var(--muted); }
+.sm { font-size: 12.5px; }
+.grow { flex: 1 1 auto; }
+[hidden] { display: none !important; }
+/* 滚动条：原先总宽 10px + 滑块 3px 透明边 ⇒ 可见可抓的滑块只有 4px——「很难滑动」的物理原因。
+   加宽到 16px、滑块实宽 10px（悬停 12px），并给最小高度：长对话里也不缩成一条线 */
+::-webkit-scrollbar { width: 16px; height: 12px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 99px; border: 3px solid transparent; background-clip: content-box; min-height: 44px; }
+::-webkit-scrollbar-thumb:hover { background: var(--faint); border-width: 2px; background-clip: content-box; }
+

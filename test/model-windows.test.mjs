@@ -1,7 +1,8 @@
 // 模型能力表：窗口 / 输出上限 / 是否带思考（数据源 models.dev，2026-10-12 抓取）
 import test from "node:test";
 import assert from "node:assert/strict";
-import { modelInfo, budgetOfModel, FALLBACK, FALLBACK_LOCAL } from "../core/model-windows.mjs";
+import { modelInfo, budgetOfModel, FALLBACK, FALLBACK_LOCAL, reasoningDepths } from "../core/model-windows.mjs";
+import { effortOf, thinkDepthOf } from "../core/providers.mjs";
 
 test("认得出的模型：按真实窗口给（不是写死 128k/200k）", () => {
   const claude = modelInfo("claude-sonnet-5-5");
@@ -45,4 +46,25 @@ test("预算留 25% 给输出与工具结果，输出上限有个封顶", () => 
   assert.ok(b.outputTokens <= 65536, "别开太大，封顶 64k");
   const tiny = budgetOfModel({ ctx: 4000, out: 1000, reasoning: false });
   assert.ok(tiny.limitTokens >= 4000, "极小窗口也要留出下限，避免算成 0");
+});
+
+/* ===== 2026-10-15：思考档位跟模型对齐（数据源 models.dev 的 reasoning_options） ===== */
+test("reasoningDepths：每个模型给各自的档位名（deepseek 没有 medium、gpt 有 minimal/xhigh）", () => {
+  assert.deepEqual(reasoningDepths("deepseek-v4.1-flash"), ["none", "low", "high", "max"]);
+  assert.deepEqual(reasoningDepths("openai/gpt-6-astra"), ["none", "low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(reasoningDepths("gpt-5.4"), ["minimal", "low", "medium", "high", "xhigh"]);
+  assert.deepEqual(reasoningDepths("glm-5.3"), ["none", "low", "high", "max"]);
+  assert.deepEqual(reasoningDepths("claude-sonnet-5-5"), ["off", "low", "medium", "high", "xhigh", "max"], "Claude 走思考预算那套，档位一样列出");
+  assert.deepEqual(reasoningDepths("glm-4.7"), ["off"], "只能开关的模型：只给「关」");
+  assert.equal(reasoningDepths("some-unknown-model-9000"), null, "认不出 = null，界面按通用档位兜底");
+});
+
+test("档位名严格跟模型走：不认识的值不会被当成档位发出去", () => {
+  assert.equal(effortOf("max"), "max");
+  assert.equal(effortOf("none"), "none");
+  assert.equal(effortOf("off"), "none", "老档位名 off 归一到 none");
+  assert.equal(effortOf("mid"), "medium", "老档位名 mid 归一到 medium");
+  assert.equal(effortOf("wide"), "", "认不出的档位名什么都不发");
+  assert.equal(thinkDepthOf({ thinkDepth: "xhigh" }), "xhigh");
+  assert.equal(thinkDepthOf({ thinkDepth: "WIDE!" }), "", "脏值不进来");
 });

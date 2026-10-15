@@ -7,11 +7,18 @@
 <meta name="color-scheme" content="light dark">
 <meta name="ua-version" content="1.1.0">
 <title>u-agent · 随身 AI</title>
-<link rel="stylesheet" href="/css/app.css">
+<link rel="stylesheet" href="/css/theme.css"><!-- 顺序=原 app.css 的段落顺序，别调 -->
+<link rel="stylesheet" href="/css/app.css"><!-- 顺序=原 app.css 的段落顺序，别调 -->
+<link rel="stylesheet" href="/css/chat.css"><!-- 顺序=原 app.css 的段落顺序，别调 -->
+<link rel="stylesheet" href="/css/composer.css"><!-- 顺序=原 app.css 的段落顺序，别调 -->
+<link rel="stylesheet" href="/css/settings.css"><!-- 顺序=原 app.css 的段落顺序，别调 -->
+<link rel="stylesheet" href="/css/bits.css">
 </head>
 <body>
 
 <svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></symbol>
+  <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M3 3l18 18M10.6 6.1A9.9 9.9 0 0 1 12 5.5c6.4 0 10 6.5 10 6.5a17.6 17.6 0 0 1-3.4 4.1M6.5 7.9A17 17 0 0 0 2 12s3.6 6.5 10 6.5c1.4 0 2.6-.3 3.7-.8"/><path d="M9.9 9.9a2.6 2.6 0 0 0 3.6 3.6"/></symbol>
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></symbol>
@@ -73,27 +80,40 @@
   <symbol id="i-v-vllm" viewBox="0 0 24 24"><path d="m23.6 0-8.721 4.59L9.829 24h7.41zM9.83 24V5.142H.4Z"/></symbol>
 </svg>
 
-<!-- ── 密码锁 ───────────────────────────────────────────── -->
+<!-- ── 密码锁（登录页：学 Claude / ChatGPT / Linear 的极简单卡式——品牌字标 + 一句话 + 一个输入 + 一个按钮） -->
 <div class="gate" id="lock">
   <form class="gate-card" id="lockForm" autocomplete="off" onsubmit="return false">
-    <div class="gate-brand"><svg class="ic"><use href="#i-bolt"/></svg><span>u-agent</span></div>
+    <div class="gate-brand">
+      <span class="gate-mark" aria-hidden="true">U</span>
+      <span class="gate-word">u-agent</span>
+    </div>
     <h1 id="lkTitle" data-i18n="lock.unlock">输入密码解锁</h1>
     <p class="gate-sub" id="lkSub">所有配置与会话都留在这只 U 盘里，换台电脑不用重配</p>
     <p class="gate-note" id="lkDisk" hidden></p>
     <label class="field" id="lkWrap1" hidden>
       <span class="field-label">设置启动密码</span>
-      <input class="input" id="lkPw1" type="password" placeholder="至少 4 位" autocomplete="new-password">
+      <span class="pw-wrap">
+        <input class="input" id="lkPw1" type="password" placeholder="至少 4 位" autocomplete="new-password">
+        <button class="pw-eye" type="button" data-eye="lkPw1" aria-label="显示密码" title="显示密码"><svg class="ic ic-sm"><use href="#i-eye"/></svg></button>
+      </span>
     </label>
     <label class="field" id="lkWrap2" hidden>
       <span class="field-label">再输一遍</span>
-      <input class="input" id="lkPw2" type="password" placeholder="确认密码" autocomplete="new-password">
+      <span class="pw-wrap">
+        <input class="input" id="lkPw2" type="password" placeholder="确认密码" autocomplete="new-password">
+        <button class="pw-eye" type="button" data-eye="lkPw2" aria-label="显示密码" title="显示密码"><svg class="ic ic-sm"><use href="#i-eye"/></svg></button>
+      </span>
     </label>
     <label class="field" id="lkWrap">
       <span class="field-label" data-i18n="lock.pw">密码</span>
-      <input class="input" id="lkPw" type="password" data-i18n-ph="lock.pwPh" placeholder="启动密码" autocomplete="current-password">
+      <span class="pw-wrap">
+        <input class="input" id="lkPw" type="password" data-i18n-ph="lock.pwPh" placeholder="启动密码" autocomplete="current-password">
+        <button class="pw-eye" type="button" data-eye="lkPw" aria-label="显示密码" title="显示密码"><svg class="ic ic-sm"><use href="#i-eye"/></svg></button>
+      </span>
     </label>
     <p class="field-error" id="lkErr" role="alert"></p>
     <button class="btn btn-primary btn-block" id="lkGo" type="submit" data-i18n="lock.unlockBtn">解锁</button>
+    <p class="gate-hint" id="lkHint"></p>
     <details class="gate-help">
       <summary>忘记密码怎么办</summary>
       <p>删掉 U 盘 <code>data\lock.json</code> 这个文件，下次打开重新设置一个即可。钥匙不受影响。</p>
@@ -180,7 +200,7 @@
         <span class="sb-plan" id="sbPlan" hidden></span>
         <span class="grow"></span>
         <span class="ctx" id="ctxWrap">
-          <span class="ctx-bar"><i id="ctxFill"></i></span>
+          <span class="ctx-bar"><i id="ctxFill"></i><i id="ctxTick"></i></span>
           <span class="ctx-text" id="ctxText" data-i18n="status.ctxEmpty">上下文</span>
         </span>
         <button class="ghost-btn" id="ctxCompact" title="把前面的对话压缩成摘要，腾出空间"><svg class="ic ic-sm"><use href="#i-refresh"/></svg><span data-i18n="status.compact">压缩</span></button>
@@ -214,6 +234,19 @@
           <button class="tool-pill pill-sm" id="planQuick" data-i18n-title="composer.planTitle" title="计划模式：先只读调研、出一份计划，你批准后再动手（再点一次退出）"><svg class="ic ic-sm"><use href="#i-book"/></svg><span class="pill-label" data-i18n="composer.plan">计划</span></button>
           <button class="ghost-btn" id="attach" data-i18n-title="composer.attachTitle" title="附加图片或文本文件"><svg class="ic"><use href="#i-clip"/></svg><span class="pill-label" data-i18n="composer.attach">附件</span></button>
           <span class="grow"></span>
+          <!-- 思考深度：档位跟着模型走（数据来自 models.dev），点了就地切，不跑设置 -->
+          <div class="pop-anchor">
+            <button class="tool-pill pill-sm" id="depthBtn" aria-haspopup="listbox" aria-expanded="false" hidden
+                    title="思考深度：模型想多久。档位跟着模型给，点了就地切">
+              <svg class="ic ic-sm"><use href="#i-brain"/></svg>
+              <span class="tool-pill-text" id="depthText">思考</span>
+              <svg class="ic ic-sm caret"><use href="#i-chevron-down"/></svg>
+            </button>
+            <div class="pop pop-up pop-mode" id="depthPop" hidden>
+              <div class="pop-body" id="depthList" role="listbox"></div>
+              <div class="pop-foot"><span class="pop-note" id="depthNote"></span></div>
+            </div>
+          </div>
           <span class="usage-text" id="usage"></span>
           <button class="send-btn" id="send" data-i18n-title="composer.send" title="发送（Enter）"><svg class="ic"><use href="#i-send"/></svg></button>
         </div>
@@ -324,6 +357,16 @@
                   <option value="0">关闭（只提醒，手动点压缩）</option>
                 </select>
                 <span class="field-help">快满的时候先用轻量通道把旧对话摘要掉，省得模型报超限；摘要会存进会话日志</span>
+              </label>
+              <label class="field mt">
+                <span class="field-label">压缩时保留最近原文</span>
+                <select class="input input-sm" id="keepTokensSel" style="max-width:230px">
+                  <option value="15000">约 15k token（默认）</option>
+                  <option value="30000">约 30k token（细节留更多）</option>
+                  <option value="5000">约 5k token（压得更狠）</option>
+                  <option value="0">不留（全交给摘要）</option>
+                </select>
+                <span class="field-help">压缩后，最近这段对话**原文**照样在上下文里（只有更早的部分会被摘要取代）——留得多，细节记得准但要花更多 token</span>
               </label>
             </div>
           </div>

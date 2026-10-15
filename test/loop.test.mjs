@@ -1,4 +1,4 @@
-// 主循环端到端：Mock 剧本走完 建文件→汇报；subagent 派生；步数上限
+// 主循环端到端：Mock 剧本走完 建文件→汇报；subagent 派生；长任务（无步数上限）；重复调用提醒
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -54,7 +54,7 @@ test("subagent 不可再嵌套", async () => {
   await assert.rejects(() => tool.run({ task: "x" }, makeCtx({ workspace: ws, registry: r, subDepth: 1 })), /不能再派生/);
 });
 
-test("步数上限：31 步剧本在 30 步被停", async () => {
+test("长任务：31 步剧本全部跑完（单轮不再设步数上限，对标 ZCode/OpenCode）", async () => {
   const { r } = await freshRegistry();
   const ws = tmpDir();
   const script = Array.from({ length: 31 }, (_, i) => ({ tool: "fs_write", args: { path: `f${i}.txt`, content: String(i) } }));
@@ -63,6 +63,71 @@ test("步数上限：31 步剧本在 30 步被停", async () => {
   );
   const done = evs.at(-1);
   assert.equal(done.type, "done");
-  assert.equal(done.stopped, true, "应标记 stopped");
-  assert.ok(!fs.existsSync(path.join(ws, "f30.txt")), "第 31 步不应执行");
+  assert.notEqual(done.stopped, true, "不应被硬停");
+  assert.ok(done.steps >= 31, "31 步都该跑过");
+  assert.ok(fs.existsSync(path.join(ws, "f30.txt")), "第 31 步应该执行到");
+  assert.equal(evs.filter((e) => e.type === "change").length, 31, "31 次改动都要有事件");
+});
+
+test("调试闸：UA_MAX_STEPS 显式设了才硬停（默认无上限）", async () => {
+  process.env.UA_MAX_STEPS = "5";
+  try {
+    const { r } = await freshRegistry();
+    const ws = tmpDir();
+    const script = Array.from({ length: 8 }, (_, i) => ({ tool: "fs_write", args: { path: `g${i}.txt`, content: String(i) } }));
+    const evs = await collect(
+      runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, registry: r, mode: "full" }) })
+    );
+    const done = evs.at(-1);
+    assert.equal(done.stopped, true, "显式闸要能停住");
+    assert.equal(done.steps, 5);
+    assert.ok(fs.existsSync(path.join(ws, "g4.txt")));
+    assert.ok(!fs.existsSync(path.join(ws, "g5.txt")), "第 6 步不应执行");
+  } finally {
+    delete process.env.UA_MAX_STEPS;
+  }
+});
+
+test("重复调用提醒：连续第 3 次同一个调用，给模型注入一句系统提醒（对标 ZCode）", async () => {
+  const { r } = await freshRegistry();
+  const ws = tmpDir();
+  fs.writeFileSync(path.join(ws, "same.txt"), "x");
+  const same = { tool: "fs_read", args: { path: "same.txt" } };
+  const script = [same, same, same, same, same, { say: "好" }];
+  const evs = await collect(
+    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, registry: r, mode: "full" }) })
+  );
+  const noted = evs.filter((e) => e.type === "tool_result" && /<system-reminder>/.test(e.text || ""));
+  assert.equal(noted.length, 1, "只在首次跨过阈值时提醒一次");
+  assert.match(noted[0].text, /连续调用 3 次/);
+  assert.equal(evs.at(-1).type, "done", "提醒不硬停，任务照跑完");
+});
+
+test("轮中压缩：每次模型请求前问一次 ctx.midTurnCompact，返回新消息就换用并播事件", async () => {
+  const { r } = await freshRegistry();
+  const ws = tmpDir();
+  const script = Array.from({ length: 4 }, (_, i) => ({ tool: "fs_write", args: { path: `m${i}.txt`, content: String(i) } })).concat([{ say: "完成" }]);
+  const asked = [];
+  const ctx = makeCtx({ workspace: ws, registry: r, mode: "full" });
+  ctx.midTurnCompact = async (step) => {
+    asked.push(step);
+    if (step !== 3) return null;
+    // 相当于压完重建（真实实现从会话日志重建）：这里手工造一份「保留已推进步数」的等价历史。
+    // 注意带上那条 user 剧本消息——真实重建的历史里它也在（Mock 靠它继续播剧本）
+    const msgs = [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }];
+    for (let i = 0; i < 2; i++) {
+      msgs.push({ role: "assistant", text: "", toolCalls: [{ id: `t${i}`, name: "fs_write", args: { path: `fake${i}.txt`, content: "x" } }] });
+      msgs.push({ role: "tool", toolCallId: `t${i}`, toolName: "fs_write", text: "ok" });
+    }
+    return { messages: msgs, before: 9000, after: 3000, summary: "前面的步骤已压缩" };
+  };
+  const evs = await collect(
+    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx })
+  );
+  assert.deepEqual(asked, [2, 3, 4, 5], "第 2 步起每次请求前都问一次");
+  const comp = evs.filter((e) => e.type === "compact" && e.mid);
+  assert.equal(comp.length, 1, "换用新消息时要播一条 compact 事件");
+  assert.equal(comp[0].before, 9000);
+  assert.equal(evs.at(-1).type, "done");
+  assert.ok(fs.existsSync(path.join(ws, "m3.txt")), "压缩之后剩下的步骤照跑");
 });

@@ -7,114 +7,7 @@ import * as chat from "./chat.js";
 import { initPicker } from "./picker.js";
 import { initSettings, openSettings, refreshSessionCount } from "./settings.js";
 import { initLang, setLang, getLang, t } from "./i18n.js";
-
-/* ================= 密码锁 =================
-   密码存在 U 盘 data\lock.json：跟盘走、不跟机器走。同一只盘插到任何电脑都是同一个密码，
-   所以只有「这只盘从没设过密码」时才让设置，设过之后任何机器都只能输入。 */
-let lockMode = "unlock";
-
-function setLockUI(mode, info = {}) {
-  lockMode = mode;
-  const setup = mode === "setup";
-  $("#lkWrap1").hidden = !setup;
-  $("#lkWrap2").hidden = !setup;
-  $("#lkWrap").hidden = setup;
-  $("#lkTitle").textContent = setup ? t("lock.setTitle") : t("lock.unlock");
-  $("#lkSub").textContent = setup
-    ? "这只盘还没设过密码——现在设置的人就是它的主人，之后插到任何电脑都要输这个密码。"
-    : "所有配置与会话都留在这只 U 盘里，换台电脑不用重配";
-  $("#lkGo").textContent = setup ? t("lock.setBtn") : t("lock.unlockBtn");
-
-  // 盘的状态提示：让人一眼看出「这是别人的盘 / 新盘」，不是每台机器重设一次
-  const note = $("#lkDisk");
-  if (setup) {
-    note.hidden = false;
-    note.className = "gate-note warn";
-    note.innerHTML = `${icon("alert", "ic ic-sm")} 新盘：第一个设密码的人就是盘的主人，别把没设过密码的盘外借`;
-  } else if (info.setAt) {
-    note.hidden = false;
-    note.className = "gate-note";
-    const d = new Date(info.setAt);
-    note.innerHTML = `${icon("shield", "ic ic-sm")} 这只盘已于 ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} 设过密码${info.setOn ? "（在 " + esc(info.setOn) + " 上）" : ""}，密码跟着盘走，换电脑还是这一个`;
-  } else {
-    note.hidden = true;
-  }
-
-  $("#lkErr").textContent = "";
-  $("#lkPw").value = $("#lkPw1").value = $("#lkPw2").value = "";
-}
-
-function showLock(setup = false, info = {}) {
-  setLockUI(setup ? "setup" : "unlock", info);
-  $("#lock").classList.remove("hide");
-  $("#app")?.setAttribute("inert", ""); // 锁屏期间 Tab 也不许钻到后面的界面里（审查 #22）
-  (setup ? $("#lkPw1") : $("#lkPw")).focus();
-  if (info.cooldown > 0) startCooldown(info.cooldown);
-}
-
-function lockError(msg) {
-  $("#lkErr").textContent = msg;
-}
-
-// 连错太多次后的冷却倒计时（防拿盘暴力试）
-let coolTimer = null;
-function startCooldown(sec) {
-  const btn = $("#lkGo");
-  clearInterval(coolTimer);
-  let left = sec;
-  btn.disabled = true;
-  const tick = () => {
-    if (left <= 0) {
-      clearInterval(coolTimer);
-      btn.disabled = false;
-      btn.textContent = lockMode === "setup" ? "保存并进入" : "解锁";
-      $("#lkErr").textContent = "";
-      return;
-    }
-    btn.textContent = `请 ${left} 秒后再试`;
-    $("#lkErr").textContent = `连续输错太多次，先等 ${left} 秒`;
-    left--;
-  };
-  tick();
-  coolTimer = setInterval(tick, 1000);
-}
-
-async function goLock() {
-  if (lockMode === "setup") {
-    const a = $("#lkPw1").value, b = $("#lkPw2").value;
-    if (a.length < 4) return lockError("密码至少 4 位");
-    if (a !== b) return lockError("两次输入不一致");
-    try {
-      await api.lockSet(a);
-    } catch (e) { return lockError(e.message); }
-    await unlock(a);
-    return;
-  }
-  await unlock($("#lkPw").value);
-}
-
-async function unlock(pw) {
-  try {
-    await api.unlock(pw);
-    clearInterval(coolTimer);
-    $("#lkGo").disabled = false;
-    $("#lock").classList.add("hide");
-    $("#app")?.removeAttribute("inert");
-    bootMain();
-  } catch (e) {
-    lockError(e.message || "密码不对");
-    $("#lkPw").value = "";
-    // 冷却秒数优先读结构化字段：429 的文案是「请 N 秒后再试」，没有「冷却」二字，
-    // 只靠文案匹配会漏掉倒计时（403 的文案里有，所以过去看起来"有时好有时不好"）
-    const sec = Number(e.data?.cooldown) || 0;
-    if (sec > 0) {
-      startCooldown(sec);
-    } else {
-      const m = /冷却\s*(\d+)\s*秒/.exec(e.message || "");
-      if (m) startCooldown(+m[1]);
-    }
-  }
-}
+import { initLock, showLock, initGate } from "./app/lock.js";
 
 /* ================= 会话侧栏 ================= */
 let allSessions = [];
@@ -456,8 +349,7 @@ async function selfCheck() {
 
 /* ================= 入口 ================= */
 (function main() {
-  // 密码锁的绑定放在最前面：后面任何一处出错都不该让密码屏失灵
-  $("#lockForm").onsubmit = (e) => { e.preventDefault(); goLock(); };
+  // 密码锁的表单绑定在 app/lock.js 的 initLock 里（放在最前面：后面任何一处出错都不该让密码屏失灵）
   document.documentElement.dataset.uaReady = "1"; // 告诉看门狗：脚本跑起来了
 
   net.onLocked = () => {
@@ -467,6 +359,7 @@ async function selfCheck() {
     showLock(false);
   };
   const steps = [
+    ["密码屏", () => initLock({ onUnlocked: bootMain })],
     ["界面语言", initLang],
     ["主题", initTheme],
     ["对话区", chat.initChat],
