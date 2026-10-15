@@ -69,6 +69,25 @@ test("长任务：31 步剧本全部跑完（单轮不再设步数上限，对�
   assert.equal(evs.filter((e) => e.type === "change").length, 31, "31 次改动都要有事件");
 });
 
+test("长任务软提醒：跑够步数给模型一句提醒（只提醒、不硬停）", async () => {
+  process.env.UA_STEP_WARN = "2";
+  try {
+    const { r } = await freshRegistry();
+    const ws = tmpDir();
+    const script = Array.from({ length: 4 }, (_, i) => ({ tool: "fs_read", args: { path: "same.txt" } })).concat([{ say: "收尾" }]);
+    fs.writeFileSync(path.join(ws, "same.txt"), "x");
+    const evs = await collect(
+      runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, registry: r, mode: "full" }) })
+    );
+    const soft = evs.filter((e) => e.type === "tool_result" && e.soft);
+    assert.equal(soft.length, 1, "到第 2 步提醒一次");
+    assert.match(soft[0].text, /已经连续跑了 2 步/);
+    assert.equal(evs.at(-1).type, "done", "提醒不硬停，任务照跑完");
+  } finally {
+    delete process.env.UA_STEP_WARN;
+  }
+});
+
 test("调试闸：UA_MAX_STEPS 显式设了才硬停（默认无上限）", async () => {
   process.env.UA_MAX_STEPS = "5";
   try {

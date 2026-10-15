@@ -205,6 +205,74 @@ test("Anthropic：网关不认 ttl 就摘掉重试一次，并记住这个 host�
   } finally { await up.close(); }
 });
 
+test("Anthropic 交错思考：多个 thinking 块按序收集，回放时也不丢块、顺序不乱", async () => {
+  let upstream;
+  const up = await mockUpstream((req, res) => {
+    sse(res, [
+      { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+      { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "先想第一段。" } },
+      { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "SIG-1" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "tu1", name: "fs_read" } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"path":"x.txt"}' } },
+      { type: "content_block_stop", index: 1 },
+      { type: "content_block_start", index: 2, content_block: { type: "thinking" } },
+      { type: "content_block_delta", index: 2, delta: { type: "thinking_delta", thinking: "再想第二段。" } },
+      { type: "content_block_delta", index: 2, delta: { type: "signature_delta", signature: "SIG-2" } },
+      { type: "content_block_stop", index: 2 },
+      { type: "message_delta", delta: { stop_reason: "tool_use" } },
+      { type: "message_stop" },
+    ]);
+  });
+  upstream = up;
+  try {
+    const provider = { protocol: "anthropic", baseURL: up.url, model: "claude-sonnet-5-5", secret: "k" };
+    const evs = await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+    const end = evs.at(-1);
+    assert.ok(Array.isArray(end.thinking), "多个块要给数组（原来只留最后一块）");
+    assert.deepEqual(end.thinking.map((b) => b.text), ["先想第一段。", "再想第二段。"]);
+    assert.deepEqual(end.thinking.map((b) => b.signature), ["SIG-1", "SIG-2"]);
+    // 回放：两个 thinking 块都要在，且在 tool_use 之前（顺序即签名顺序）
+    await collect(streamChat(provider, [
+      { role: "user", text: "hi" },
+      { role: "assistant", text: "", thinking: end.thinking, toolCalls: end.toolCalls },
+      { role: "tool", toolCallId: "tu1", toolName: "fs_read", text: "内容" },
+    ], []));
+    const asst = up.requests[1].body.messages.find((m) => m.role === "assistant");
+    assert.deepEqual(asst.content.slice(0, 2).map((b) => b.thinking), ["先想第一段。", "再想第二段。"]);
+    assert.deepEqual(asst.content.slice(0, 2).map((b) => b.signature), ["SIG-1", "SIG-2"]);
+    assert.equal(asst.content[2].type, "tool_use");
+  } finally { await up.close(); }
+});
+
+test("流式空闲看门狗：连上不吐字会自动断开（可重试），不再永久挂着", async () => {
+  process.env.UA_STREAM_IDLE_MS = "300";
+  process.env.UA_STREAM_RETRIES = "0";
+  let closed = false;
+  const up = await mockUpstream((req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.flushHeaders(); // 连上就什么都不吐（但头要先发出去，客户端才进得了读流）
+    // 客户端被看门狗掐断后，把响应也收掉——不然 server.close() 会一直等着这条挂着的连接（测试会卡死）
+    // 注意挂 res 的 close：req 的 close 在请求体读完时就立刻触发，会把响应直接收掉（踩过）
+    res.on("close", () => { if (!closed && !res.writableEnded) { closed = true; try { res.end(); } catch {} } });
+  });
+  try {
+    const provider = { protocol: "openai-chat", baseURL: up.url, model: "m", secret: "k" };
+    const t0 = Date.now();
+    await assert.rejects(
+      () => collect(streamChat(provider, [{ role: "user", text: "hi" }], [])),
+      /没有吐任何内容|断开/,
+      "应该带着人话断开，而不是永远等下去"
+    );
+    assert.ok(Date.now() - t0 < 5000, "看门狗要真的把它掐掉（不是等到天荒地老）");
+  } finally {
+    delete process.env.UA_STREAM_IDLE_MS;
+    delete process.env.UA_STREAM_RETRIES;
+    try { up.server.closeAllConnections?.(); } catch {}
+    await up.close();
+  }
+});
+
 test("reminder（每轮会变的那段）贴三条协议的尾巴，且不进缓存段", async () => {
   // 三家都验一遍：chat 用第二个 text 块、responses 用第二个 input_text、anthropic 用最后的 text 块，
   // 且 anthropic 的缓存断点打在 reminder 之前那块（reminder 逐轮都变，不能进缓存）

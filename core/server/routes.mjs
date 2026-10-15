@@ -32,6 +32,16 @@ export async function handleRequest(req, res) {
     if (hostName !== "127.0.0.1" && hostName !== "localhost" && hostName !== "::1") {
       return sendJson(res, 403, { error: "只接受本机访问（Host 校验未通过）" });
     }
+    // CSRF 兜底：cookie 已是 HttpOnly + SameSite=Strict（跨站 POST 带不上），但 /api/lock-* 是免鉴权路径——
+    // 浏览器发的跨站请求一定带 Origin，这里只放行「本机来源」或「没有 Origin」（curl 这类原生客户端）
+    if (req.method !== "GET" && u.pathname.startsWith("/api/")) {
+      const origin = String(req.headers.origin || "");
+      let host = "";
+      if (origin) { try { host = new URL(origin).hostname; } catch {} }
+      if (origin && !["127.0.0.1", "localhost", "::1"].includes(host)) {
+        return sendJson(res, 403, { error: "来源不被接受：只允许本机页面调用（跨站请求一律拒绝）" });
+      }
+    }
     // 密码锁：白名单之外的功能接口必须先解锁
     if (u.pathname.startsWith("/api/") && !FREE_PATHS.has(u.pathname) && !unlocked(req)) {
       return sendJson(res, 401, { error: "请先输入密码解锁", locked: true });

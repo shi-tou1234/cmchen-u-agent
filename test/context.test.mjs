@@ -203,6 +203,46 @@ test("systemPrompt：被问「你是什么模型」要说清底层通道+模型�
   assert.match(sp2, /被问到/);
 });
 
+test("配平：悬空 tool_call 补合成结果、顺序按调用排、孤儿 tool 丢掉（严格网关不再 400）", () => {
+  // ① 有调用没结果（整轮中途崩/被中止的典型日志形状）
+  {
+    const events = [
+      ev("user", { text: "干活" }),
+      ev("assistant_message", { text: "" }),
+      ev("tool_call", { id: "c1", name: "fs_read", args: { path: "a.txt" } }),
+      ev("tool_call", { id: "c2", name: "fs_read", args: { path: "b.txt" } }),
+    ];
+    const msgs = buildHistory(events);
+    const asst = msgs.find((m) => m.role === "assistant");
+    const tools = msgs.filter((m) => m.role === "tool");
+    assert.equal(asst.toolCalls.length, 2);
+    assert.equal(tools.length, 2, "两个调用都要有结果");
+    assert.deepEqual(tools.map((t) => t.toolCallId), ["c1", "c2"], "顺序跟 tool_calls 一致");
+    assert.match(tools[0].text, /没有产生结果/, "合成结果要说明情况");
+  }
+  // ② 只回了一半结果：按调用顺序补齐（不能把 c2 的结果串到 c1 上）
+  {
+    const events = [
+      ev("user", { text: "干活" }),
+      ev("assistant_message", { text: "" }),
+      ev("tool_call", { id: "c1", name: "fs_read", args: {} }),
+      ev("tool_call", { id: "c2", name: "fs_write", args: {} }),
+      ev("tool_result", { id: "c2", name: "fs_write", text: "写好了" }),
+    ];
+    const msgs = buildHistory(events);
+    const tools = msgs.filter((m) => m.role === "tool");
+    assert.deepEqual(tools.map((t) => t.toolCallId), ["c1", "c2"]);
+    assert.match(tools[0].text, /没有产生结果/);
+    assert.equal(tools[1].text, "写好了", "真结果要留在它自己那个 id 上");
+  }
+  // ③ 孤儿 tool（前面没有对应调用）：丢掉
+  {
+    const events = [ev("user", { text: "干活" }), ev("tool_result", { id: "ghost", name: "fs_read", text: "不该在这" })];
+    const msgs = buildHistory(events);
+    assert.equal(msgs.filter((m) => m.role === "tool").length, 0, "孤儿 tool 消息要删掉");
+  }
+});
+
 test("rewind：被回退的那段不进上下文，原位留一句说明", async () => {
   const { buildHistory, rewindRanges, isDropped } = await import("../core/context.mjs");
   const ev = (type, extra = {}, ts = 1) => ({ ts, type, ...extra });

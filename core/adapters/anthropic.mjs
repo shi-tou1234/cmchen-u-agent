@@ -30,7 +30,11 @@ function bodyAnthropic(provider, messages, tools, opts = {}) {
     } else if (m.role === "assistant") {
       const blocks = [];
       // 开了思考就必须把上一步的 thinking 块（含签名）原样带回去，否则 API 会拒；别的协议不用带
-      if (m.thinking?.text) blocks.push({ type: "thinking", thinking: m.thinking.text, signature: m.thinking.signature || "" });
+      // thinking 可能是「多个块」（交错思考：thinking → tool_use → thinking…）：按块按序原样带回去，
+      // 少一个块或顺序错了 Anthropic 会直接 400（同时兼容老的单个对象形式）
+      for (const th of Array.isArray(m.thinking) ? m.thinking : m.thinking ? [m.thinking] : []) {
+        if (th?.text) blocks.push({ type: "thinking", thinking: th.text, signature: th.signature || "" });
+      }
       if (m.text) blocks.push({ type: "text", text: m.text });
       for (const tc of m.toolCalls || []) blocks.push({ type: "tool_use", id: tc.id, name: tc.name, input: tc.args ?? {} });
       msgs.push({ role: "assistant", content: blocks.length ? blocks : [{ type: "text", text: "" }] });
@@ -88,8 +92,8 @@ async function* streamAnthropic(provider, messages, tools, signal) {
   const calls = new Map(); // index → {id, name, args}
   let stop = "stop";
   let curTool = null;
-  let thinkText = "";
-  let signature = "";
+  const thinkBlocks = []; // 按序收集每个 thinking 块（{text, signature}）
+  let curThink = null;
   let inThinking = false;
   for await (const data of sseLines(res)) {
     let j;
@@ -101,8 +105,8 @@ async function* streamAnthropic(provider, messages, tools, signal) {
     const type = j.type || "";
     if (type === "content_block_start" && j.content_block?.type === "thinking") {
       inThinking = true;
-      thinkText = "";
-      signature = "";
+      curThink = { text: "", signature: "" };
+      thinkBlocks.push(curThink);
     } else if (type === "content_block_start" && j.content_block?.type === "tool_use") {
       curTool = { index: j.index, id: j.content_block.id, name: j.content_block.name, args: "" };
       calls.set(j.index, curTool);
@@ -110,10 +114,12 @@ async function* streamAnthropic(provider, messages, tools, signal) {
     } else if (type === "content_block_delta") {
       if (j.delta?.type === "text_delta") yield { type: "text", delta: j.delta.text };
       else if (j.delta?.type === "thinking_delta") {
-        thinkText += j.delta.thinking || "";
+        if (!curThink) { curThink = { text: "", signature: "" }; thinkBlocks.push(curThink); }
+        curThink.text += j.delta.thinking || "";
         yield { type: "reasoning", delta: j.delta.thinking || "" };
       } else if (j.delta?.type === "signature_delta") {
-        signature = j.delta.signature || signature; // 签名要在多轮里原样带回去，不然 API 会拒
+        if (!curThink) { curThink = { text: "", signature: "" }; thinkBlocks.push(curThink); }
+        curThink.signature = j.delta.signature || curThink.signature; // 签名要原样带回去，不然 API 会拒
       } else if (j.delta?.type === "input_json_delta" && curTool) {
         curTool.args += j.delta.partial_json || "";
         yield { type: "tool_delta", id: curTool.id, delta: j.delta.partial_json || "" };
@@ -121,6 +127,7 @@ async function* streamAnthropic(provider, messages, tools, signal) {
     } else if (type === "content_block_stop") {
       curTool = null;
       inThinking = false;
+      curThink = null;
     } else if (type === "message_delta") {
       if (j.usage) yield { type: "usage", input: 0, output: j.usage.output_tokens || 0 };
       if (j.delta?.stop_reason === "tool_use") stop = "tool_calls";
@@ -150,7 +157,8 @@ async function* streamAnthropic(provider, messages, tools, signal) {
     }
     return { id: a.id, name: a.name, args };
   });
-  yield { type: "end", stopReason: toolCalls.length ? "tool_calls" : stop, toolCalls, thinking: thinkText ? { text: thinkText, signature } : null };
+  const thinkOut = thinkBlocks.filter((b) => b.text || b.signature);
+  yield { type: "end", stopReason: toolCalls.length ? "tool_calls" : stop, toolCalls, thinking: thinkOut.length ? (thinkOut.length === 1 ? thinkOut[0] : thinkOut) : null };
 }
 
 // ---------- Mock provider（离线演示 + 全部测试的确定性脚本） ----------

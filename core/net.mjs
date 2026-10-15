@@ -100,7 +100,11 @@ function fetchDirect(rawUrl, { timeoutMs, headers, maxBytes, redirects, guard })
         else res.destroy();
       });
       res.on("end", () => ok(res.statusCode, res.headers, decodeBody(Buffer.concat(chunks), res.headers["content-encoding"])));
-      res.on("close", () => ok(res.statusCode, res.headers, decodeBody(Buffer.concat(chunks), res.headers["content-encoding"])));
+      res.on("close", () => {
+        // 截断的 200 不能当成功：close 时 res.complete 为 false 说明连接半路断了（审查：报告第 9 条）
+        if (!res.complete) return fail(new Error("连接在下载途中被切断（内容可能不完整）"));
+        ok(res.statusCode, res.headers, decodeBody(Buffer.concat(chunks), res.headers["content-encoding"]));
+      });
       res.on("error", fail);
     };
     const deadline = setTimeout(() => fail(new Error("请求超时（" + Math.round(timeoutMs / 1000) + "s）")), timeoutMs);
@@ -216,7 +220,11 @@ function fetchViaProxy(rawUrl, { px, timeoutMs, headers, maxBytes, redirects, gu
         else res.destroy();
       });
       res.on("end", () => ok(res.statusCode, res.headers, decodeBody(Buffer.concat(chunks), res.headers["content-encoding"])));
-      res.on("close", () => ok(res.statusCode, res.headers, decodeBody(Buffer.concat(chunks), res.headers["content-encoding"])));
+      res.on("close", () => {
+        // 截断的 200 不能当成功：close 时 res.complete 为 false 说明连接半路断了（审查：报告第 9 条）
+        if (!res.complete) return fail(new Error("连接在下载途中被切断（内容可能不完整）"));
+        ok(res.statusCode, res.headers, decodeBody(Buffer.concat(chunks), res.headers["content-encoding"]));
+      });
       res.on("error", fail);
     };
     const deadline = setTimeout(() => fail(new Error("请求超时（" + Math.round(timeoutMs / 1000) + "s）")), timeoutMs);

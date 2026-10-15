@@ -1,27 +1,5 @@
 // u-agent 本地服务：静态页 + API（SSE 聊天 / 确认 / 设置 / 会话 / 密码锁）。零 npm 依赖。
 import http from "node:http";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import crypto from "node:crypto";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { Registry } from "./core/tools.mjs";
-import { runAgent } from "./core/agent-loop.mjs";
-import { streamChat, normalizeBase, buildHeaders, describeFetchError } from "./core/providers.mjs";
-import { buildHistory, budgetOf, compactPrompt, rewindRanges, isDropped, pickRecentUsers, wasLastTurnAborted, tailStartIndex } from "./core/context.mjs";
-import { Sessions } from "./core/sessions.mjs";
-import { ConfirmGate } from "./core/confirm.mjs";
-import { Checkpoints, SNAP_PATHS } from "./core/checkpoints.mjs";
-import { resolveInside } from "./core/sandbox.mjs";
-import { modelInfo, budgetOfModel, reasoningDepths } from "./core/model-windows.mjs";
-import { loadCommands, loadSkills, skillsPromptSection, expandCommand } from "./core/skills.mjs";
-import { MODES, DEFAULT_AUTO_APPROVE } from "./core/modes.mjs";
-import { McpHub } from "./core/mcp.mjs";
-import { loadHookSources, matchHooks, runHookBatch } from "./core/hooks.mjs";
-import { PERSONA_PRESETS, VOICE_LENGTHS, VOICE_STYLES, VOICE_LANGS, normalizeVoice } from "./core/persona.mjs";
-import { readJson, writeJson, writeFileAtomic, genId, truncate } from "./core/util.mjs";
-import { runChecks, fixPrompt, checkSummary, CHECKS_MAX_FIX } from "./core/checks.mjs";
-import { listJobs, jobLog, stopJob, runningCount, killAllJobs } from "./core/jobs.mjs";
 
 import { handleRequest } from "./core/server/routes.mjs";
 import { registry } from "./core/server/runtime.mjs";
