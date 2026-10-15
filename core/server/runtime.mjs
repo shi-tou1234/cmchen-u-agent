@@ -19,7 +19,7 @@ const VAULT = path.join(DATA, "vault.bin"); // 钥匙库（AES-GCM 加密，不�
 const SETTINGS = path.join(DATA, "settings.json");
 const LOCK = path.join(DATA, "lock.json"); // 密码锁（scrypt 哈希）
 const EXAMPLE = path.join(UA_HOME, "config.example.json");
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const MASK = "•••已保存"; // 钥匙回显掩码：网页只看得到这个，取不到原文
 const DEFAULT_KEEP_TOKENS = 15000; // 压缩时默认保留最近多少 token 原文（设置可改；照 OpenCode 的 compaction.keep）
 
