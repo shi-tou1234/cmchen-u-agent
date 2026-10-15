@@ -2,7 +2,13 @@
 // （2026-10-15 从 core/providers.mjs 拆出；一个功能一个文件）
 import { outLimitOf, thinkingBudgetOf } from "./thinking.mjs";
 import { assertOk, endpoint, postStream, sseLines } from "./http.mjs";
-function bodyAnthropic(provider, messages, tools) {
+// 最后一块是不是主循环贴的 reminder（那段以 <system-reminder> 开头）
+function m_lastIsReminder(blocks) {
+  const last = blocks[blocks.length - 1];
+  return !!last && typeof last.text === "string" && last.text.startsWith("<system-reminder>");
+}
+
+function bodyAnthropic(provider, messages, tools, opts = {}) {
   let system = "";
   const msgs = [];
   const pushBlocks = (role, blocks) => {
@@ -19,6 +25,7 @@ function bodyAnthropic(provider, messages, tools) {
       for (const i of m.images || []) {
         blocks.push({ type: "image", source: { type: "base64", media_type: i.mediaType, data: i.data } });
       }
+      if (m.reminder) blocks.push({ type: "text", text: m.reminder }); // 每轮会变的那段贴尾巴
       pushBlocks("user", blocks);
     } else if (m.role === "assistant") {
       const blocks = [];
@@ -33,22 +40,50 @@ function bodyAnthropic(provider, messages, tools) {
   }
   const outLimit = outLimitOf(provider);
   const thinkBudget = thinkingBudgetOf(provider);
+  // Anthropic 的缓存是「显式打点」的：不打 cache_control 就是 0 命中（和 OpenAI 系的自动前缀缓存不一样）。
+  // 打三处（对标 Claude Code 的断点打法，上限 4 处）：最后一个工具 → 系统提示词 → 最后一条消息里
+  // 「稳定的最后一块」（有 reminder 就打在它前面，让 reminder 不进缓存段）。
+  // TTL：工具 + 系统这两块几乎不变，给 1h（默认只有 5 分钟——停一会儿再聊就全过期、整段重算）；
+  // 消息尾块每次都往前挪，用默认 5m 就好（ttl 只有 5m/1h 两档）
+  const cc = (long) => ({ type: "ephemeral", ...(long && opts.ttl ? { ttl: opts.ttl } : {}) });
+  const toolDefs = tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.params }));
+  if (toolDefs.length) toolDefs[toolDefs.length - 1] = { ...toolDefs[toolDefs.length - 1], cache_control: cc(true) };
+  const systemBlocks = system ? [{ type: "text", text: system, cache_control: cc(true) }] : [];
+  const lastMsg = msgs[msgs.length - 1];
+  if (lastMsg?.content?.length) {
+    const blocks = lastMsg.content;
+    const target = m_lastIsReminder(blocks) ? blocks.length - 2 : blocks.length - 1;
+    if (target >= 0) blocks[target] = { ...blocks[target], cache_control: cc(false) };
+  }
   return {
     model: provider.model,
     max_tokens: thinkBudget ? Math.max(outLimit, thinkBudget + 2048) : outLimit,
     ...(thinkBudget ? { thinking: { type: "enabled", budget_tokens: thinkBudget } } : {}),
-    ...(system ? { system } : {}),
+    ...(systemBlocks.length ? { system: systemBlocks } : {}),
     messages: msgs,
     stream: true,
-    ...(tools.length ? { tools: tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.params })) } : {}),
+    ...(toolDefs.length ? { tools: toolDefs } : {}),
   };
 }
 
 // ---------- SSE 读取 ----------
 
+// 带 ttl 被拒过的网关：记住，之后不再带（免得每个请求都白打一遍 400）
+const NO_TTL_HOSTS = new Set();
+function hostOfUrl(url) {
+  try { return new URL(url).host; } catch { return String(url); }
+}
+
 async function* streamAnthropic(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
-  const res = await postStream(url, headers, bodyAnthropic(provider, messages, tools), signal);
+  const useTtl = !NO_TTL_HOSTS.has(hostOfUrl(url));
+  let res = await postStream(url, headers, bodyAnthropic(provider, messages, tools, { ttl: useTtl ? "1h" : "" }), signal);
+  if (res.status === 400 && useTtl) {
+    // 有的网关不认 cache_control.ttl（长缓存是个较新的字段）：摘掉重试一次，并记住这个 host
+    try { await res.body?.cancel(); } catch {}
+    NO_TTL_HOSTS.add(hostOfUrl(url));
+    res = await postStream(url, headers, bodyAnthropic(provider, messages, tools, { ttl: "" }), signal);
+  }
   await assertOk(res, provider);
   const calls = new Map(); // index → {id, name, args}
   let stop = "stop";
@@ -91,7 +126,14 @@ async function* streamAnthropic(provider, messages, tools, signal) {
       if (j.delta?.stop_reason === "tool_use") stop = "tool_calls";
       else if (j.delta?.stop_reason === "end_turn") stop = "stop";
     } else if (type === "message_start") {
-      if (j.message?.usage) yield { type: "usage", input: j.message.usage.input_tokens || 0, output: 0, cached: j.message.usage.cache_read_input_tokens || 0 };
+      if (j.message?.usage) {
+        // Anthropic 的 input_tokens **不含**缓存命中/写入的 token（cache_read / cache_creation 是分开报的）；
+        // 而 OpenAI 的 prompt_tokens 是含的。要跟别家一个口径（也为了「缓存占比 = cached/input」算得对），
+        // 这里把三者加起来当 input（ZCode 的 context-cache-hit-rate.md 也强调过这个分母坑）
+        const u = j.message.usage;
+        const cachedRead = u.cache_read_input_tokens || 0;
+        yield { type: "usage", input: (u.input_tokens || 0) + cachedRead + (u.cache_creation_input_tokens || 0), output: 0, cached: cachedRead };
+      }
     } else if (type === "error") {
       yield { type: "error", message: j.error?.message || "anthropic 流失败" };
       return;

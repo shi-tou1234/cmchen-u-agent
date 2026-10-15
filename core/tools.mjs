@@ -11,7 +11,11 @@ export class Registry {
 
   async load() {
     this.map.clear();
-    for (const f of fs.readdirSync(this.dir).filter((f) => f.endsWith(".mjs"))) {
+    // 按文件名排序：工具表也是请求前缀的一部分——readdirSync 的顺序在不同机器/重启后可能不一样，
+    // 顺序一变，前缀就变，缓存白存
+    for (const f of fs.readdirSync(this.dir).filter((x) => x.endsWith(".mjs")).sort()) {
+      // 按文件名排序：工具表也是请求前缀的一部分，readdirSync 的顺序在不同机器/重启后可能不一样，
+      // 顺序一变前缀就变（缓存白存）
       const mod = await import(pathToFileURL(path.join(this.dir, f)).href);
       const t = mod.default;
       if (t?.name && typeof t.run === "function") this.map.set(t.name, t);

@@ -7,7 +7,21 @@ import { loadHookSources, matchHooks, runHookBatch } from "../hooks.mjs";
 import { assertCommandAllowed } from "../blacklist.mjs";
 import { truncate } from "../util.mjs";
 import { CHANGE_KINDS, buildChange } from "./changes.mjs";
-import { systemPrompt } from "./prompt.mjs";
+import { systemPrompt, turnReminder } from "./prompt.mjs";
+// 把「每轮会变的那段」贴到最新一条用户消息后面（返回新数组：history 本体不动 → 日志/回放不受影响）。
+// 放在最末尾而不是系统提示词里，是为了让缓存前缀尽量长——逐轮只有这句尾部在变。
+function withReminder(history, reminder) {
+  if (!reminder) return history;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === "user") {
+      const copy = history.slice();
+      copy[i] = { ...history[i], reminder };
+      return copy;
+    }
+  }
+  return history;
+}
+
 function envMaxSteps() {
   const n = Number(process.env.UA_MAX_STEPS);
   return Number.isFinite(n) && n > 0 ? n : Infinity;
@@ -28,6 +42,8 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
   let finalText = "";
   let steps = 0;
   let repeatWarns = 0; // 本轮已经注入过几次「重复调用」提醒
+  let sysText = null; // 系统提示词：本轮第一趟算一次，之后逐字节复用（缓存）
+  let reminder = null; // 每轮会变的那段：同样第一趟算一次（轮内冻结）
   ctx.loopGuard = ctx.loopGuard || { lastSig: "", count: 0 }; // 防死循环：连续重复同一个调用才计数（跨轮保持，由服务端按会话持有）
 
   // v0.9.9 用户 hooks：每趟加载一次来源清单；工作区那份要过信任闸（本次运行内批准过就记着）
@@ -55,7 +71,13 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
       let roundThink = "";
       let thinkMs = 0;
       let ended = null;
-      const stream = streamChat(provider, [{ role: "system", text: systemPrompt({ ...ctx, provider }) }, ...history], toolList, ctx.signal);
+      // 缓存命门的两个约定（改前先读 core/agent/prompt.mjs 顶部的说明）：
+      //   ① 系统提示词每步都重算，但只放"基本不变"的东西 —— 跨轮逐字节一致；
+      //   ② 会变的那段（计划/模式/记忆/时间）由 turnReminder 贴在最新一条用户消息后面，
+      //      一个用户轮次只算一次（冻结），且不改 history 本体（也就不会写进会话日志）。
+      if (sysText === null) sysText = systemPrompt({ ...ctx, provider });
+      if (reminder === null) reminder = ctx.turnReminderText ?? turnReminder(ctx); // 服务端给的那份与日志逐字一致；没有就自己算（测试/子代理路径）
+      const stream = streamChat(provider, [{ role: "system", text: sysText }, ...withReminder(history, reminder)], toolList, ctx.signal);
       while (true) {
         const { value: ev, done } = await stream.next();
         if (done) break;
@@ -91,7 +113,7 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
       history.push({ role: "assistant", text: roundText, toolCalls: ended.toolCalls, ...(thinkForHistory ? { thinking: thinkForHistory } : {}) });
 
       // 给 get_context_remaining 用的实时预算（含刚回填的这一步）
-      ctx.budgetNow = () => budgetOf([{ role: "system", text: systemPrompt({ ...ctx, provider }) }, ...history], ctx.limits);
+      ctx.budgetNow = () => budgetOf([{ role: "system", text: sysText || systemPrompt({ ...ctx, provider }) }, ...withReminder(history, reminder)], ctx.limits);
 
       // ── 一轮里的多个工具调用 ──
       // 门禁判定、弹窗、检查点按顺序做（要排队、要追加写清单，必须串行）；

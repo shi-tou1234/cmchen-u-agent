@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { personaBlock, PERSONA_PRESETS, DEFAULT_VOICE, normalizeVoice } from "../core/persona.mjs";
-import { systemPrompt, MEMORY_INJECT_MAX } from "../core/agent-loop.mjs";
+import { systemPrompt, turnContext, MEMORY_INJECT_MAX } from "../core/agent-loop.mjs";
 import { tmpDir } from "./helpers.mjs";
 
 const base = { workspace: "C:/w", mode: "confirm" };
@@ -48,11 +48,11 @@ test("表达风格：回答长度 / 语言风格 / 输出语言 各按语言给�
   assert.deepEqual(normalizeVoice({ length: "huge", style: "???", lang: "fr" }), DEFAULT_VOICE);
 });
 
-test("记忆注入：太长只带最近的，并说清被裁了多少", () => {
+test("记忆注入：太长只带最近的，并说清被裁了多少（走每轮补充，不进缓存前缀）", () => {
   const short = "记得主人喜欢简短回答";
-  assert.match(systemPrompt({ ...base, memory: short }), /记得主人喜欢简短回答/);
+  assert.match(turnContext({ memory: short }), /记得主人喜欢简短回答/);
   const long = "x".repeat(MEMORY_INJECT_MAX + 500) + "【最新的这句】";
-  const sp = systemPrompt({ ...base, memory: long });
+  const sp = turnContext({ memory: long });
   assert.match(sp, /【最新的这句】/, "保留最近的");
   assert.match(sp, /只带上了最近/);
   assert.doesNotMatch(sp, new RegExp("x".repeat(MEMORY_INJECT_MAX + 400)), "老的不该整段进来");

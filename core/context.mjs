@@ -76,6 +76,18 @@ export function buildHistory(events, at = null) {
         flushCur(i);
         put({ role: "user", text: ev.text || "", images: ev.images || [] }, i);
         break;
+      case "turn_context": {
+        // 每轮会变的那段（时间/模式/计划/完成标准/记忆）：落盘后由这里贴回它前面那条用户消息。
+        // 为什么要落盘：请求逐字比对前缀才命中缓存——不落盘的话，下一轮重建出来的同一条用户消息
+        // 少了这段，前缀从这个位置断掉，上一轮的整段工具结果都要按原价重算。
+        for (let k = msgs.length - 1; k >= 0; k--) {
+          if (msgs[k].role === "user") {
+            msgs[k] = { ...msgs[k], reminder: ev.text || "" };
+            break;
+          }
+        }
+        break;
+      }
       case "assistant_message":
         // 独立回复：上一个回合已带着文本但无工具（罕见）时先固化；然后开始本回合
         if (cur && cur.text && !cur.toolCalls.length) flushCur(i);
