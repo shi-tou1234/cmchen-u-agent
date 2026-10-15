@@ -14,6 +14,7 @@ function bodyOpenaiResponses(provider, messages, tools) {
         content: [
           { type: "input_text", text: m.text },
           ...((m.images || []).map((i) => ({ type: "input_image", image_url: dataUrl(i) }))),
+          ...(m.reminder ? [{ type: "input_text", text: m.reminder }] : []), // 每轮会变的那段贴尾巴（缓存前缀要长）
         ],
       });
     } else if (m.role === "assistant") {
@@ -31,6 +32,9 @@ function bodyOpenaiResponses(provider, messages, tools) {
     model: provider.model,
     input,
     stream: true,
+    // Codex 同款：给整个会话一个稳定的 prompt_cache_key，服务端据此把同一会话路由到同一份缓存，
+    // 命中率比"按前缀碰运气"更稳；会话内逐轮不变（变了就等于宣布缓存作废）
+    ...(provider.sessionId ? { prompt_cache_key: String(provider.sessionId) } : {}),
     // 让它把思考摘要一起流出来（有的网关不认这个字段，见下面的 400 重试）；
     // 思考深度选了档位就带上 effort（off = 干脆不带 reasoning）
     ...(provider.thinking === false || depth === "off"
@@ -46,10 +50,11 @@ async function* streamOpenaiResponses(provider, messages, tools, signal) {
   const { url, headers } = endpoint(provider);
   const reqBody = bodyOpenaiResponses(provider, messages, tools);
   let res = await postStream(url, headers, reqBody, signal);
-  if (res.status === 400 && reqBody.reasoning) {
-    // 有的网关不认 reasoning（思考摘要）字段，去掉后重试一次；同样先消费掉首个响应体
+  if (res.status === 400 && (reqBody.reasoning || reqBody.prompt_cache_key)) {
+    // 有的网关不认 reasoning（思考摘要）/ prompt_cache_key，去掉后重试一次；同样先消费掉首个响应体
     try { await res.body?.cancel(); } catch {}
     delete reqBody.reasoning;
+    delete reqBody.prompt_cache_key;
     res = await postStream(url, headers, reqBody, signal);
   }
   await assertOk(res, provider);

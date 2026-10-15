@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildHistory, budgetOf, estTokens, compactPrompt, tailStartIndex } from "../core/context.mjs";
-import { systemPrompt } from "../core/agent-loop.mjs";
+import { systemPrompt, turnContext } from "../core/agent-loop.mjs";
 
 const ev = (type, extra = {}) => ({ ts: "2026-10-12T00:00:00Z", type, ...extra });
 
@@ -140,17 +140,51 @@ test("compactPrompt：传进来什么就摘要什么（尾段取舍归 tailStart
   assert.ok(!p.includes("较新的消息B"), "留在上下文里的尾段不该再进摘要请求");
 });
 
-test("systemPrompt 注入：记忆 / 计划 / AGENTS.md", () => {
-  const sp = systemPrompt({
+test("缓存契约：系统提示词只放不变的（AGENTS.md），会变的（记忆/计划/模式/完成标准）走每轮补充", () => {
+  const ctx = {
     workspace: "C:/w",
     mode: "confirm",
     memory: "用户偏好简短回答",
     agentsMd: "本项目用 pnpm 构建",
     state: { plan: [{ step: "第一步", status: "doing" }] },
-  });
-  assert.match(sp, /用户偏好简短回答/);
-  assert.match(sp, /本项目用 pnpm 构建/);
-  assert.match(sp, /第一步/);
+    goal: "测试全绿",
+  };
+  const sp = systemPrompt(ctx);
+  assert.match(sp, /本项目用 pnpm 构建/, "AGENTS.md 基本不变 → 留在系统提示词里（缓存前缀）");
+  // 这三样每轮都可能变，留在系统提示词里会把整段缓存打散
+  assert.doesNotMatch(sp, /用户偏好简短回答/, "记忆不该在系统提示词里");
+  assert.doesNotMatch(sp, /第一步/, "计划不该在系统提示词里");
+  assert.doesNotMatch(sp, /测试全绿/, "完成标准不该在系统提示词里");
+  assert.doesNotMatch(sp, /当前权限模式/, "权限模式会中途变（计划批准→谨慎），不该进缓存前缀");
+  // 同一份 ctx 两次拼出来必须逐字节一样（否则缓存永远不命中）
+  assert.equal(systemPrompt({ ...ctx, workspace: "C:/w" }), sp, "同样的输入要得到逐字节相同的系统提示词");
+  // 会变的那段：在每轮补充里
+  const tc = turnContext(ctx);
+  assert.match(tc, /用户偏好简短回答/);
+  assert.match(tc, /第一步/);
+  assert.match(tc, /测试全绿/);
+  assert.match(tc, /当前权限模式/);
+  assert.match(tc, /当前时间：/, "时间到分钟也在这段里（每轮变，不能进系统提示词）");
+});
+
+test("缓存契约：切权限档（含完全权限）也不改系统提示词——模式相关的句子都在每轮补充里", () => {
+  const base = { workspace: "C:/w" };
+  const confirmSp = systemPrompt({ ...base }); // 谨慎档
+  const fullSp = systemPrompt({ ...base, allowAnyPath: true }); // 完全权限档
+  const rootsSp = systemPrompt({ ...base, extraRoots: ["D:/x"] }); // 配了额外目录
+  assert.equal(fullSp, confirmSp, "切到完全权限不该改系统提示词（改了整段缓存就白存）");
+  assert.equal(rootsSp, confirmSp, "额外目录也不该出现在系统提示词里");
+  assert.match(turnContext({ allowAnyPath: true }), /完全权限模式/, "完全权限的提示在每轮补充里");
+  assert.match(turnContext({ extraRoots: ["D:/x", "E:/y"] }), /D:\/x、E:\/y/, "额外目录也在每轮补充里");
+});
+
+test("缓存契约：换模式/改计划不改系统提示词（前缀逐轮一致才命中）", () => {
+  const base = { workspace: "C:/w", agentsMd: "约定" };
+  const a = systemPrompt({ ...base, mode: "confirm", state: { plan: [{ step: "甲", status: "pending" }] } });
+  const b = systemPrompt({ ...base, mode: "full", state: { plan: [{ step: "乙", status: "done" }] }, memory: "新记忆" });
+  assert.equal(a, b, "系统提示词必须与模式/计划/记忆无关");
+  assert.notEqual(turnContext({ mode: "confirm", state: { plan: [{ step: "甲", status: "pending" }] }, now: new Date(0) }),
+                  turnContext({ mode: "full", now: new Date(0) }), "每轮补充要如实反映变化");
 });
 
 test("systemPrompt：被问「你是什么模型」要说清底层通道+模型（且不带钥匙）", () => {

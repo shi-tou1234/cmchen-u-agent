@@ -439,6 +439,8 @@ function startUpstream() {
       // 「保留尾段」用例：带 KEEP-TAIL-E2E 的对话回一句专属回声（每轮各不相同，好断言"这轮的回复还在/没了"）；
       // 摘要请求（内容里有「交接摘要」）不能走这条，否则摘要会变成回声
       const wantEcho = !wantBigRead && lastMsg?.role === "user" && lastText.includes("KEEP-TAIL-E2E") && !/交接摘要/.test(lastText);
+      // 「输入口径」用例：模拟分开报的网关（prompt_tokens 不含命中，命中单独报）
+      const wantOddCache = !wantBigRead && lastMsg?.role === "user" && lastText.includes("CACHE-ODD-E2E");
       const chunks = wantBigRead
         ? [
             { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_big", type: "function", function: { name: "fs_read", arguments: JSON.stringify({ path: "big.txt" }) } }] } }] },
@@ -448,7 +450,7 @@ function startUpstream() {
         : [
             { choices: [{ delta: { content: wantEcho ? "回声：" + ((lastText.match(/KEEP-TAIL-E2E ([^\n]{0,20})/) || [, "?"])[1]) : "好的，我记住了。" } }] },
             { choices: [{ delta: {}, finish_reason: "stop" }] },
-            { usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [] },
+            { usage: wantOddCache ? { prompt_tokens: 400, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 628 } } : { prompt_tokens: 10, completion_tokens: 5 }, choices: [] },
           ];
       for (const c of chunks) res.write("data: " + JSON.stringify(c) + String.fromCharCode(10, 10));
       res.write("data: [DONE]" + String.fromCharCode(10, 10));
@@ -489,6 +491,38 @@ test("验收P：压缩后旧轮次被摘要替代", async () => {
   assert.ok(!(last.messages || last.input || []).some((m) => m.role === "assistant"), "助手回合已被摘要替代（压缩后不再原样出现）");
 });
 
+test("v1.1.1 新增：缓存前缀逐字稳定——第二轮请求里，第一轮那整段与当时发出去的完全一致", async () => {
+  await activateUp();
+  const sid = "s-cache-prefix-" + Math.random().toString(36).slice(2, 7);
+  await chat({ sessionId: sid, message: { text: "第一句：记个事" }, mode: "confirm", provider: "Up" });
+  const req1 = UP.requests.at(-1);
+  await chat({ sessionId: sid, message: { text: "第二句：接着说" }, mode: "confirm", provider: "Up" });
+  const req2 = UP.requests.at(-1);
+  const m1 = req1.messages || [];
+  const m2 = req2.messages || [];
+  assert.ok(m1.length >= 2 && m2.length > m1.length, "第二轮要带着第一轮的历史");
+  // ① 系统提示词两轮逐字一样（它排最前，变一个字整段缓存就废）
+  assert.equal(JSON.stringify(m2[0]), JSON.stringify(m1[0]), "系统提示词必须逐字节一致");
+  assert.equal(m1[0].role, "system");
+  // ② 第一轮那条用户消息（含贴在它身上的「每轮补充」）第二轮里原样还在 → 前缀到这里为止完全相同
+  assert.equal(JSON.stringify(m2[1]), JSON.stringify(m1[1]), "上一轮的用户消息要原样重建（含 system-reminder）");
+  assert.match(JSON.stringify(m1[1]), /system-reminder/, "本轮补充确实贴在那条消息上");
+  // ③ 只有最后一条（这一轮新说的）是新的
+  assert.match(JSON.stringify(m2.at(-1)), /第二句：接着说/);
+});
+
+test("缓存占比不会超 100%：网关把「命中」和「新输入」分开报时，分母要加起来", async () => {
+  await activateUp();
+  const seen = [];
+  const r = await chat({ sessionId: "s-cache-odd-" + Math.random().toString(36).slice(2, 7), message: { text: "CACHE-ODD-E2E 打个招呼" }, mode: "confirm", provider: "Up" });
+  seen.push(...r.events);
+  const u = seen.filter((e) => e.type === "usage").at(-1);
+  assert.ok(u, "要收到 usage 事件");
+  assert.equal(u.cached, 628, "命中数照抄");
+  assert.equal(u.input, 1028, "分母 = 400（新输入）+ 628（命中）——加之前算出来是 157%");
+  assert.ok(u.cached <= u.input, "占比必须 ≤ 100%");
+});
+
 test("验收Q：覆盖写 confirm_request 带 diff 预览", async () => {
   await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir }) });
   const sid = "s-preview-test";
@@ -523,13 +557,18 @@ test("验收R：update_plan 产生计划事件并记录", async () => {
   assert.equal(plan.items[1].status, "pending");
 });
 
-test("验收S：记忆写入后注入模型系统提示", async () => {
+test("验收S：记忆写进每轮补充（不再是系统提示词——缓存前缀要稳定）", async () => {
   await activateUp();
   await jjson("/api/memory", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "用户喜欢用中文且回答要短" }) });
   await chat({ sessionId: "s-mem-test", message: { text: "打个招呼" }, mode: "confirm", provider: "Up" });
   const last = UP.requests.at(-1);
-  const sys = (last.messages || []).find((m) => m.role === "system");
-  assert.ok(JSON.stringify(sys).includes("用户喜欢用中文且回答要短"), "系统提示应含记忆内容");
+  const msgs = last.messages || [];
+  const sys = msgs.find((m) => m.role === "system");
+  const lastUser = msgs.filter((m) => m.role === "user").at(-1);
+  const flatUser = JSON.stringify(lastUser);
+  assert.ok(flatUser.includes("用户喜欢用中文且回答要短"), "记忆要贴在最新一条用户消息的 <system-reminder> 里");
+  assert.match(flatUser, /system-reminder/, "而且是提醒块的形式");
+  assert.ok(!JSON.stringify(sys).includes("用户喜欢用中文且回答要短"), "系统提示词里不该有记忆（否则每改一次记忆，整段缓存就废一次）");
   await jjson("/api/memory", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "" }) });
 });
 

@@ -16,6 +16,7 @@ import { LOG_TYPES, sendJson, sse, sseHead } from "./reply.mjs";
 import { pruneCheckpointsSoon, snapPathsOf } from "./checkpoints.mjs";
 import { GOAL_MAX_JUDGE, autoTitle, judgeGoal, lastGoal, pickAssist } from "./assist.mjs";
 import { agentRunWithOverflowRetry, autoCompactIfNeeded, compactSession, keepTokensOf, keepUserBudgetOf, patchCurrentUser } from "./compact.mjs";
+import { turnReminder } from "../agent/prompt.mjs";
 async function handleChat(req, res, body) {
   const st = loadState();
   const sessionId = body.sessionId || sessions.create("s");
@@ -50,16 +51,14 @@ async function handleChat(req, res, body) {
   let pastEvents = sessions.read(sessionId);
   let history = buildHistory(pastEvents);
   const turnSeq = pastEvents.filter((e) => e.type === "user").length + 1; // 第几轮：写进快照清单，回滚时看得懂
-  // 发给模型的用户消息多带两样「现场信息」（只进请求、不进会话日志，界面回放看不到）：
-  // 当前时间（长会话跨天防日期错觉）与「上一轮被手动停止」的提醒（防它重跑已执行过的命令）
-  const meta = [`【当前时间 ${new Date().toLocaleString("zh-CN", { hour12: false })}】`];
-  if (wasLastTurnAborted(pastEvents)) {
-    meta.push("（注意：上一轮是用户主动点了停止。被中断的命令/工具可能已部分执行——先检查现状，别把已完成的事再做一遍；后台可能还有进程。）");
-  }
-  let outgoingText = meta.join("\n") + "\n\n" + text;
-  let messages = [...history, { role: "user", text: outgoingText, ...(images.length ? { images } : {}) }];
+  // 「现场信息」（当前时间 / 上一轮被手动停止的提醒）挪进每轮补充 turnContext 了：
+  // 原来拼在用户消息开头，逐轮在这个位置对不上，整段 KV 缓存跟着失效（2026-10-15 缓存改造）
+  const resumeNote = wasLastTurnAborted(pastEvents)
+    ? "（注意：上一轮是用户主动点了停止。被中断的命令/工具可能已部分执行——先检查现状，别把已完成的事再做一遍；后台可能还有进程。）"
+    : "";
+  let outgoingText = text;
+  let messages = null; // 等 lastPlan 就位后再拼（那段提醒里要带当前计划）
   const limits = limitsOf(provider); // 这个模型真实能吃多少：按窗口算，不再用写死的字数
-  let budget = budgetOf(messages, limits);
   const context = contextInfoOf(provider);
   // 计划跨轮存活：把日志里最后一条没被回退掉的计划塞回状态（对标「任务跨压缩存活」）
   const dropped = rewindRanges(pastEvents);
@@ -67,8 +66,22 @@ async function handleChat(req, res, body) {
   for (let i = pastEvents.length - 1; i >= 0; i--) {
     if (pastEvents[i].type === "plan" && pastEvents[i].items?.length && !isDropped(dropped, i)) { lastPlan = pastEvents[i].items; break; }
   }
+  // 本轮「会变的那段」：这里算一次（轮内冻结），既贴在本轮用户消息上，也写进会话日志——
+  // 下一轮重建历史时它还在同一个位置，请求前缀才能逐字对上（缓存命中），见 core/context.mjs 的 turn_context
+  const turnReminderText = turnReminder({
+    mode,
+    state: lastPlan ? { plan: lastPlan } : {},
+    goal: lastGoal(sessionId),
+    memory: readMemory(),
+    note: resumeNote,
+    allowAnyPath: mode === "full", // 跟权限模式一起走（模式变了才变，正好和这段的位置一致）
+    extraRoots: st.extraRoots,
+  });
+  messages = [...history, { role: "user", text: outgoingText, reminder: turnReminderText, ...(images.length ? { images } : {}) }];
+  let budget = budgetOf(messages, limits);
   sessions.append(sessionId, { type: "mode", mode });
   sessions.append(sessionId, { type: "user", text, images });
+  if (turnReminderText) sessions.append(sessionId, { type: "turn_context", text: turnReminderText }); // 与上面那条 user 成对（缓存前缀要逐字稳定）
 
   sseHead(res);
   sse(res, { type: "session", sessionId, provider: provider.name, mode, budget, context });
@@ -105,6 +118,8 @@ async function handleChat(req, res, body) {
     skillsText: skillsPromptSection(loadSkills({ workspace: st.workspace, uaHome: UA_HOME })), // 技能清单：只有名字与说明
     checks: st.checks, // test / lint 命令（run_checks 工具与轮末自动检查共用）
     goal: lastGoal(sessionId), // 本次任务的完成标准（/goal 设的）
+    note: resumeNote, // 「上一轮被手动停止」的提醒（已并进 turnReminderText）
+    turnReminderText, // 本轮冻结的那段（与日志里那条 turn_context 逐字一致）
     limits, // 当前模型的可用 token 预算（get_context_remaining 工具用它算余量）
     jobLogDir: path.join(DATA, "jobs"), // 后台任务的输出落这里
 
@@ -247,9 +262,15 @@ async function handleChat(req, res, body) {
       let changedThisPass = false;
       for await (const ev of agentRunWithOverflowRetry({ provider, messages: runMessages, registry, ctx, onOverflow })) {
         if (ev.type === "usage") {
-          usageTotal.input += ev.input || 0;
+          // 输入口径归一（各家不一样，这里一次摆平）：
+          //   含命中报的（OpenAI 的 prompt_tokens、DeepSeek 的 prompt_tokens = 命中+未命中）→ cached ≤ input，照抄；
+          //   分开报的（Anthropic 原生 input_tokens 不含缓存；部分兼容网关也这样，领导见过「命中 157%」）
+          //   → 命中比 input 还大就是这种口径，加起来才是真正的输入总量，占比也就不会超过 100%
+          const inTok = ev.input || 0;
+          const cachedTok = ev.cached || 0;
+          usageTotal.input += cachedTok > inTok ? inTok + cachedTok : inTok;
           usageTotal.output += ev.output || 0;
-          usageTotal.cached += ev.cached || 0; // 缓存命中 tokens（各家字段不同，在 providers 里归一）
+          usageTotal.cached += cachedTok; // 缓存命中 tokens（各家字段不同，在 providers 里归一）
           sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output, cached: usageTotal.cached });
           continue;
         }

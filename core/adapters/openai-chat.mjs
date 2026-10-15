@@ -12,12 +12,16 @@ function bodyOpenaiChat(provider, messages, tools) {
   const msgs = messages.map((m) => {
     if (m.role === "system") return { role: "system", content: m.text };
     if (m.role === "user") {
-      if (!m.images?.length) return { role: "user", content: m.text };
+      // reminder = 主循环贴的「每轮会变的那段」（时间/模式/计划/记忆）：放这条消息最末尾，
+      // 让前面整段历史当缓存前缀（见 core/agent/prompt.mjs 顶部说明）
+      const tail = m.reminder ? [{ type: "text", text: m.reminder }] : [];
+      if (!m.images?.length && !tail.length) return { role: "user", content: m.text };
       return {
         role: "user",
         content: [
           { type: "text", text: m.text },
-          ...m.images.map((i) => ({ type: "image_url", image_url: { url: dataUrl(i) } })),
+          ...(m.images || []).map((i) => ({ type: "image_url", image_url: { url: dataUrl(i) } })),
+          ...tail,
         ],
       };
     }

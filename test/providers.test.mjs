@@ -81,13 +81,17 @@ test("openai-responses：input 映射 + function_call_output + output_item 流�
   await up.close();
 });
 
-test("anthropic：x-api-key 头、tool_result 合并进 user、tool_use 流解析", async () => {
+test("anthropic：x-api-key 头、tool_result 合并进 user、tool_use 流解析、缓存断点", async () => {
   let upstream;
   const up = await mockUpstream((req, res) => {
     const b = upstream.requests[0].body;
     assert.equal(upstream.requests[0].headers["x-api-key"], "ak-test");
-    assert.equal(b.system, "sys");
+    // 2026-10-15 起 system 是块数组（第一块打 cache_control，Anthropic 不打点就是 0 命中）
+    assert.equal(b.system?.[0]?.text, "sys");
+    assert.equal(b.system?.[0]?.cache_control?.type, "ephemeral", "系统提示词要打缓存断点");
+    assert.equal(b.tools.at(-1).cache_control?.type, "ephemeral", "最后一个工具要打缓存断点");
     const lastUser = b.messages.filter((m) => m.role === "user").at(-1);
+    assert.equal(lastUser.content.at(-1).cache_control?.type, "ephemeral", "最后一条消息的稳定尾块要打缓存断点");
     const trs = lastUser.content.filter((c) => c.type === "tool_result");
     assert.equal(trs.length, 2, "两个工具结果应合并进同一条 user 消息");
     assert.equal(trs[0].tool_use_id, "t1");
@@ -121,6 +125,125 @@ test("anthropic：x-api-key 头、tool_result 合并进 user、tool_use 流解�
   assert.equal(end.toolCalls[0].id, "tu1");
   assert.deepEqual(end.toolCalls[0].args, { path: "y.txt" });
   await up.close();
+});
+
+test("缓存三件：Anthropic 用量口径含缓存读写 / responses 带 prompt_cache_key / 网关不认就摘掉重试", async () => {
+  // ① Anthropic：input_tokens 不含缓存读写，要加起来（否则「缓存占比 = cached/input」会虚高）
+  {
+    let upstream;
+    const up = await mockUpstream((req, res) => {
+      sse(res, [
+        { type: "message_start", message: { usage: { input_tokens: 100, cache_read_input_tokens: 900, cache_creation_input_tokens: 50 } } },
+        { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 7 } },
+        { type: "message_stop" },
+      ]);
+    });
+    upstream = up;
+    try {
+      const evs = await collect(streamChat({ protocol: "anthropic", baseURL: up.url, model: "claude-sonnet-5-5", secret: "k" }, [{ role: "user", text: "hi" }], []));
+      const u = evs.filter((e) => e.type === "usage").reduce((acc, e) => ({ input: acc.input + e.input, cached: acc.cached + (e.cached || 0) }), { input: 0, cached: 0 });
+      assert.equal(u.cached, 900, "命中读要单独报（占比的分子）");
+      assert.equal(u.input, 1050, "分母 = input_tokens + 缓存读 + 缓存写（与 OpenAI 的 prompt_tokens 一个口径）");
+    } finally { await up.close(); }
+  }
+  // ② responses：带稳定 prompt_cache_key；网关 400 时摘掉重试
+  {
+    let upstream;
+    const up = await mockUpstream((req, res) => {
+      const b = up.requests.at(-1).body;
+      if (b.prompt_cache_key && up.requests.length === 1) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "unknown field prompt_cache_key" } }));
+        return;
+      }
+      sse(res, [{ type: "response.output_text.delta", delta: "ok" }, { type: "response.completed", response: { status: "completed" } }]);
+    });
+    upstream = up;
+    try {
+      const provider = { protocol: "openai-responses", baseURL: up.url, model: "gpt-5.5", secret: "k", sessionId: "s-abc" };
+      await collect(streamChat(provider, [{ role: "user", text: "hi" }], []));
+      assert.equal(up.requests[0].body.prompt_cache_key, "s-abc", "首次请求要带会话级缓存 key（Codex 同款）");
+      assert.equal(up.requests.length, 2, "400 要重试一次");
+      assert.equal(up.requests[1].body.prompt_cache_key, undefined, "重试那次摘掉这个字段");
+    } finally { await up.close(); }
+  }
+});
+
+test("Anthropic 缓存 TTL：工具+系统用 1h 长缓存，消息尾块仍默认 5m", async () => {
+  const up = await mockUpstream((req, res) => {
+    sse(res, [{ type: "message_start", message: { usage: { input_tokens: 1 } } }, { type: "message_stop" }]);
+  });
+  try {
+    const provider = { protocol: "anthropic", baseURL: up.url, model: "claude-sonnet-5-5", secret: "k" };
+    await collect(streamChat(provider, [{ role: "system", text: "sys" }, { role: "user", text: "hi" }], [{ name: "fs_read", description: "r", params: { type: "object" } }]));
+    const b = up.requests[0].body;
+    assert.equal(b.system[0].cache_control.ttl, "1h", "系统块给 1h（停一会儿再聊也不过期）");
+    assert.equal(b.tools.at(-1).cache_control.ttl, "1h", "工具块同样 1h");
+    assert.equal(b.messages.at(-1).content.at(-1).cache_control.type, "ephemeral");
+    assert.equal(b.messages.at(-1).content.at(-1).cache_control.ttl, undefined, "消息尾块每次往前挪，用默认 5m 就行");
+  } finally { await up.close(); }
+});
+
+test("Anthropic：网关不认 ttl 就摘掉重试一次，并记住这个 host（第二次不再带）", async () => {
+  const up = await mockUpstream((req, res) => {
+    const b = up.requests.at(-1).body;
+    if (b.system?.[0]?.cache_control?.ttl) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "unexpected field ttl" } }));
+      return;
+    }
+    sse(res, [{ type: "message_start", message: { usage: { input_tokens: 1 } } }, { type: "message_stop" }]);
+  });
+  try {
+    const provider = { protocol: "anthropic", baseURL: up.url, model: "claude-sonnet-5-5", secret: "k" };
+    await collect(streamChat(provider, [{ role: "system", text: "sys" }, { role: "user", text: "hi" }], []));
+    assert.equal(up.requests.length, 2, "带 ttl 被拒 → 摘掉重试一次");
+    assert.ok(up.requests[0].body.system[0].cache_control.ttl, "第一次带着 ttl");
+    assert.equal(up.requests[1].body.system[0].cache_control.ttl, undefined, "重试那次摘掉了");
+    await collect(streamChat(provider, [{ role: "system", text: "sys" }, { role: "user", text: "再来" }], []));
+    assert.equal(up.requests.at(-1).body.system[0].cache_control.ttl, undefined, "这个 host 记住了，第三次不再带");
+  } finally { await up.close(); }
+});
+
+test("reminder（每轮会变的那段）贴三条协议的尾巴，且不进缓存段", async () => {
+  // 三家都验一遍：chat 用第二个 text 块、responses 用第二个 input_text、anthropic 用最后的 text 块，
+  // 且 anthropic 的缓存断点打在 reminder 之前那块（reminder 逐轮都变，不能进缓存）
+  const cases = [
+    ["openai-chat", (b) => {
+      const um = b.messages.filter((m) => m.role === "user").at(-1);
+      assert.equal(um.content.at(-1).text, "<system-reminder>变的东西</system-reminder>");
+    }],
+    ["openai-responses", (b) => {
+      const um = b.input.filter((m) => m.role === "user").at(-1);
+      assert.equal(um.content.at(-1).text, "<system-reminder>变的东西</system-reminder>");
+    }],
+    ["anthropic", (b) => {
+      const um = b.messages.filter((m) => m.role === "user").at(-1);
+      assert.equal(um.content.at(-1).text, "<system-reminder>变的东西</system-reminder>");
+      assert.equal(um.content.at(-1).cache_control, undefined, "reminder 不该进缓存段");
+      assert.equal(um.content.at(-2).cache_control?.type, "ephemeral", "断点打在前一块（稳定尾块）");
+    }],
+  ];
+  for (const [protocol, check] of cases) {
+    let upstream;
+    const up = await mockUpstream((req, res) => {
+      check(upstream.requests[0].body);
+      if (protocol === "anthropic") sse(res, [{ type: "message_start", message: { usage: { input_tokens: 1 } } }, { type: "message_stop" }]);
+      else if (protocol === "openai-responses") sse(res, [{ type: "response.output_text.delta", delta: "ok" }, { type: "response.completed", response: { status: "completed" } }]);
+      else sse(res, [{ choices: [{ delta: { content: "ok" } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }]);
+    });
+    upstream = up;
+    try {
+      const provider = { protocol, baseURL: up.url, model: protocol === "anthropic" ? "claude-sonnet-5-5" : "glm-5.3", secret: "k" };
+      const messages = [
+        { role: "system", text: "sys" },
+        { role: "user", text: "干活", reminder: "<system-reminder>变的东西</system-reminder>" },
+      ];
+      await collect(streamChat(provider, messages, []));
+    } finally {
+      await up.close();
+    }
+  }
 });
 
 test("上游 HTTP 错误要抛出并带状态码", async () => {

@@ -920,7 +920,8 @@ function liveStatsCompute(stats) {
   const parts = ["生成中", `${approx}${Math.round(est)} tok`, `${approx}${tps.toFixed(tps >= 100 ? 0 : 1)} tok/s`, genSec < 10 ? genSec.toFixed(1) + "s" : Math.round(genSec) + "s"];
   const roundIn = Math.max(0, (S.tokens.input || 0) - stats.startUsage.input);
   const roundCached = Math.max(0, (S.tokens.cached || 0) - stats.startUsage.cached);
-  if (roundIn > 0 && roundCached > 0) parts.push(`缓存 ${Math.round((roundCached / roundIn) * 100)}%`);
+  // 占比封顶 100%（口径已在服务端归一；这里再兜一道，免得个别网关的数字让人看到 157% 这种迷惑值）
+  if (roundIn > 0 && roundCached > 0) parts.push(`缓存 ${Math.min(100, Math.round((roundCached / roundIn) * 100))}%`);
   return parts.join(" · ");
 }
 function ensureLiveStats(stats) {
@@ -955,7 +956,7 @@ function addRoundStats(stats) {
     `生成 ${genSec < 10 ? genSec.toFixed(1) : Math.round(genSec)}s`,
   ];
   parts.push(tps >= 1 ? `${tps.toFixed(tps >= 100 ? 0 : 1)} tok/s` : `约 ${Math.max(1, Math.round(cps))} 字/s`);
-  if (roundIn > 0 && S.tokens.cached) parts.push(`缓存命中 ${Math.round((roundCached / roundIn) * 100)}%`);
+  if (roundIn > 0 && S.tokens.cached) parts.push(`缓存命中 ${Math.min(100, Math.round((roundCached / roundIn) * 100))}%`);
   const strip = liveStatsEl?.isConnected ? liveStatsEl : el(`<div class="gen-stats"></div>`);
   strip.classList.remove("live");
   strip.textContent = parts.join(" · ");
@@ -1517,7 +1518,7 @@ export function renderUsage() {
   compact.disabled = !tokens;
 
   const total = S.tokens.input + S.tokens.output;
-  const cachePct = S.tokens.cached && S.tokens.input ? Math.round((S.tokens.cached / S.tokens.input) * 100) : 0;
+  const cachePct = S.tokens.cached && S.tokens.input ? Math.min(100, Math.round((S.tokens.cached / S.tokens.input) * 100)) : 0;
   $("#usage").textContent = total ? `本轮 ${total} tokens` + (cachePct ? ` · 缓存 ${cachePct}%` : "") : "";
   // 模式芯片以 S.mode 为准：状态条一刷新就顺带对齐（服务端中途改档、Shift+Tab、/mode 都覆盖到）
   if (lastRenderedMode !== S.mode) {

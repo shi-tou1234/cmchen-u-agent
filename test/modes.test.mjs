@@ -90,8 +90,8 @@ test("confirm 模式：fs_write 新文件（medium）自动执行；覆盖已有
 });
 
 test("计划模式系统提示词包含出计划指令", async () => {
-  const { systemPrompt } = await import("../core/agent-loop.mjs");
-  assert.match(systemPrompt({ workspace: "w", mode: "plan" }), /计划/);
+  const { turnContext } = await import("../core/agent-loop.mjs");
+  assert.match(turnContext({ mode: "plan" }), /计划模式/, "计划模式的说明在每轮补充里（不进缓存前缀）");
 });
 
 /* ===== v7：细粒度自动放行 ===== */
