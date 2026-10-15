@@ -36,9 +36,12 @@ export const isDropped = (ranges, i) => ranges.some((r) => i > r.atIndex && i < 
 // 会话事件 → 统一消息数组。
 // 轮次归属：assistant_message 与紧随的 tool_call/tool_result 属同一轮，合并成
 // assistant{text, toolCalls} + tool 消息各一条，避免把一个回合拆成多条 assistant。
-// 若有 compact 事件：atIndex 之前的事件用摘要替代。
+// 若有 compact 事件：atIndex 之前的事件用摘要替代，atIndex 起的事件（压缩时特意保留的
+// 「最近一段原文」）照常重建——所以压缩后模型既看得到摘要，也看得到最近的完整对话。
 // 若有 rewind 事件：被回退掉的那段直接跳过，并在原位留一句系统提示。
-export function buildHistory(events) {
+// at（可选）：传入一个数组时，逐条记录每条消息来自哪个事件下标（-1 = 摘要/留存用户这类合成消息），
+// 压缩时要拿它把「事件下标」换算成「消息下标」。
+export function buildHistory(events, at = null) {
   let compact = null;
   for (let i = events.length - 1; i >= 0; i--) {
     if (events[i].type === "compact") {
@@ -48,54 +51,101 @@ export function buildHistory(events) {
   }
   const ranges = rewindRanges(events);
   const msgs = [];
+  const put = (msg, from) => {
+    msgs.push(msg);
+    if (at) at.push(from);
+  };
   let cur = null; // 当前 assistant 回合 {text, toolCalls[]}
-  const flushCur = () => {
+  const flushCur = (fallback) => {
     if (cur && (cur.text || cur.toolCalls.length)) {
-      msgs.push({ role: "assistant", text: cur.text || "", ...(cur.toolCalls.length ? { toolCalls: cur.toolCalls } : {}) });
+      put({ role: "assistant", text: cur.text || "", ...(cur.toolCalls.length ? { toolCalls: cur.toolCalls } : {}) }, cur.__at ?? fallback);
     }
     cur = null;
   };
   for (let i = 0; i < events.length; i++) {
-    if (compact && i < compact.atIndex) continue;
+    if (compact && i < (compact.atIndex || 0)) continue;
     if (isDropped(ranges, i)) continue;
     const ev = events[i];
     switch (ev.type) {
       case "rewind":
         // 回退点到标记之间没有留下任何上下文——给模型一句说明，免得它以为对话是断的
-        flushCur();
-        msgs.push({ role: "system", text: "【用户在此处回退过对话：这之后的内容已被丢弃，不属当前上下文】" });
+        flushCur(i);
+        put({ role: "system", text: "【用户在此处回退过对话：这之后的内容已被丢弃，不属当前上下文】" }, i);
         break;
       case "user":
-        flushCur();
-        msgs.push({ role: "user", text: ev.text || "", images: ev.images || [] });
+        flushCur(i);
+        put({ role: "user", text: ev.text || "", images: ev.images || [] }, i);
         break;
       case "assistant_message":
         // 独立回复：上一个回合已带着文本但无工具（罕见）时先固化；然后开始本回合
-        if (cur && cur.text && !cur.toolCalls.length) flushCur();
-        if (cur && cur.toolCalls.length) flushCur(); // 工具回合已收尾又来文本 = 新一轮
+        if (cur && cur.text && !cur.toolCalls.length) flushCur(i);
+        if (cur && cur.toolCalls.length) flushCur(i); // 工具回合已收尾又来文本 = 新一轮
         // thinking：只有 anthropic 开了思考才需要，下一轮要原样带回去（含签名），否则 API 会拒
-        cur = { text: ev.text || "", toolCalls: [], ...(ev.thinking?.text ? { thinking: ev.thinking } : {}) };
+        cur = { text: ev.text || "", toolCalls: [], ...(ev.thinking?.text ? { thinking: ev.thinking } : {}), __at: i };
         break;
       case "tool_call":
-        if (!cur) cur = { text: "", toolCalls: [] };
+        if (!cur) cur = { text: "", toolCalls: [], __at: i };
         cur.toolCalls.push({ id: ev.id, name: ev.name, args: ev.args || {} });
         break;
       case "tool_result":
-        flushCur();
-        msgs.push({ role: "tool", toolCallId: ev.id, toolName: ev.name, text: ev.text || "" });
+        flushCur(cur?.__at ?? i);
+        put({ role: "tool", toolCallId: ev.id, toolName: ev.name, text: ev.text || "" }, i);
         break;
       default:
         break;
     }
   }
-  flushCur();
+  flushCur(events.length);
   if (compact) {
+    // 合成消息放在最前面：摘要 + 压缩时特意留住的「更早那段的最近用户原话」
     msgs.unshift({ role: "system", text: `【更早对话的摘要，供延续上下文】\n${compact.summary}` });
-    // 压缩时特意留住的「最近用户消息原文」紧跟摘要放回：用户的约束/原话比模型摘要可靠
+    if (at) at.unshift(-1);
     const kept = (compact.keepUsers || []).filter((m) => m && m.text);
-    if (kept.length) msgs.splice(1, 0, ...kept.map((m) => ({ role: "user", text: m.text })));
+    if (kept.length) {
+      msgs.splice(1, 0, ...kept.map((m) => ({ role: "user", text: m.text })));
+      if (at) at.splice(1, 0, ...kept.map(() => -1));
+    }
   }
   return msgs;
+}
+
+// 压缩时「保留最近原文」的起点（事件下标）：
+// 从最后一条用户消息往前**整轮**累计 token，直到 keepTokens 用完——只落在 user 事件上，
+// 所以 assistant+tool 的配对不会在边界上被切坏（对标 OpenCode：保留最近约 15k token 原文）。
+// floorIndex = 上一次压缩的 atIndex：比它更早的内容已经被上一份摘要覆盖，别再捞回来。
+// 至少保留最后一轮（哪怕它自己就超预算）；keepTokens <= 0 = 不保留（全交给摘要）。
+export function tailStartIndex(events, keepTokens, floorIndex = 0) {
+  if (!(keepTokens > 0)) return events.length;
+  const ranges = rewindRanges(events);
+  const starts = [];
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (i < floorIndex) break;
+    if (isDropped(ranges, i)) continue;
+    if (events[i].type === "user") starts.push(i);
+  }
+  const turnCost = (from, to) => {
+    let sum = 0;
+    for (let i = from; i < to; i++) {
+      if (isDropped(ranges, i)) continue;
+      const ev = events[i];
+      if (ev.type === "user") sum += estTokens(ev.text) + (ev.images?.length || 0) * 900;
+      else if (ev.type === "assistant_message") sum += estTokens(ev.text);
+      else if (ev.type === "tool_call") sum += estTokens(JSON.stringify(ev.args || {})) + 40;
+      else if (ev.type === "tool_result") sum += estTokens(ev.text);
+    }
+    return sum;
+  };
+  let used = 0;
+  let start = events.length;
+  for (let k = 0; k < starts.length; k++) {
+    const from = starts[k];
+    const to = k === 0 ? events.length : starts[k - 1];
+    const cost = turnCost(from, to);
+    if (k > 0 && used + cost > keepTokens) break; // 最后一轮永远留着
+    used += cost;
+    start = from;
+  }
+  return start;
 }
 
 // 把一段文本截到不超过 budget 个 token（先按 1 字≈1 token 保守估，再逐步放宽验证）
@@ -176,21 +226,58 @@ export function budgetOf(messages, opts = {}) {
   };
 }
 
-// 生成给模型看的压缩请求（保留最近 keepTail 条消息不动；instruction = 用户点名要保住什么）
-export function compactPrompt(messages, keepTail = 6, instruction = "") {
-  const older = messages.slice(0, Math.max(0, messages.length - keepTail));
-  const dump = older
+// 生成给模型看的压缩请求。结构照 OpenCode 的交接摘要模板（Objective/Requirements/Decisions/
+// Work State/Next Move/Relevant Files/Important Context 七段），改成中文；
+// prevSummary 有值时走「滚动更新」：在上一份摘要基础上合并新进展，而不是重开一份（老信息不丢）。
+// instruction = 用户在 /compact 后面点名要保住什么。
+export const SUMMARY_HEADINGS = ["## 目标", "## 要求与边界", "## 已定的决定", "## 进度", "## 下一步", "## 相关文件", "## 不能丢的上下文"];
+
+export function compactPrompt(messages, { instruction = "", prevSummary = "" } = {}) {
+  const dump = messages
     .map((m) => {
       const who = m.role === "user" ? "用户" : m.role === "assistant" ? "助手" : "工具";
       const calls = m.toolCalls?.length ? `（调用了 ${m.toolCalls.map((t) => t.name).join("、")}）` : "";
-      return `${who}${calls}：${(m.text || "").slice(0, 1200)}`;
+      return `${who}${calls}：${(m.text || "").slice(0, 1250)}`;
     })
     .join("\n");
-  const head = [
-    "请把下面这段对话历史压缩成一份简明摘要，供后续对话延续使用。",
-    "要求：保留用户的目标与偏好、已完成的操作及结果、重要文件路径、未完成的待办；删除寒暄与冗余细节；中文，≤500 字，用要点列表。只输出摘要正文。",
-  ];
+  const template = [
+    "用固定小标题输出（不适用的段写「（无）」，不要输出 <template> 标签）：",
+    "<template>",
+    "## 目标",
+    "- [一两句话：用户想做成什么]",
+    "## 要求与边界",
+    "- [用户说过的约束、偏好、范围；没有写（无）]",
+    "## 已定的决定",
+    "- [已经定了的做法和为什么]",
+    "## 进度",
+    "- 已完成：[…]",
+    "- 正在做：[…]",
+    "- 卡住的：[…]",
+    "## 下一步",
+    "1. [按顺序的后续动作]",
+    "## 相关文件",
+    "- [最多 15 条，只列接着干必须打开的文件/目录：`路径`：为什么重要]",
+    "## 不能丢的上下文",
+    "- [下一轮接手必须知道、自己又查不到的事实；路径/命令/报错原文照抄]",
+    "</template>",
+  ].join("\n");
+  const rules = [
+    "规则：",
+    "- 一律要点式单行，不写小作文、不嵌套列表。",
+    "- 精确保留：文件路径、函数/变量名、命令、报错原文、URL、标识符。",
+    "- 用户问过但还没答、或还没做完的事，原样带上（措辞别改）；已经答过/做完的别再抄。",
+    "- 涉及改动的，写明当前状态（改了没提交 / 已提交 / 已推送）。",
+    "- 只写用户和助手说过、做过的事；不要抄系统提示、AGENTS.md、技能清单这类每轮都会重新注入的东西。",
+    "- 不要提「压缩 / 摘要 / 上下文满了」这类事，也不要调用任何工具。",
+  ].join("\n");
+  const head = prevSummary
+    ? [
+        "上面是这轮对话；下面是这份对话**之前**已经整理过的一份交接摘要。请把它更新成一份合并后的新摘要（只要一份，别叠加）。",
+        "新出现的进展优先于旧摘要：旧信息除非已被推翻/已完成/已作废，否则保留；已经做完的事从「正在做」挪到「已完成」，已解决的卡点删掉。",
+        prevSummary,
+      ]
+    : ["请把上面这段对话整理成一份「交接摘要」，供下一轮接着干活用。只写对继续干活有用的东西。"];
   // /compact 后面可以带一句话：用户想保住哪部分，压缩时优先保住
-  if (instruction) head.push(`用户额外叮嘱：${String(instruction).slice(0, 500)}`);
-  return [...head, "", "== 对话历史开始 ==", dump.slice(0, 60000), "== 对话历史结束 ==", ""].join("\n");
+  if (instruction) head.push(`用户额外叮嘱（优先保住）：${String(instruction).slice(0, 500)}`);
+  return [...head, "", "== 对话历史开始 ==", dump.slice(0, 60000), "== 对话历史结束 ==", "", template, "", rules].join("\n");
 }

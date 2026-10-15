@@ -78,6 +78,64 @@ const TABLE = [
 
 // 兜底：认不出来时按 200k 算（2026 年的主流下限），输出按 32k
 export const FALLBACK = { ctx: 200000, out: 32000, reasoning: true };
+
+// 各家族**自己的**思考档位（发给网关的 reasoning_effort 取值），同样来自 models.dev：
+// 取该家族在当前模型目录里的 reasoning_options（官方条目 + OpenCode 系网关条目）。
+// 语义：数组 = 支持的档位（"off" = 能整个关掉）；null = 认不出 → 界面按通用五档（关/浅/中/深）兜底。
+// 个别网关只认其中一部分（400 会被自动去掉重试一次），所以这里取"该家族常见的全集"。
+export const DEPTHS = {
+  "claude-fable": ["off", "low", "medium", "high", "xhigh", "max"],
+  "claude-opus-5": ["off", "low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4": ["off", "low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-5": ["off", "low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-4": ["off", "low", "medium", "high", "xhigh", "max"],
+  "claude-haiku-5": ["off", "low", "medium", "high", "xhigh", "max"],
+  "claude-haiku-4": ["off", "low", "medium", "high", "xhigh", "max"],
+  "gpt-6": ["none", "low", "medium", "high", "xhigh", "max"],
+  "gpt-5.6": ["none", "low", "medium", "high", "xhigh", "max"],
+  "gpt-5.5": ["none", "low", "medium", "high", "xhigh", "max"],
+  "gpt-5.4": ["minimal", "low", "medium", "high", "xhigh"],
+  "gpt-5.3": ["minimal", "low", "medium", "high", "xhigh"],
+  "gpt-5.2": ["minimal", "low", "medium", "high", "xhigh"],
+  "gpt-5.1": ["minimal", "low", "medium", "high", "xhigh"],
+  "gpt-5": ["minimal", "low", "medium", "high", "xhigh"],
+  o4: ["low", "medium", "high"],
+  o3: ["low", "medium", "high"],
+  "gpt-oss": ["low", "medium", "high"],
+  "gemini-3": ["off", "minimal", "low", "medium", "high"],
+  "gemini-2.5": ["off", "low", "medium", "high"],
+  "glm-5": ["none", "low", "high", "max"],
+  "glm-4.7": ["off"], // 只能开关（models.dev: toggle）
+  "glm-4.6": ["off"],
+  "deepseek-v4": ["none", "low", "high", "max"],
+  "deepseek-v3": ["off"],
+  "kimi-k3": ["low", "high", "max"],
+  "kimi-k2": ["off"],
+  "qwen3.8": ["low", "medium", "xhigh"],
+  "qwen3.7": ["low", "medium", "xhigh"],
+  "qwen3.5": ["low", "medium", "xhigh"],
+  qwen3: ["off"],
+  "minimax-m3": ["off"],
+  "minimax-m2": ["off"],
+  "grok-4.7": ["none", "low", "medium", "high", "xhigh"],
+  "grok-4": ["none", "low", "medium", "high", "xhigh"],
+  "grok-build": ["low", "medium", "high"],
+};
+
+const DEPTH_SORTED = Object.entries(DEPTHS).sort((a, b) => b[0].length - a[0].length);
+
+/** 模型名 → 它自己的思考档位数组（认不出返回 null，界面按通用五档兜底） */
+export function reasoningDepths(modelId) {
+  const raw = String(modelId || "").trim();
+  const short = (raw.split("/").pop() || raw).toLowerCase();
+  const variants = [short, short.replace(/\./g, "-"), short.replace(/-/g, ".")];
+  for (const v of variants) {
+    const hit = DEPTH_SORTED.find(([p]) => v.startsWith(p));
+    if (hit) return hit[1];
+  }
+  return null;
+}
+
 // 本机小模型（Ollama / LM Studio）窗口通常很小，按 200k 算会一塞就爆
 export const FALLBACK_LOCAL = { ctx: 32768, out: 8192, reasoning: true };
 // 本机部署的云端同名模型也要打个折：显存与服务默认配置普遍小于云端

@@ -2,7 +2,16 @@
 // 为什么单独测它：答案正文全靠这个函数变成 HTML，历史上这里出过「字面 <br> 冒出来」的事故
 import test from "node:test";
 import assert from "node:assert/strict";
-import { md } from "../public/js/ui.js";
+import { md, tok } from "../public/js/ui.js";
+
+test("tok：token 数按人话写（1,000,000 → 1M，不是 1000k）", () => {
+  assert.equal(tok(1000000), "1M", "1M 窗口要写成 1M");
+  assert.equal(tok(750000), "750k", "预算还是 k 档");
+  assert.equal(tok(1048576), "1.05M");
+  assert.equal(tok(12345), "12k");
+  assert.equal(tok(999), "999");
+  assert.equal(tok(0), "0");
+});
 
 test("v9.14 md：段内单换行是真换行（<br>），不是字面 &lt;br&gt;", () => {
   const h = md("第一行\n第二行\n\n第二段");

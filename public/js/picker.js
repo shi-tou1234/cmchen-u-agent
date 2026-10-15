@@ -9,9 +9,19 @@ import { t, getLang } from "./i18n.js";
 let modelIdx = 0;
 let modeIdx = 0;
 
+// 思考档位的中文名（与设置卡里的一致；档位值本身跟着模型给）
+const DEPTH_LABEL = {
+  off: "关", none: "关", minimal: "极简", low: "浅", mid: "中", medium: "中",
+  high: "深", xhigh: "很深", max: "最深", ultra: "极限",
+};
+const GENERIC_DEPTHS = ["off", "low", "medium", "high"];
+const depthCache = new Map(); // 通道名 → { levels, reasoning }（模型没变就不重复问服务端）
+
+const depthLabel = (v) => DEPTH_LABEL[v] || v;
+
 /* ---------- 通用弹层 ---------- */
 function closeAll(except) {
-  for (const [btn, pop] of [["#modelBtn", "#modelPop"], ["#modeBtn", "#modePop"], ["#sbWs", "#wsPop"]]) {
+  for (const [btn, pop] of [["#modelBtn", "#modelPop"], ["#modeBtn", "#modePop"], ["#sbWs", "#wsPop"], ["#depthBtn", "#depthPop"]]) {
     if (pop === except) continue;
     const node = $(pop);
     if (!node) continue;
@@ -58,6 +68,7 @@ export const providerReady = (p) => {
 };
 
 export function renderModelBtn() {
+  renderDepthBtn(); // 模型/通道换了，档位列表跟着换（老坑：模型胶囊重画时忘了它）
   const p = S.providers.find((x) => x.name === S.active) || S.providers[0];
   $("#modelChipWrap").innerHTML = p ? brandChip(p) : `<span class="brand-chip" style="background:var(--hover);color:var(--faint)">?</span>`;
   $("#modelText").textContent = p ? `${p.name}${p.model ? " · " + p.model : ""}` : t("composer.noProvider");
@@ -242,14 +253,89 @@ function filterList(popSel, q) {
   }
 }
 
+
+/* ---------- 思考深度（输入框那一行的胶囊） ---------- */
+function activeProvider() {
+  return S.providers.find((x) => x.name === S.active) || S.providers[0] || null;
+}
+
+async function depthInfoOf(p) {
+  if (!p) return { levels: GENERIC_DEPTHS, reasoning: false };
+  const key = p.name + "::" + (p.model || "") + "::" + (p.contextWindow || "");
+  if (!depthCache.has(key)) {
+    let info = null;
+    try { info = await api.modelInfo(p); } catch { info = null; }
+    depthCache.set(key, { levels: info?.depths?.length ? info.depths : GENERIC_DEPTHS, reasoning: info?.reasoning !== false });
+  }
+  return depthCache.get(key);
+}
+
+let depthSeq = 0;
+export async function renderDepthBtn() {
+  const btn = $("#depthBtn");
+  if (!btn) return;
+  const seq = ++depthSeq; // 并发守卫：模型连点/换通道时，只认最后一次的结果
+  const p = activeProvider();
+  const info = await depthInfoOf(p);
+  if (seq !== depthSeq) return;
+  if (!info.reasoning) { btn.hidden = true; return; } // 模型不吃思考：不占地方
+  btn.hidden = false;
+  const cur = p?.thinkDepth || "";
+  $("#depthText").textContent = "思考 · " + (cur ? depthLabel(cur) : "默认");
+  btn.title = p
+    ? `思考深度（${p.name}）：${cur ? depthLabel(cur) + "（" + cur + "）" : "默认，跟着模型走"}。档位跟着模型给，点了就地切`
+    : "思考深度";
+  renderDepthList(p, info.levels, cur);
+}
+
+function renderDepthList(p, levels, cur) {
+  const box = $("#depthList");
+  if (!box) return;
+  const rows = [{ v: "", n: "默认", d: "什么都不设，照着模型自己的习惯走" }].concat(
+    levels.map((v) => ({ v, n: depthLabel(v), d: v === "off" || v === "none" ? "不想，最快最省" : "想得越深越慢也越贵" }))
+  );
+  box.innerHTML = rows
+    .map(
+      (r) => `<button class="pop-item ${r.v === cur ? "cur" : ""}" data-v="${esc(r.v)}" role="option">
+        <span class="pop-main"><b>${esc(r.n)}</b><span class="pop-sub">${esc(r.d)}</span></span>
+        ${r.v === cur ? icon("check", "ic ic-sm") : ""}
+      </button>`
+    )
+    .join("");
+  $$(".pop-item", box).forEach((b) => (b.onclick = () => pickDepth(b.dataset.v)));
+  const note = $("#depthNote");
+  if (note) note.textContent = `档位跟着模型给 · 数据来自 models.dev`;
+}
+
+async function pickDepth(level) {
+  const p = activeProvider();
+  if (!p) return;
+  if (level) p.thinkDepth = level;
+  else delete p.thinkDepth;
+  closeAll();
+  renderDepthBtn();
+  try {
+    // 与设置面板同一条路：把 providers 整份交上去（钥匙是掩码，服务端不会覆盖真钥匙）
+    await api.saveSettings({ providers: S.providers.map((x) => ({ ...x })), active: S.active });
+    toast(level ? "思考深度：" + depthLabel(level) : "思考深度：默认（跟着模型）", "ok");
+  } catch (e) {
+    toast(e.message || "没存上", "err");
+  }
+}
+
+export function openDepthPop() { openPop("#depthBtn", "#depthPop"); }
+
 /* ---------- 绑定 ---------- */
 // 给 /model、/mode 命令用：输入框里打命令也能直接调出这两个弹层（原来会走 palPick 的 default 分支清空输入框、什么都不发生）
 export function openModelPop() { openPop("#modelBtn", "#modelPop"); }
 export function openModePop() { openPop("#modeBtn", "#modePop"); }
 
 export function initPicker() {
+  window.addEventListener("ua:settings-saved", () => { depthCache.clear(); renderDepthBtn(); }); // 设置里改了深度/换了模型，胶囊跟着变
   $("#modelBtn").onclick = (e) => { e.stopPropagation(); openPop("#modelBtn", "#modelPop"); };
   $("#modeBtn").onclick = (e) => { e.stopPropagation(); openPop("#modeBtn", "#modePop"); };
+  const dBtn = $("#depthBtn");
+  if (dBtn) dBtn.onclick = (e) => { e.stopPropagation(); openPop("#depthBtn", "#depthPop"); };
   // 输入框上方的工作区胶囊：点开就能换
   $("#sbWs").onclick = (e) => { e.stopPropagation(); openWsPop(); };
   $("#wsOpen") && ($("#wsOpen").querySelector("span") || {});
@@ -263,9 +349,10 @@ export function initPicker() {
   const sb = $("#sbMode");
   if (sb) sb.onclick = (e) => { e.stopPropagation(); openPop("#modeBtn", "#modePop"); };
   document.addEventListener("click", (e) => {
-    if (!e.target.closest(".pop") && !e.target.closest("#modelBtn") && !e.target.closest("#modeBtn") && !e.target.closest("#sbMode") && !e.target.closest("#sbWs")) closeAll();
+    if (!e.target.closest(".pop") && !e.target.closest("#modelBtn") && !e.target.closest("#modeBtn") && !e.target.closest("#sbMode") && !e.target.closest("#sbWs") && !e.target.closest("#depthBtn")) closeAll();
   });
-  for (const [btn, pop] of [["#modelBtn", "#modelPop"], ["#modeBtn", "#modePop"]]) {
+  for (const [btn, pop] of [["#modelBtn", "#modelPop"], ["#modeBtn", "#modePop"], ["#depthBtn", "#depthPop"]]) {
+    if (!$(pop)) continue;
     $(pop).addEventListener("click", (e) => e.stopPropagation());
     const q = $(pop).querySelector("input");
     if (q) q.addEventListener("input", () => filterList(pop, q.value));

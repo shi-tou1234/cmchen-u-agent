@@ -2,12 +2,20 @@
 // 模型部分学 OpenCode：预设里存「厂商 → 协议 + 地址 + 候选模型」，用户只做两件事——填钥匙、挑模型
 import { api } from "./api.js";
 import { S, setMode, MODES, ACTION_META, DEFAULT_AUTO_APPROVE } from "./state.js";
-import { $, $$, el, esc, icon, toast } from "./ui.js";
+import { $, $$, el, esc, icon, toast, tok as fmtTok } from "./ui.js";
 import { fillProviders, showThinking, setShowThinking, refreshCustomCommands, doCheck } from "./chat.js";
 import { brandChip, chipOf, providerReady } from "./picker.js";
 import { notifyOn, setNotifyOn, askPermission, notifyGranted } from "./notify.js";
 import { CATALOG, GROUPS, providerFromPreset, presetById, matchPreset, protocolForModel, normalizeBaseURL } from "./catalog.js";
 import { t, getLang, setLang } from "./i18n.js";
+
+// 思考深度档位的中文名（卡片能力行回显用；档位值本身跟着模型走，见服务端的能力表）
+const DEPTH_LABEL = {
+  off: "关", none: "关", minimal: "极简", low: "浅", mid: "中", medium: "中",
+  high: "深", xhigh: "很深", max: "最深", ultra: "极限",
+};
+// 认不出模型时给的通用档位（关/浅/中/深）
+const GENERIC_DEPTHS = ["off", "low", "medium", "high"];
 
 const PANELS = [
   { id: "general", label: "通用", icon: "monitor" },
@@ -91,6 +99,8 @@ async function loadAll() {
     S.assist = st.assist || "";
     S.autoCompactAt = st.autoCompactAt === undefined ? 0.8 : Number(st.autoCompactAt);
     $("#autoCompactSel").value = String(S.autoCompactAt);
+    S.keepTokens = Number.isFinite(Number(st.keepTokens)) ? Number(st.keepTokens) : 15000;
+    $("#keepTokensSel").value = String(S.keepTokens);
     S.checks = st.checks || { test: "", lint: "", auto: true };
     $("#chkTest").value = S.checks.test || "";
     $("#chkLint").value = S.checks.lint || "";
@@ -305,8 +315,14 @@ function renderProviders() {
         </div>
         <div class="prov-grid">
           <label class="field"><span class="field-label">上下文窗口（token）</span><input class="input cw" type="number" min="0" step="1024" value="${p.contextWindow ? Number(p.contextWindow) : ""}" placeholder="留空 = 按模型自动" spellcheck="false"></label>
-          <div class="field"><span class="field-label">这一条的能力</span><p class="field-help cwinfo"></p></div>
+          <label class="field"><span class="field-label">思考深度</span><select class="input td">
+            ${[""].concat(GENERIC_DEPTHS).map((v) =>
+              `<option value="${v}" ${(p.thinkDepth || "") === v ? "selected" : ""}>${v === "" ? "默认（跟着模型）" : esc(DEPTH_LABEL[v] || v)}</option>`
+            ).join("")}
+          </select></label>
         </div>
+        <label class="field"><span class="field-label">这一条的能力</span><p class="field-help cwinfo"></p></label>
+        <p class="field-help">思考深度只管「模型想多久」：关 = 最快最省，越深想得越久、也越贵。<b>档位跟着模型给</b>（数据来自 models.dev 的公开目录：不同模型的档位不一样，比如有的只有 关/低/高 三档）；个别网关不认这个设置，碰到会自动重试一次把它去掉。留「默认」= 什么都不设，照着模型自己的习惯走。</p>
         <div class="prov-foot">
           <button class="btn btn-ghost" data-act="test"><svg class="ic ic-sm"><use href="#i-refresh"/></svg>测试连接</button>
           <button class="ghost-btn" data-act="fetch"><svg class="ic ic-sm"><use href="#i-search"/></svg>拉取模型列表</button>
@@ -429,6 +445,7 @@ function renderProviders() {
     const cwEl = node.querySelector(".cw");
     const recompute = () => { read(); refreshCwInfo(node, p); markDirty(); };
     cwEl?.addEventListener("input", recompute);
+    node.querySelector(".td")?.addEventListener("change", recompute); // 思考深度：改了就重算能力行 + 存盘
     moEl.addEventListener("blur", () => { read(); refreshCwInfo(node, p); });
     refreshCwInfo(node, p);
 
@@ -475,6 +492,24 @@ function readRow(node, p) {
   const cw = Number(node.querySelector(".cw")?.value) || 0;
   if (cw > 0) p.contextWindow = cw;
   else delete p.contextWindow; // 留空 = 按模型自动匹配
+  const td = node.querySelector(".td")?.value || "";
+  if (td) p.thinkDepth = td;
+  else delete p.thinkDepth; // 默认 = 不干预（请求里不加思考相关字段）
+}
+
+// 思考深度的下拉按「模型自己的档位」生成（服务端能力表给的 depths：deepseek=关/低/高/最高、
+// gpt-6=关/极简/…/最难 等；认不出就用通用档位）。存着的档位不在列表里（比如换了模型）也保留，标「自定义」。
+function renderDepthOptions(node, p, depths) {
+  const sel = node.querySelector(".td");
+  if (!sel) return;
+  const list = Array.isArray(depths) && depths.length ? depths : GENERIC_DEPTHS;
+  const cur = p.thinkDepth || "";
+  const opts = [`<option value="">默认（跟着模型）</option>`].concat(
+    list.map((v) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(DEPTH_LABEL[v] || v)}</option>`)
+  );
+  if (cur && !list.includes(cur)) opts.push(`<option value="${esc(cur)}" selected>${esc(DEPTH_LABEL[cur] || cur)}（自定义）</option>`);
+  sel.innerHTML = opts.join("");
+  sel.value = cur;
 }
 
 // 让服务端按模型能力表算出「窗口多大、预算多少、支不支持思考」，卡片上直接显示
@@ -488,10 +523,13 @@ async function refreshCwInfo(node, p) {
   try {
     const info = await api.modelInfo(p);
     if (node.dataset.cwSeq !== seq || !box.isConnected) return; // 这张卡又改过了，丢弃旧结果
-    const kk = (n) => (n >= 1000 ? Math.round(n / 1000) + "k" : String(n));
+    renderDepthOptions(node, p, info.depths); // 档位列表跟着模型走（能力表数据来自 models.dev）
+    const depth = p.thinkDepth || "";
     box.innerHTML =
-      `窗口 <b>${kk(info.windowTokens)}</b> · 可用预算 <b>${kk(info.limitTokens)}</b>` +
-      ` · 思考${info.reasoning ? "支持（会自动开）" : "不支持"}<br><span class="muted">窗口数据：${esc(info.source)}${info.model ? " · " + esc(info.model) : ""}</span>`;
+      `窗口 <b>${fmtTok(info.windowTokens)}</b> · 可用预算 <b>${fmtTok(info.limitTokens)}</b>（留 25% 给输出与工具结果） · 思考${info.reasoning ? "支持" : "不支持"}` +
+      ` · 深度 <b>${esc(depth ? DEPTH_LABEL[depth] || depth : "默认")}</b>${depth ? `` : "（跟着模型走）"}${
+        depth ? `（${esc(depth)}）` : ""
+      }<br><span class="muted">窗口数据：${esc(info.source)}${info.model ? " · " + esc(info.model) : ""}</span>`;
   } catch (e) {
     if (box.isConnected) box.textContent = e.message || "算不出来";
   }
@@ -808,6 +846,7 @@ async function save(opts = {}) {
     autoApprove: S.autoApprove,
     assist: $("#assistSel").value || "",
     autoCompactAt: Number($("#autoCompactSel").value) || 0,
+    keepTokens: Number($("#keepTokensSel").value) || 0,
     checks: { test: $("#chkTest").value.trim(), lint: $("#chkLint").value.trim(), auto: $("#chkAuto").checked },
     voice: S.voice, // 人格风格三档（默认/简短/详细 等）
   };
