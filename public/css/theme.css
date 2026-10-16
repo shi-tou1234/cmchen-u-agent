@@ -24,7 +24,7 @@
   --line-strong: #d8c49c;
   --fg: #2c2416;
   --muted: #6a5c48;
-  --faint: #8b7355;
+  --faint: #7d6647; /* 原 #8b7355 在 --surface 上约 4.2:1，低于 WCAG AA 4.5:1；加深一档到 ~5:1（审查 三.1）*/
   --accent: #8b4513;
   --accent-hover: #74380e;
   --accent-fg: #fffaf0;

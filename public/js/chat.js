@@ -267,6 +267,10 @@ export async function sendMessage(text, opts = {}) {
     if (e.name === "AbortError") finishAi(streamNode, full || "（已中止）");
     else { finishAi(streamNode); addError(e.message); toast(e.message, "err"); }
   } finally {
+    // 思考块收尾统一放这里：用户点停止或网络层直接断掉时 reader 抛错走 catch，
+    // 之后不会再收到任何 SSE 事件（done/error 走不到），只有 finally 能兜住——
+    // 漏了它，500ms 计时器和「正在思考…」会永远挂着（审查 一.2）
+    stopThink({ think });
     window.__abort = null;
     S.sending = false;
     runStats = null;
@@ -393,6 +397,7 @@ function handleEvent(ev, c) {
       if (!c.think.node) {
         c.think.node = addThink(c.getStream());
         c.think.started = Date.now();
+        c.think.node.dataset.started = c.think.started; // tickThink 从 dataset 读起点算秒数；此前从没人写过它，秒数永远不显示（审查 一.3）
         c.think.text = "";
         const node = c.think.node;
         c.think.timer = setInterval(() => tickThink(node), 500);
@@ -903,7 +908,7 @@ function finishAi(node, text) {
   scrollEnd();
 }
 
-// 结束思考块（不改变已挂好的文本，只停计时器 + 收尾）——done / error 两条收尾路径都要走一遍
+// 结束思考块（不改变已挂好的文本，只停计时器 + 收尾）——done / error 事件与 catch/finally（中止、断流）都要走
 function stopThink(c) {
   if (!c?.think?.node) return;
   finishThink(c.think.node, c.think.text, Date.now() - (c.think.started || Date.now()));
@@ -1602,6 +1607,7 @@ function renderRunChip() {
 
 // 后台任务：状态条上一个芯片，点开看列表、输出尾巴与停止按钮
 let jobsPanelOpen = false;
+let jobsTimer = null; // 轮询表：页面切后台会停，切回来再续（审查 四.2）
 export async function refreshJobs() {
   // 未解锁前不轮询：这个请求在锁屏期间只会拿回 401，
   // 而 401 会触发锁屏重置——把人正在输入的密码一遍遍清空（曾把人挡在门外登不进去）
@@ -1727,7 +1733,8 @@ function showConfirm() {
     $("#cfmNo").textContent = "跳过（不作答）";
     $("#cfmBody").innerHTML = renderAskForm(ev.args.questions);
     $("#cfmRoot").hidden = false;
-  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
+    // 焦点落在表单第一个可填项：回车不会误提交空答案（审查 二.1：默认焦点别放「提交/批准」这类正动作）
+    ($("#cfmBody").querySelector("input, select, textarea") || $("#cfmNo")).focus();
     return;
   }
   // v0.9.9：工作区 hooks 的信任复核
@@ -1739,7 +1746,7 @@ function showConfirm() {
       `<div class="cfm-args">${esc((ev.args?.将执行 || []).join("\n"))}</div>` +
       `<p class="field-help">批准后本次运行一直有效；hooks.json 内容改了会重新问</p>`;
     $("#cfmRoot").hidden = false;
-  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
+    $("#cfmNo").focus(); // 焦点给「不运行」：手滑一下回车不该等于批准跑命令（审查 二.1）
     return;
   }
   // 计划评审（计划模式里交上来的计划）：列步骤，按钮改成「批准执行 / 继续改计划」
@@ -1758,7 +1765,7 @@ function showConfirm() {
       w.textContent = ev.reason;
     }
     $("#cfmRoot").hidden = false;
-  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
+    $("#cfmNo").focus(); // 焦点给「继续改计划」：回车不直接批准执行（审查 二.1）
     return;
   }
   yesBtn.textContent = "批准执行";
@@ -1776,7 +1783,7 @@ function showConfirm() {
   }
   $("#cfmNote").value = ""; // 上一单的附言不许带到下一单
   $("#cfmRoot").hidden = false;
-  $("#cfmYes").focus(); // 键盘用户直接落在「批准」上（审查 #22：模态原先完全没有焦点管理）
+  $("#cfmNo").focus(); // 焦点给「拒绝」：弹窗瞬间手滑回车≠批准高危操作（审查 二.1）
 }
 async function resolveConfirm(approve, remember, scope) {
   const ev = queue.shift();
@@ -1860,7 +1867,20 @@ let palAt = 0;         // @ 或 / 在输入框里的起始位置
 let palSeq = 0;        // 并发请求的序号，防止先发的后到覆盖
 let palMoved = false;  // 用户是否用 ↑↓ 选过：没选过又候选很多时，回车别自作主张（打个 "/" 就回车不会误触 /new）
 let fileTimer = null;
+// @ 文件搜索结果缓存（键：工作区 + 查询串）。带一个上限按 LRU 淘汰——原先只进不出，
+// 会话开久了这条 Map 会一直吃内存（审查 四.1）
+const FILE_CACHE_MAX = 100;
 const fileCache = new Map();
+function fileCacheGet(key) {
+  const v = fileCache.get(key);
+  if (v) { fileCache.delete(key); fileCache.set(key, v); } // 命中挪到队尾 = 最近用过
+  return v;
+}
+function fileCacheSet(key, items) {
+  fileCache.delete(key);
+  fileCache.set(key, items);
+  while (fileCache.size > FILE_CACHE_MAX) fileCache.delete(fileCache.keys().next().value); // Map 保插入序：删最旧的
+}
 
 function palOpen() { return !$("#palette").hidden; }
 function palClose() { $("#palette").hidden = true; clearTimeout(fileTimer); palKind = "cmd"; }
@@ -1936,7 +1956,7 @@ function palUpdate() {
 // 缓存键带上工作区，换了工作区自然重新拉，不用额外清理
 function searchFiles(q) {
   const key = (S.workspace || "") + "\u0000" + q;
-  const cached = fileCache.get(key);
+  const cached = fileCacheGet(key);
   if (cached) { pal = cached; palRender(); return; }
   pal = [{ cmd: "__loading", show: "正在搜索工作区…", desc: "", disabled: true }];
   palRender();
@@ -1946,7 +1966,7 @@ function searchFiles(q) {
     try {
       const r = await api.files(q, 30);
       const items = r.files.map((f) => ({ cmd: f.path, show: f.path, desc: "", path: f.path }));
-      fileCache.set(key, items);
+      fileCacheSet(key, items);
       if (seq !== palSeq || palKind !== "file") return;
       pal = items.length ? items : [{ cmd: "__none", show: `工作区里没有匹配「${q}」的文件`, desc: "", disabled: true }];
       palIdx = 0;
@@ -2247,6 +2267,13 @@ function saveDraftNow() {
     else localStorage.removeItem(draftScope());
   } catch {}
 }
+// 切会话 / 新会话前必须先调它：草稿是停手 300ms 后才落盘的，晚一步 S.sessionId 就变了，
+// 挂着的定时器会把内容写进新会话的槽位、旧会话刚打的字就丢了（审查 一.5）
+export function flushDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = null;
+  saveDraftNow();
+}
 export function restoreDraft() {
   try {
     txtEl().value = localStorage.getItem(draftScope()) || "";
@@ -2337,6 +2364,9 @@ const findSupported = () => typeof CSS !== "undefined" && !!CSS.highlights && ty
 export function openFind() {
   const bar = $("#findBar");
   if (!bar) return;
+  // 模态弹层（设置/确认/命令台…）开着时不抢：查找栏层级在弹层之下，而且主界面被 inert，
+  // 开了也看不见、点不到（审查 一.7 的配套：别再让焦点落到弹窗背后的输入框里）
+  if (document.querySelector(".modal-root:not([hidden]), .cmdk-root:not([hidden])")) return;
   bar.hidden = false;
   $("#findInput").focus();
   $("#findInput").select();
@@ -2666,8 +2696,21 @@ export function initChat() {
   };
   $("#runStop").onclick = () => abortRun();
   $("#sbJobs").onclick = () => toggleJobsPanel();
+  // 后台任务轮询（审查 四.2）：页面在后台就停表（切回来补一次）；没任务、面板也没开时降到 30 秒——
+  // 原先是恒定 4 秒永不休，页面看不见也在白烧
+  const jobsTick = () => {
+    clearTimeout(jobsTimer);
+    jobsTimer = setTimeout(async () => {
+      if (document.hidden) return;
+      await refreshJobs();
+      jobsTick();
+    }, $("#sbJobs")?.hidden && !jobsPanelOpen ? 30000 : 4000);
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) { refreshJobs(); jobsTick(); } // 切回前台：立刻补一次并恢复轮询
+  });
   refreshJobs();
-  setInterval(refreshJobs, 4000); // 后台任务状态：本地接口，4 秒刷一次不心疼
+  jobsTick();
   $("#ctxCompact").onclick = () => doCompact();
   $("#attach").onclick = () => $("#file").click();
   $("#file").onchange = (e) => { addFiles([...e.target.files]); e.target.value = ""; };

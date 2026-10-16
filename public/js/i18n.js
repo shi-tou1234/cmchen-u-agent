@@ -100,7 +100,7 @@ export const DICT = {
     "gen.themeDark": "深色",
     "gen.themeSystem": "跟随系统",
     "gen.lang": "界面语言",
-    "gen.langDesc": "界面语言只影响这台电脑；答话用哪种语言在「人格」面板里设",
+    "gen.langDesc": "界面语言只影响这台电脑；答话用哪种语言在「人格」面板里设（English 覆盖主流程界面，设置面板内的详细说明暂为中文）",
     // ---- 锁屏 ----
     "lock.unlock": "输入密码解锁",
     "lock.unlockBtn": "解锁",
@@ -198,7 +198,7 @@ export const DICT = {
     "gen.themeDark": "Dark",
     "gen.themeSystem": "System",
     "gen.lang": "Interface language",
-    "gen.langDesc": "Only affects this computer. The language the assistant answers in is set in the Persona panel",
+    "gen.langDesc": "Only affects this computer. The language the assistant answers in is set in the Persona panel (English covers the main UI; detailed copy inside Settings is still Chinese)",
     "lock.unlock": "Enter your password",
     "lock.unlockBtn": "Unlock",
     "lock.pw": "Password",

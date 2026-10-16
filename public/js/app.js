@@ -13,6 +13,7 @@ import { initLock, showLock, initGate } from "./app/lock.js";
 let allSessions = [];
 let sessSelect = null; // 批量管理模式：null = 关闭；Set = 已勾选的会话 id
 let sessVisible = []; // 当前列表里渲染出来的（搜索过滤后的）会话
+let overlayMo = null; // 弹层 hidden 观察器（拿住引用，别让它在后台被回收）
 
 async function refreshSessions() {
   try { allSessions = await api.sessions(); } catch { return; }
@@ -153,6 +154,7 @@ function renameRow(node, id) {
   inp.focus();
   inp.select();
   const done = async (save) => {
+    inp.onblur = null; // 先解绑：Esc 取消后到刷新列表前的窗口期里失焦，不该再触发一次保存（审查 一.6）
     if (save) {
       try {
         await api.renameSession(id, inp.value.trim());
@@ -194,7 +196,9 @@ function deleteRow(node, id) {
 
 let loadSeq = 0; // 快速连点切换会话：只认最后一次请求的结果，过期响应丢掉（审查 #24 串台）
 async function loadSession(id) {
-  if (S.sending) return;
+  // 运行中不给切：说一声，别让人对着没反应的列表怀疑卡了（审查 二.2）
+  if (S.sending) return toast("这一轮还在跑，跑完才能切会话（想现在停：点「停止」）");
+  chat.flushDraft(); // 先落盘当前会话的草稿：下方 S.sessionId 一变，挂着的防抖定时器就会把内容写进新槽位（审查 一.5）
   const mySeq = ++loadSeq;
   try {
     const j = await api.session(id, S.provider || S.active);
@@ -219,7 +223,8 @@ function setTitle(t) {
 }
 
 function newChat() {
-  if (S.sending) return;
+  if (S.sending) return toast("这一轮还在跑，跑完才能开新会话（想现在停：点「停止」）");
+  chat.flushDraft(); // 同上：先把当前草稿落到它自己的槽位，再换新会话槽位
   S.sessionId = null;
   S.plan = null;
   S.budget = { chars: 0, tokens: 0, limitTokens: 0, windowTokens: 0, pct: 0, over: false };
@@ -311,6 +316,19 @@ function bindGlobal() {
       if (S.sending && !$("#txt").value.trim()) chat.abortRun(); // 没有浮层可关 + 正在跑 = 停止这一轮
     }
   });
+
+  // 弹层焦点陷阱（审查 三.4）：任何全屏弹层开着时给主界面加 inert，Tab 不会钻进弹层背后。
+  // 用观察器统一盯 hidden 变化，不必在每个开/关点埋钩子；锁屏自己那套 inert（lock.js）并入一起算。
+  const overlayRoots = [...document.querySelectorAll(".modal-root, .cmdk-root")];
+  const syncAppInert = () => {
+    const app = $("#app");
+    if (!app) return;
+    const lockOn = !$("#lock")?.classList.contains("hide");
+    app.toggleAttribute("inert", lockOn || overlayRoots.some((n) => !n.hidden));
+  };
+  overlayMo = new MutationObserver(syncAppInert);
+  overlayRoots.forEach((n) => overlayMo.observe(n, { attributes: true, attributeFilter: ["hidden"] }));
+  syncAppInert();
 
   window.addEventListener("ua:sessions-cleared", () => { S.sessionId = null; newChat(); });
   window.addEventListener("ua:open-session", (e) => { if (e.detail?.id) loadSession(e.detail.id); });

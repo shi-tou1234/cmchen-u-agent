@@ -278,7 +278,7 @@ test("验收N：用户可见文件无 api key 字样", () => {
 });
 
 test("v5 网页依赖：静态资源全部可取", async () => {
-  for (const p of ["/", "/css/app.css", "/js/app.js", "/js/chat.js", "/js/settings.js", "/js/api.js", "/js/ui.js", "/js/state.js", "/js/theme.js"]) {
+  for (const p of ["/", "/css/app.css", "/js/app.js", "/js/chat.js", "/js/settings.js", "/js/api.js", "/js/ui.js", "/js/state.js", "/js/theme.js", "/js/theme-boot.js"]) {
     const r = await jfetch(p);
     assert.equal(r.status, 200, `${p} 应可取到`);
     const type = r.headers.get("content-type") || "";
@@ -473,7 +473,10 @@ test("验收O：多轮上下文——第二轮请求携带第一轮", async () =
 
 test("验收P：压缩后旧轮次被摘要替代", async () => {
   await activateUp();
-  const sid = "s-compact-test";
+  // 一次性会话 id：本用例断言「压缩后助手回合不再原样出现」，需要从干净会话出发。
+  // 固定 id 会让日志跨次运行累积——压缩只覆盖中段、尾段原文照留，断言在单跑本文件时必挂
+  // （2026-10-16 实测：固定 s-compact-test 时单跑 1/1 失败，与本次前端改动无关）。
+  const sid = "s-compact-test-" + Math.random().toString(36).slice(2, 7);
   await chat({ sessionId: sid, message: { text: "第一件事：查询版本号" }, mode: "confirm", provider: "Up" });
   await chat({ sessionId: sid, message: { text: "第二件事：查个天气" }, mode: "confirm", provider: "Up" });
   await chat({ sessionId: sid, message: { text: "第三件事：算个数" }, mode: "confirm", provider: "Up" });

@@ -126,7 +126,7 @@
 .ask-opt:hover { background: var(--hover); }
 .ask-custom { margin-top: 4px; }
 .rewind-line { display: flex; align-items: center; gap: 8px; margin: 4px 0 22px; padding: 7px 12px; font-size: 12px;
-  color: var(--muted); border: 1px dashed var(--line); border-radius: var(--r-md); background: var(--surface-2); }
+  color: var(--muted); border: 1px dashed var(--line); border-radius: var(--r-sm); background: var(--surface-2); } /* --r-md 从未定义过，写它等于圆角归零（审查 一.4） */
 .rewind-line .ic { color: var(--accent); flex: none; }
 .msg-user .bubble { max-width: 84%; background: var(--accent-soft); border: 1px solid transparent;
   border-radius: 16px 16px 4px 16px; padding: 9px 14px; white-space: pre-wrap; word-break: break-word; }
@@ -201,8 +201,9 @@ img.brand-mark { object-fit: cover; display: block; }
 .rail-tick { display: block; width: 12px; height: 2px; border-radius: 99px; background: var(--line-strong);
   transform-origin: left center; transition: transform .15s ease-out, background-color .15s; cursor: pointer; }
 .rail-tick:hover { background: var(--accent); }
-/* 会话内查找：Ctrl+F，CSS Custom Highlight 高亮，不动 DOM */
-.find-bar { position: fixed; top: 62px; right: 26px; z-index: 70; display: flex; align-items: center; gap: 6px;
+/* 会话内查找：Ctrl+F，CSS Custom Highlight 高亮，不动 DOM。
+   z-index 55：压在 modal-root(60) 之下——设置/确认弹窗开着时，查找栏不许浮在弹窗上面（审查 一.7） */
+.find-bar { position: fixed; top: 62px; right: 26px; z-index: 55; display: flex; align-items: center; gap: 6px;
   background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--r); padding: 5px 8px; box-shadow: var(--shadow); }
 .find-bar[hidden] { display: none; }
 .find-bar input { border: 0; outline: none; background: transparent; font-size: 13px; width: 180px; color: var(--fg); }

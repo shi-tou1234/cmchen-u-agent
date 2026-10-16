@@ -19,23 +19,27 @@ const EXPECT_SIZE = 35556042; // 2026-10-11 实测
 const log = (...a) => console.log("[u-agent]", ...a);
 
 // 供应链校验（审查二轮 #17）：拿官方 SHASUMS256.txt 比对 sha256。
-// 校验做不成（清单拉不到）时降级为大小校验并明确提示；对不上则删包重来。
+// 分级处理（v1.2.0 复审 五）：「拉不到清单」= 校验做不成，退回大小校验并明确提示；
+// 「对不上」= 可能被替换/下载损坏，删包并中止安装（绝不静默放行）——此前两者混在一起都会降级，
+// 哈希不符只剩一个「解压失败」的糊涂报错。
 async function verifyZip(zip) {
+  let line;
   try {
     const res = await fetch(SUMS_URL, { redirect: "follow" });
     if (!res.ok) throw new Error("清单 HTTP " + res.status);
-    const line = (await res.text()).split(/\r?\n/).find((l) => l.trim().endsWith(ZIP_NAME));
+    line = (await res.text()).split(/\r?\n/).find((l) => l.trim().endsWith(ZIP_NAME));
     if (!line) throw new Error("清单里没有 " + ZIP_NAME);
-    const want = line.trim().split(/\s+/)[0].toLowerCase();
-    const got = crypto.createHash("sha256").update(fs.readFileSync(zip)).digest("hex");
-    if (want !== got) {
-      fs.rmSync(zip, { force: true });
-      throw new Error(`sha256 不符（期望 ${want.slice(0, 12)}… 实得 ${got.slice(0, 12)}…），已删除缓存包，请重试`);
-    }
-    log("sha256 校验通过（对 npmmirror SHASUMS256.txt）");
   } catch (e) {
     log(`⚠ 没做成哈希校验（${e.message}），退回大小校验——包来自 npmmirror 官方源，仍可用；介意的话带 --force 重装重试`);
+    return;
   }
+  const want = line.trim().split(/\s+/)[0].toLowerCase();
+  const got = crypto.createHash("sha256").update(fs.readFileSync(zip)).digest("hex");
+  if (want !== got) {
+    fs.rmSync(zip, { force: true });
+    throw new Error(`sha256 不符（期望 ${want.slice(0, 12)}… 实得 ${got.slice(0, 12)}…）：包可能被替换或下载损坏，已删除缓存包并中止安装。请检查网络/源站后重新运行`);
+  }
+  log("sha256 校验通过（对 npmmirror SHASUMS256.txt）");
 }
 
 function nodeVersion(exe) {
