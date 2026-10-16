@@ -1004,6 +1004,11 @@ export function initSettings() {
     if (!$("#wizRoot").hidden) $("#wizRoot").hidden = true;
     else if (!$("#dirRoot").hidden) $("#dirRoot").hidden = true;
     else if (!$("#setRoot").hidden) closeSettings();
+    else return; // 面板族都没开着：让 app.js 的全局 Esc 链接着处理
+    // 这一下 Esc 已被面板消费，必须 stopImmediatePropagation：本监听和 app.js 的全局监听
+    // 都挂在 document 上，光 stopPropagation 拦不住同目标的后注册监听——不拦的话 app.js 的
+    // 守卫会看到「已经关掉」，接着往下把正在跑的一轮误中止掉（审查 一.1 的完整事件链）
+    e.stopImmediatePropagation();
   });
 
   // 工作区

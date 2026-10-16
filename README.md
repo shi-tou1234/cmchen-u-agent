@@ -89,7 +89,7 @@ git clone https://github.com/shi-tou1234/cmchen-u-agent.git
 | 长上下文 | 按模型**真实窗口**算预算（Claude 5 系 / GLM-5.3 / DeepSeek-v4 都是 1M，GPT-5.6 系 1.05M）——窗口数据来自 models.dev 目录，认不出或对不上时可在通道里手填 |
 | 记忆 | 会话 JSONL 追加日志全存 U 盘 `data\sessions\`；跨会话记忆在 `data\memory.md`，**agent 自己能记**（memory 工具：记一条 / 忘掉 / 看清单，对话里说「记住 …」即可），太长只注入最近的部分（1600 字上限），设置 → 记忆里可一键「整理」（借轻量通道压成要点） |
 | 人格与表达风格 | 设置 → 人格：5 个预设（热情洋溢 / 严谨专注 / 幽默风趣 / 高冷成熟 / 元气微甜，中英双份、可编辑、存 `data\persona.md`）+ 三个正交档位（回答长度 简短/详细、语言风格 苏格拉底引导/专业严谨/通俗易懂、输出语言 中文/English）；**三个都选「默认」且人设留空时，一个字都不注入——模型的原始输出** |
-| 界面语言 | 设置 → 通用 → 外观里切**中文 / English**：侧栏、输入区、空态首页、权限面板、状态条、设置外壳与通用面板、锁屏等常用界面全双语（长段说明与工具卡文案暂为中文） |
+| 界面语言 | 设置 → 通用 → 外观里切**中文 / English**：侧栏、输入区、空态首页、状态条、设置导航、锁屏等**主流程界面**双语；设置面板内各卡片的详细说明、toast 与工具卡文案暂为中文（英文界面按「主流程可用」给，不是全量翻译） |
 | 离线向导 | Mock 通道不是鹦鹉学舌：它按关键词答「怎么换工作区 / 怎么换模型 / 钥匙怎么填 / 权限怎么选 / 怎么回退 / 怎么导出 …」（30 条问答 + 认不出就给菜单），不联网不花钱，专门用来看懂这个工具 |
 | 首页 | 空态首屏：时段问候（6 档 × 4 句、跨时段自动换档）+ 字母 U 水印 + 「试试这些任务」（12 条池子、换一批、点一下填进输入框不发出去） |
 | 导出 | 对话里输入 `/export` 把当前会话导出成 Markdown |
@@ -111,7 +111,7 @@ core/             内核：主循环(agent/)·三协议适配(adapters/)·服务
   server/         runtime·state·auth·perm·workspace·reply·checkpoints·assist·compact·chat·routes
 tools/            28 个插件工具（fs/shell/git/web/subagent/memory…）
 public/           网页：index.html + css/{theme,app,chat,composer,settings,bits}.css
-  js/             ui/api/state/catalog/picker/theme/chat/settings/notify/i18n/app + app/lock.js（登录页）
+  js/             ui/api/state/catalog/picker/theme/theme-boot/chat/settings/notify/i18n/app + app/lock.js（登录页）
 runtime|data|config.json   运行时与数据（不进 git）
 ```
 
