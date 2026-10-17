@@ -1,7 +1,7 @@
 // 启动、密码锁、会话侧栏、主题与全局快捷键
 import { api, net } from "./api.js";
 import { S } from "./state.js";
-import { $, $$, el, esc, icon, toast, relTime } from "./ui.js";
+import { $, $$, askConfirm, el, esc, icon, toast, relTime } from "./ui.js";
 import { initTheme } from "./theme.js";
 import * as chat from "./chat.js";
 import { initPicker } from "./picker.js";
@@ -37,15 +37,20 @@ function renderSessionList() {
       if (runA !== runB) return runB - runA;
       if (b.mtime !== a.mtime) return b.mtime - a.mtime;
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    })
-    .slice(0, 50);
+    });
+  // 原来这里有 `.slice(0, 50)`：只渲染前 50 条。问题是「全选」选的就是渲染出来的那些——
+  // 一百多条会话时，全选只删掉 50 条，刷新后剩下的又顶上来，看着就像"删了没删掉"（领导 2026-10-16 报）。
+  // 现在全量渲染；屏幕外的行靠 .sess 的 content-visibility 跳过布局，几百条也不卡。
   sessVisible = list;
   const managing = !!sessSelect;
   const ops = $("#sessOps");
   ops.classList.toggle("man", managing);
   if (managing) {
-    $("#sessOpsN").textContent = "已选 " + sessSelect.size;
-    $("#sessOpsAll").textContent = list.length && sessSelect.size >= list.length ? "取消全选" : "全选";
+    const nEl = $("#sessOpsN");
+    nEl.textContent = `已选 ${sessSelect.size}/${list.length}`; // 侧栏只有 265px：短写，完整意思放 title
+    nEl.title = `已选 ${sessSelect.size} 条，共 ${list.length} 条（搜索只筛显示，全选选的是筛选后的）`;
+    $("#sessOpsAll").textContent = list.length && sessSelect.size >= list.length ? "取消" : "全选"; // 侧栏窄：两字就够
+
     $("#sessOpsDel").disabled = !sessSelect.size;
     $("#sessOpsExport").disabled = !sessSelect.size;
   }
@@ -100,13 +105,34 @@ function setManage(on) {
 async function deleteSelectedSessions() {
   const ids = [...(sessSelect || [])];
   if (!ids.length) return;
-  if (!confirm(`删除选中的 ${ids.length} 条会话？不可恢复（它们对应的检查点也会一起清掉）`)) return;
+  // 用应用内确认框：window.confirm 会被「不再显示此对话框」勾选或扩展静默掐掉，表现为点了没反应
+  const yes = await askConfirm({
+    title: `删除选中的 ${ids.length} 条会话？`,
+    body: "不可恢复（它们对应的检查点也会一起清掉）。",
+    okText: "删除",
+    danger: true,
+  });
+  if (!yes) return;
+  // 逐条删（几十上百条要几秒）：按钮进"删除中"，边删边报进度，别让人对着没反应的面板发呆
+  const delBtn = $("#sessOpsDel");
+  const label = delBtn.textContent;
+  delBtn.disabled = true;
   const failedIds = new Set();
-  for (const id of ids) await api.dropSession(id).catch(() => { failedIds.add(id); }); // 失败不许吞：如实汇报
+  let done = 0;
+  for (const id of ids) {
+    try {
+      await api.dropSession(id);
+    } catch {
+      failedIds.add(id); // 失败不许吞：如实汇报
+    }
+    done++;
+    if (ids.length > 8) delBtn.textContent = `删除中 ${done}/${ids.length}`;
+  }
+  delBtn.textContent = label;
   const touchedCurrent = ids.includes(S.sessionId) && !failedIds.has(S.sessionId);
   sessSelect.clear();
   toast(
-    failedIds.size ? `${ids.length - failedIds.size} 条已删除，${failedIds.size} 条没删掉（可能还在跑：先停止再删）` : `已删除 ${ids.length} 条会话`,
+    failedIds.size ? `${ids.length - failedIds.size} 条已删除，${failedIds.size} 条没删掉（多半是这一轮没停下来：等它超时结束再删一次）` : `已删除 ${ids.length} 条会话`,
     failedIds.size ? "err" : "ok"
   );
   if (touchedCurrent) { S.sessionId = null; newChat(); }
@@ -179,9 +205,21 @@ function deleteRow(node, id) {
   cur.querySelector('[data-act="del"]').onclick = async (e) => {
     e.stopPropagation();
     clearTimeout(timer);
-    try {
-      await api.dropSession(id);
-    } catch (err) {
+    let err = null;
+    for (let i = 0; i < 2; i++) {
+      try {
+        await api.dropSession(id);
+        err = null;
+        break;
+      } catch (e2) {
+        err = e2;
+        // 409 = 服务端刚把这一轮停掉、还在收尾：等一秒自己再试一次，
+        // 别把「等一两秒再点一次」留给用户（服务端已经停了，再点一遍纯属多余）
+        if (e2?.status !== 409 || i === 1) break;
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+    if (err) {
       // 说真话：删失败就把原因摆出来（原先 catch 吞掉还谎报"已删除"——领导报"无法删除对话"的一半在这）
       cur.dataset.confirm = "";
       refreshSessions();
@@ -189,7 +227,8 @@ function deleteRow(node, id) {
       return;
     }
     if (id === S.sessionId) newChat();
-    else refreshSessions();
+    // 不论删的是不是当前会话都刷一次列表：newChat 那条分支原先不刷新，删掉的会话还挂在侧栏里，像"没删掉"
+    refreshSessions();
     toast("会话已删除", "ok");
   };
 }
@@ -331,7 +370,11 @@ function bindGlobal() {
   syncAppInert();
 
   window.addEventListener("ua:sessions-cleared", () => { S.sessionId = null; newChat(); });
-  window.addEventListener("ua:open-session", (e) => { if (e.detail?.id) loadSession(e.detail.id); });
+  window.addEventListener("ua:open-session", async (e) => {
+    if (!e.detail?.id) return;
+    await loadSession(e.detail.id);
+    if (e.detail.keepInput) chat.setInput(e.detail.keepInput); // 分叉：原话要留在新会话的输入框里（切会话会换草稿槽）
+  });
   window.addEventListener("ua:open-settings", (e) => openSettings({ panel: e.detail?.panel }));
   window.addEventListener("ua:autoapprove-change", () => chat.renderAutoApproveBar());
   window.addEventListener("ua:settings-saved", () => {

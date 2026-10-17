@@ -161,12 +161,18 @@ async function handleChat(req, res, body) {
     confirm: (info) => {
       const id = genId("cfm");
       const p = new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          // 超时先把 pending 摘掉再返回拒绝（审查 #12）：留着的话 ① 每次超时泄漏一条含完整工具参数
-          // 的表项；② 两分钟后用户点「批准」会被当成有效裁决回 {ok:true}——假批准，实际早按拒绝走了
+        // 超时/中止都从这里收口：先摘 pending 再 resolve，绝不留下「点批准还能批」的假裁决（审查 #12）
+        const settle = (v) => {
           if (confirmGate.pending.get(id)?.timer === timer) confirmGate.pending.delete(id);
-          resolve({ ok: false, note: "", timeout: true });
-        }, Number(process.env.UA_CONFIRM_TIMEOUT_MS) || 120000);
+          clearTimeout(timer);
+          resolve(v);
+        };
+        const timer = setTimeout(() => settle({ ok: false, note: "", timeout: true }), Number(process.env.UA_CONFIRM_TIMEOUT_MS) || 120000);
+        // 这一轮被中止（点停止 / 删会话）：确认弹窗不该继续干等 2 分钟超时——立刻按拒绝放行，
+        // 主循环才能收尾、running 才能摘锁（否则「停止」后还要挂两分钟，删会话也删不动）
+        const onAbort = () => settle({ ok: false, note: "", aborted: true });
+        if (abort.signal.aborted) onAbort();
+        else abort.signal.addEventListener("abort", onAbort, { once: true });
         confirmGate.pending.set(id, { resolve, info: { ...info, id, ts: new Date().toISOString() }, timer });
       });
       // 网页可以给这句确认附一句话：批准时是补充要求，拒绝时是理由，都会转给模型

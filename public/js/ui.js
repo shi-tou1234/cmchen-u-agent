@@ -54,6 +54,69 @@ export function toast(msg, type = "") {
   }, type === "err" ? 4600 : 3000);
 }
 
+/* ---------- 浮层开合（2026-10-17） ----------
+   [hidden] 是 display:none !important（theme.css 的兜底规则），过渡管不了它：进场走 CSS 的
+   @starting-style，退场由这里挂 .closing 把退场动画播完再真正 hidden。时长与 --t-fast 对齐。 */
+export function hideOverlay(node, ms = 140) {
+  if (!node || node.hidden || node.classList.contains("closing")) return;
+  node.classList.add("closing");
+  clearTimeout(node._hideTimer);
+  node._hideTimer = setTimeout(() => {
+    node.classList.remove("closing");
+    node.hidden = true;
+    node._hideTimer = null;
+  }, ms);
+}
+// 打开：顺手取消上一次还没播完的退场（不然那个定时器会把刚打开的又关上）
+export function showOverlay(node) {
+  if (!node) return;
+  clearTimeout(node._hideTimer);
+  node._hideTimer = null;
+  node.classList.remove("closing");
+  node.hidden = false;
+}
+
+/* ---------- 应用内确认框 ----------
+   替代 window.confirm：浏览器原生的 confirm 会被「不再显示此对话框」勾选或扩展静默掐掉，
+   表现是「点了没反应」——删会话这类操作用户只会以为坏了。这个框在页面里画，
+   默认焦点给「取消」：手滑回车不该等于危险操作放行（与确认弹窗一个原则）。 */
+export function askConfirm({ title = "确认操作", body = "", okText = "确定", danger = false } = {}) {
+  return new Promise((resolve) => {
+    const root = $("#askRoot");
+    if (!root) {
+      resolve(window.confirm(body || title)); // 兜底：静态页缺节点时退回原生（也别用于危险操作）
+      return;
+    }
+    $("#askTitle").textContent = title;
+    const b = $("#askBody");
+    b.textContent = body;
+    b.hidden = !body;
+    const ok = $("#askOk");
+    ok.textContent = okText;
+    ok.className = "btn " + (danger ? "btn-danger-solid" : "btn-primary");
+    const done = (v) => {
+      hideOverlay(root, 120);
+      document.removeEventListener("keydown", onKey, true);
+      root.removeEventListener("click", onClick);
+      resolve(v);
+    };
+    // Esc 只在对话框开着时归它：捕获阶段拦下，不外泄给全局 Esc 链（别顺手中止正在跑的回合）
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      e.stopImmediatePropagation();
+      done(false);
+    };
+    const onClick = (e) => {
+      const act = e.target.closest("[data-ask]");
+      if (act) done(act.dataset.ask === "ok");
+    };
+    showOverlay(root);
+    document.addEventListener("keydown", onKey, true);
+    root.addEventListener("click", onClick);
+    $("#askNo").focus(); // 默认焦点在「取消」
+  });
+}
+
 /* ---------- Markdown ----------
    行式解析：先抽代码块，再逐行识别标题/分隔线/引用/列表/表格，最后做行内格式。
    只用浏览器原生能力渲染，不引任何库。                                        */

@@ -2,7 +2,7 @@
 // 模型部分学 OpenCode：预设里存「厂商 → 协议 + 地址 + 候选模型」，用户只做两件事——填钥匙、挑模型
 import { api } from "./api.js";
 import { S, setMode, MODES, ACTION_META, DEFAULT_AUTO_APPROVE } from "./state.js";
-import { $, $$, el, esc, icon, toast, tok as fmtTok } from "./ui.js";
+import { $, $$, askConfirm, el, esc, icon, toast, tok as fmtTok, hideOverlay, showOverlay } from "./ui.js";
 import { fillProviders, showThinking, setShowThinking, refreshCustomCommands, doCheck } from "./chat.js";
 import { brandChip, chipOf, providerReady } from "./picker.js";
 import { notifyOn, setNotifyOn, askPermission, notifyGranted } from "./notify.js";
@@ -71,15 +71,15 @@ export function openSettings(opts = {}) {
   return loadAll()
     .then(() => loadPersona().catch(() => {}))
     .then(() => {
-      $("#setRoot").hidden = false;
+      showOverlay($("#setRoot"));
       selectPanel(opts.panel || "general");
     });
 }
 
 function closeSettings() {
-  $("#setRoot").hidden = true;
-  $("#dirRoot").hidden = true;
-  $("#wizRoot").hidden = true;
+  hideOverlay($("#setRoot"));
+  hideOverlay($("#dirRoot"));
+  hideOverlay($("#wizRoot"));
 }
 
 async function loadAll() {
@@ -291,19 +291,20 @@ function renderProviders() {
     // 有的网关按模型分协议：协议和模型名对不上时，卡片上直接给个一键改（多半就是「连不上」的原因）
     const want = preset?.protocolPerModel ? protocolForModel(p.model) : null;
     const badProto = want && want.protocol && want.protocol !== p.protocol;
-    const node = el(`<div class="prov ${ready ? "ready" : ""}">
+    const node = el(`<div class="prov ${ready ? "ready" : ""} ${p.name === (S.active || "") ? "on" : ""}">
       <div class="prov-head">
         ${brandChip(p)}
         <span class="prov-name">${esc(p.name || "未命名")}</span>
         ${p.name === (S.active || "") ? `<span class="prov-tag on">在用</span>` : ""}
         ${badProto ? `<button class="ghost-btn" data-act="fixproto">协议不对，点我改</button>` : ""}
-        <span class="prov-meta">${esc(p.model || "未填模型")}${preset ? " · " + esc(preset.name) : ""}</span>
         <span class="grow"></span>
         <span class="prov-state ${stateLabel(p).cls}">${stateLabel(p).text}</span>
         <button class="ghost-btn" data-act="default">设为默认</button>
         <svg class="ic ic-sm chev"><use href="#i-chevron-down"/></svg>
       </div>
-      <div class="prov-body" ${ix === expanded ? "" : "hidden"}>
+      <div class="prov-body-wrap ${ix === expanded ? "open" : ""}">
+      <div class="prov-body">
+      <div class="prov-body-in">
         <div class="prov-grid">
           <label class="field"><span class="field-label">名称</span><input class="input nm" value="${esc(p.name || "")}" placeholder="起个好认的名字"></label>
           <label class="field"><span class="field-label">协议</span><select class="input pt">${PROTOCOLS.map(([v, t]) => `<option value="${v}" ${p.protocol === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
@@ -331,14 +332,19 @@ function renderProviders() {
           <span class="test-result"></span>
         </div>
       </div>
+      </div>
+      </div>
     </div>`);
 
     const chev = node.querySelector(".chev");
     if (ix === expanded) chev.style.transform = "rotate(180deg)";
     node.querySelector(".prov-head").addEventListener("click", (e) => {
       if (e.target.closest("[data-act]")) return;
-      expanded = expanded === ix ? -1 : ix;
-      renderProviders();
+      // 就地展开/收起（别再整表重渲染——重渲染会把高度动画掐断，展开就"啪"地跳一下）
+      const open = expanded !== ix;
+      expanded = open ? ix : -1;
+      node.querySelector(".prov-body-wrap").classList.toggle("open", open);
+      chev.style.transform = open ? "rotate(180deg)" : "";
     });
 
     node.querySelector('[data-act="default"]').onclick = (e) => {
@@ -565,7 +571,7 @@ function openWizard() {
   $("#wizTest").textContent = "";
   $("#vendorSearch").value = "";
   renderVendors("");
-  $("#wizRoot").hidden = false;
+  showOverlay($("#wizRoot"));
 }
 
 function renderVendors(q) {
@@ -714,7 +720,7 @@ function readWiz() {
   }
 }
 
-function wizSave() {
+async function wizSave() {
   if (!wizProv) return;
   if ($("#wizStep2").hidden) return; // 第一步不保存
   readWiz();
@@ -722,7 +728,7 @@ function wizSave() {
   if (wizProv.protocol !== "mock" && !wizProv.baseURL) return toast("服务地址还没填", "err");
   if (wizProv.protocol !== "mock" && !wizProv.model) return toast("模型名还没填（可以点「拉取模型列表」）", "err");
   if (wizProv.protocol !== "mock" && !wizProv.secret && !wizPreset?.noKey) {
-    if (!confirm("还没填钥匙，这样多半连不上。仍要添加吗？")) return;
+    if (!(await askConfirm({ title: "还没填钥匙", body: "这样多半连不上。仍要添加吗？", okText: "继续添加" }))) return;
   }
   let name = wizProv.name;
   let n = 2;
@@ -735,7 +741,7 @@ function wizSave() {
   if (usable) S.active = name;
   renderProviders();
   markDirty();
-  $("#wizRoot").hidden = true;
+  hideOverlay($("#wizRoot"));
   toast(usable ? `已添加「${name}」并切到它（设置会自动保存）` : `已添加「${name}」（设置会自动保存）`, "ok");
 }
 
@@ -834,7 +840,7 @@ async function save(opts = {}) {
     else wsOk = await api.browse(ws).then(() => true).catch(() => false);
   }
   if (!wsOk && !auto) {
-    if (!confirm("还没选工作区，agent 就没有能动手的目录。仍要保存吗？")) return;
+    if (!(await askConfirm({ title: "还没选工作区", body: "agent 就没有能动手的目录。仍要保存吗？", okText: "继续保存" }))) return;
   }
 
   const body = {
@@ -911,7 +917,7 @@ async function browseDir(p) {
    target："ws" 选中写进设置面板的输入框（还得按保存）·"extra" 加额外目录 ·"ws-live" 选完立刻生效 */
 export function openDirBrowser(target = "ws", startPath = "") {
   dirPickTarget = target;
-  $("#dirRoot").hidden = false;
+  showOverlay($("#dirRoot"));
   browseDir(startPath || S.workspace || "");
 }
 
@@ -982,8 +988,8 @@ export function initSettings() {
   // 原来只认 e.target.dataset.close，点在图标线条上就关不掉了（领导 2026-10-14 点出来的）
   for (const [root, close] of [
     ["#setRoot", closeSettings],
-    ["#dirRoot", () => ($("#dirRoot").hidden = true)],
-    ["#wizRoot", () => ($("#wizRoot").hidden = true)],
+    ["#dirRoot", () => hideOverlay($("#dirRoot"))],
+    ["#wizRoot", () => hideOverlay($("#wizRoot"))],
   ]) {
     $(root).addEventListener("click", (e) => {
       if (e.target.closest("[data-close]")) close();
@@ -1001,8 +1007,8 @@ export function initSettings() {
   }
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    if (!$("#wizRoot").hidden) $("#wizRoot").hidden = true;
-    else if (!$("#dirRoot").hidden) $("#dirRoot").hidden = true;
+    if (!$("#wizRoot").hidden) hideOverlay($("#wizRoot"));
+    else if (!$("#dirRoot").hidden) hideOverlay($("#dirRoot"));
     else if (!$("#setRoot").hidden) closeSettings();
     else return; // 面板族都没开着：让 app.js 的全局 Esc 链接着处理
     // 这一下 Esc 已被面板消费，必须 stopImmediatePropagation：本监听和 app.js 的全局监听
@@ -1035,7 +1041,7 @@ export function initSettings() {
     } else if (dirPickTarget === "ws-live") {
       // 从对话栏那颗胶囊进来的：选完立刻生效（走 picker.js 的 pickWorkspace，不用在这儿按保存）
       dirPickTarget = "ws";
-      $("#dirRoot").hidden = true;
+      hideOverlay($("#dirRoot"));
       window.dispatchEvent(new CustomEvent("ua:ws-picked", { detail: { path: p } }));
       return;
     } else {
@@ -1044,7 +1050,7 @@ export function initSettings() {
       toast("已选中：" + p, "ok");
     }
     dirPickTarget = "ws";
-    $("#dirRoot").hidden = true;
+    hideOverlay($("#dirRoot"));
     markDirty();
   };
 
@@ -1213,14 +1219,28 @@ export function initSettings() {
   $("#wipeBtn").onclick = async () => {
     const list = await api.sessions().catch(() => []);
     if (!list.length) return toast("没有可删的会话", "err");
-    if (!confirm(`将删除 ${list.length} 条会话记录（存在 U 盘 data\\sessions），不可恢复。确定？`)) return;
-    for (const s of list) await api.dropSession(s.id).catch(() => {});
-    toast(`已清空 ${list.length} 条会话`, "ok");
+    const yes = await askConfirm({
+      title: `清空全部 ${list.length} 条会话？`,
+      body: "会话记录存在 U 盘 data\\sessions，不可恢复。",
+      okText: "清空",
+      danger: true,
+    });
+    if (!yes) return;
+    let failed = 0;
+    for (const s of list) await api.dropSession(s.id).catch(() => { failed++; });
+    // 说真话：多少条没删掉就报多少（原先一条都不统计，全失败也报「已清空」——用户会以为按钮坏了）
+    toast(failed ? `清空完成：${list.length - failed} 条已删，${failed} 条没删掉（多半正被占用，稍后重试即可）` : `已清空 ${list.length} 条会话`, failed ? "err" : "ok");
     api.checkpoints().then((r) => renderCpStats(r.stats)).catch(() => {});
     window.dispatchEvent(new CustomEvent("ua:sessions-cleared"));
   };
   $("#cpClear").onclick = async () => {
-    if (!confirm("清空后就撤不了之前那些改动了（已经撤销过的不受影响）。确定清空检查点？")) return;
+    const yes = await askConfirm({
+      title: "清空检查点？",
+      body: "清空后就撤不了之前那些改动了（已经撤销过的不受影响）。",
+      okText: "清空",
+      danger: true,
+    });
+    if (!yes) return;
     try {
       const r = await api.dropCheckpoints();
       renderCpStats(r.stats);

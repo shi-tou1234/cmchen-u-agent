@@ -1,22 +1,26 @@
 /* ============================================================
    u-agent · app.css — 通用组件 + 布局骨架 + 登录页（密码锁）
-   （2026-10-15 从原 app.css 按段切出；<link> 顺序=原文顺序，级联不受影响）
+   2026-10-16 重做：组件只吃 theme.css 的令牌；高度/圆角/字号按阶梯取值（32/28/24、8/6、13/12/11）。
    ============================================================ */
 /* ---------- 3 通用组件 ---------- */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  height: 34px; padding: 0 14px; border-radius: var(--r);
-  border: 1px solid transparent; font-size: 13.5px; font-weight: 500;
-  white-space: nowrap; transition: background .13s, border-color .13s, color .13s, box-shadow .13s;
+  height: 32px; padding: 0 12px; border-radius: var(--r);
+  border: 1px solid transparent; font-size: var(--fs-ui); font-weight: 500;
+  white-space: nowrap; transition: background var(--t) var(--ease), border-color var(--t) var(--ease),
+  color var(--t) var(--ease), box-shadow var(--t) var(--ease);
 }
 .btn-primary { background: var(--accent); color: var(--accent-fg); }
 .btn-primary:hover { background: var(--accent-hover); }
-.btn-ghost { border-color: var(--line-strong); color: var(--fg); background: var(--surface); }
-.btn-ghost:hover { background: var(--hover); border-color: var(--faint); }
+.btn-ghost { border-color: var(--line); color: var(--fg); background: var(--surface); }
+.btn-ghost:hover { background: var(--hover); border-color: var(--line-strong); }
 .btn-subtle { color: var(--muted); }
 .btn-subtle:hover { background: var(--hover); color: var(--fg); }
-.btn-danger { background: var(--danger); color: #fff; }
-.btn-danger:hover { filter: brightness(1.08); }
+/* 危险动作：软红（10% 底 + 红字）——比整块红更克制，鼠标悬停才加深；确认弹窗里那个才是实心红 */
+.btn-danger { background: var(--danger-soft); color: var(--danger); }
+.btn-danger:hover { background: color-mix(in srgb, var(--danger) 18%, transparent); }
+.btn-danger-solid { background: var(--danger); color: #fff; }
+.btn-danger-solid:hover { filter: brightness(1.08); }
 .btn-warn { background: var(--warn); color: #fff; }
 .btn-warn:hover { filter: brightness(1.08); }
 .btn-block { width: 100%; }
@@ -24,98 +28,106 @@
 .btn-group { display: flex; gap: 8px; align-items: center; }
 
 .icon-btn {
-  width: 32px; height: 32px; border-radius: var(--r); color: var(--muted);
+  width: 28px; height: 28px; border-radius: var(--r-sm); color: var(--muted);
   display: inline-flex; align-items: center; justify-content: center;
-  transition: background .13s, color .13s;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
 }
 .icon-btn:hover { background: var(--hover); color: var(--fg); }
 
 .input {
-  width: 100%; height: 34px; padding: 0 11px;
-  background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--r);
-  transition: border-color .13s, box-shadow .13s;
+  width: 100%; height: 32px; padding: 0 10px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm);
+  transition: border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
 }
+.input:hover { border-color: var(--line-strong); }
 .input::placeholder { color: var(--faint); }
-.input:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
-.input-sm { height: 30px; font-size: 13px; }
-textarea.input, .area { height: auto; padding: 9px 11px; line-height: 1.7; resize: vertical; }
+.input:focus { outline: none; background: var(--elev); border-color: var(--accent); box-shadow: var(--ring); }
+.input-sm { height: 28px; font-size: var(--fs-sm); }
+textarea.input, .area { height: auto; padding: 8px 10px; line-height: 1.7; resize: vertical; }
 select.input { cursor: pointer; padding-right: 26px; appearance: none;
   background-image: var(--sel-arrow); background-repeat: no-repeat; background-position: right 8px center; background-size: 12px; }
-[data-theme="light"] { --sel-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b919c' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
-[data-theme="dark"] { --sel-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23737b88' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
+[data-theme="light"] { --sel-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b7f68' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
+[data-theme="dark"] { --sel-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a1957e' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
 
 .field { display: block; }
 .path-row { display: flex; align-items: center; gap: 8px; }
 .path-row .path-icon { display: grid; place-items: center; color: var(--accent); flex: none; }
-.path-row .path-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; }
-.crumb-bar .path-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; }
-.field-label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
-.field-help { font-size: 12px; color: var(--faint); margin-top: 6px; line-height: 1.7; }
-.field-error { min-height: 18px; font-size: 12.5px; color: var(--danger); }
+.path-row .path-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: var(--fs-sm); }
+.crumb-bar .path-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: var(--fs-sm); }
+.field-label { display: block; font-size: var(--fs-sm); color: var(--muted); margin-bottom: 5px; font-weight: 500; }
+.field-help { font-size: var(--fs-sm); color: var(--faint); margin-top: 5px; line-height: 1.7; }
+.field-error { min-height: 17px; font-size: var(--fs-sm); color: var(--danger); }
 .mt { margin-top: 12px; }
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-ul.dots { padding-left: 18px; color: var(--muted); font-size: 13px; }
+ul.dots { padding-left: 18px; color: var(--muted); font-size: var(--fs-ui); }
 /* 人格面板：预设胶囊 + 三列风格下拉 */
-.chips { display: flex; flex-wrap: wrap; gap: 7px; }
-.chip { padding: 5px 12px; border: 1px solid var(--line); border-radius: 99px; background: var(--surface); color: var(--muted); font-size: 12.5px; cursor: pointer; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { padding: 4px 11px; border: 1px solid var(--line); border-radius: 99px; background: var(--surface); color: var(--muted);
+  font-size: var(--fs-sm); cursor: pointer; transition: border-color var(--t-fast), color var(--t-fast), background var(--t-fast); }
 .chip:hover { border-color: var(--line-strong); color: var(--fg); }
-.chip.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.chip.on { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); background: var(--accent-soft); }
 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .row-actions { display: inline-flex; gap: 8px; }
 ul.dots li { margin: 3px 0; }
 
+/* 卡：
+   卡片吃"发丝边 + 无阴影"（ZCode/OpenHands 的做法），层级靠底色差而不是影子 */
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); margin-bottom: 14px; overflow: hidden; }
 .card:last-child { margin-bottom: 0; }
-.card-head { padding: 15px 18px 0; }
+.card-head { padding: 14px 16px 0; }
 .card-head.row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.card-head h3 { font-size: 14px; font-weight: 600; letter-spacing: .01em; }
-.card-head p { font-size: 12.5px; color: var(--faint); margin-top: 3px; line-height: 1.6; }
-.card-body { padding: 14px 18px 16px; }
+.card-head h3 { font-size: var(--fs-lg); font-weight: 600; letter-spacing: .01em; }
+.card-head p { font-size: var(--fs-sm); color: var(--faint); margin-top: 3px; line-height: 1.6; }
+.card-body { padding: 13px 16px 15px; }
 .card-body.tight { padding: 8px 10px 10px; }
-.card.danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.card.danger { border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); }
 
-.segmented { display: inline-flex; padding: 3px; gap: 2px; background: var(--hover); border-radius: var(--r); }
-.segmented button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 12px; border-radius: 6px; font-size: 13px; color: var(--muted); }
+.segmented { display: inline-flex; padding: 2px; gap: 2px; background: var(--hover); border-radius: var(--r); }
+.segmented button { display: inline-flex; align-items: center; gap: 5px; padding: 5px 11px; border-radius: var(--r-sm);
+  font-size: var(--fs-ui); color: var(--muted); transition: color var(--t-fast), background var(--t-fast); }
 .segmented button:hover { color: var(--fg); }
 .segmented button[aria-checked="true"] { background: var(--seg-on); color: var(--fg); box-shadow: var(--shadow-sm); }
 
 .choice-list { display: grid; gap: 6px; }
 .choice {
-  display: flex; gap: 11px; align-items: flex-start; padding: 11px 13px;
+  display: flex; gap: 11px; align-items: flex-start; padding: 10px 12px;
   border: 1px solid var(--line); border-radius: var(--r); cursor: pointer; background: var(--surface);
-  transition: border-color .13s, background .13s;
+  transition: border-color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
 }
-.choice:hover { background: var(--surface-2); border-color: var(--line-strong); }
-.choice[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); }
-.choice .tick { width: 16px; height: 16px; margin-top: 3px; border-radius: 50%; border: 1.5px solid var(--line-strong); flex: none; position: relative; }
+.choice:hover { background: var(--hover); border-color: var(--line-strong); }
+.choice[aria-checked="true"] { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); background: var(--accent-soft); }
+.choice .tick { width: 16px; height: 16px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--line-strong); flex: none; position: relative; }
 .choice[aria-checked="true"] .tick { border-color: var(--accent); background: var(--accent); }
 .choice[aria-checked="true"] .tick::after { content: ""; position: absolute; inset: 4px; border-radius: 50%; background: var(--surface); }
 [data-theme="dark"] .choice[aria-checked="true"] .tick::after { background: var(--accent-fg); }
-.choice b { font-weight: 600; font-size: 13.5px; }
-.choice span.d { display: block; font-size: 12.5px; color: var(--muted); margin-top: 2px; line-height: 1.6; }
-/* 模式卡占的地方太大，会把下面的自动放行挤到折叠线以下；两列排开就都看得见了 */
+.choice b { font-weight: 600; font-size: var(--fs-ui); }
+.choice span.d { display: block; font-size: var(--fs-sm); color: var(--muted); margin-top: 2px; line-height: 1.6; }
+/* 模式卡两列排（把自动放行挤下折叠线的老问题） */
 .choice-list.two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
-.choice-list.two-col .choice { padding: 10px 12px; }
-.choice-list.two-col .choice b { font-size: 13px; }
-.choice-list.two-col .choice span.d { font-size: 12px; line-height: 1.55; }
+.choice-list.two-col .choice { padding: 9px 11px; }
+.choice-list.two-col .choice b { font-size: var(--fs-ui); }
+.choice-list.two-col .choice span.d { font-size: var(--fs-xs); line-height: 1.55; }
 
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 13px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: var(--fs-ui); }
 .kv dt { color: var(--faint); }
 .kv dd { color: var(--fg); word-break: break-all; }
 
-.dirty { font-size: 12.5px; color: var(--warn); display: inline-flex; align-items: center; gap: 6px; }
+.dirty { font-size: var(--fs-sm); color: var(--warn); display: inline-flex; align-items: center; gap: 6px; }
 .dirty::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
 .dirty.ok { color: var(--ok); }
 .dirty.ok::before { background: var(--ok); }
 .dirty.bad { color: var(--danger); }
 .dirty.bad::before { background: var(--danger); }
 
-.toasts { position: fixed; right: 18px; bottom: 18px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; max-height: calc(100vh - 36px); overflow: hidden; }
+/* Toast：细左边的状态条 + 发丝边，不再整块描边（原 3px 左边 + 重边太吵） */
+.toasts { position: fixed; right: 16px; bottom: 16px; z-index: 90; display: flex; flex-direction: column; gap: 8px;
+  align-items: flex-end; max-height: calc(100vh - 32px); overflow: hidden; }
 .toast {
-  background: var(--elev); border: 1px solid var(--line-strong); border-left: 3px solid var(--accent);
-  border-radius: var(--r); padding: 9px 14px; font-size: 13px; max-width: 380px;
-  box-shadow: var(--shadow); white-space: pre-line; animation: toast-in .18s ease-out;
+  display: flex; align-items: flex-start; gap: 9px;
+  background: var(--elev); border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  border-radius: var(--r); padding: 9px 13px; font-size: var(--fs-ui); max-width: 380px;
+  box-shadow: var(--shadow); white-space: pre-line; animation: toast-in var(--t) var(--ease);
 }
 .toast.ok { border-left-color: var(--ok); }
 .toast.err { border-left-color: var(--danger); }
@@ -125,34 +137,41 @@ ul.dots li { margin: 3px 0; }
 .app { display: flex; height: 100vh; }
 .app > .main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; background: var(--bg); }
 
-/* 登录页（学 Claude / ChatGPT / Linear 的极简单卡：品牌字标 + 一句话 + 一个输入 + 一个按钮，
-   剩下的都收进「忘记密码」折叠；背景一层贴纸感的暖光晕，不做大块装饰） */
+/* 登录页（Claude Code 的框式排法：品牌行 + 一句话 + 一个输入 + 一个按钮 + 编号小提示） */
 .gate { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 22px;
   background: radial-gradient(1100px 520px at 50% -14%, var(--accent-soft), transparent 62%), var(--bg); }
 .gate.hide { display: none; }
-.gate-card { width: 100%; max-width: 400px; background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--r-xl); padding: 30px 28px 22px; box-shadow: var(--shadow-lg); animation: gateIn .32s ease; }
+.gate-card { width: 100%; max-width: 424px; background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r-lg); padding: 18px 22px 0; box-shadow: none; animation: gateIn var(--t-slow) var(--ease); }
 .gate-card.hide { display: none; }
-@keyframes gateIn { from { opacity: 0; transform: translateY(10px) scale(.985); } }
-.gate-card.shake { animation: gateShake .34s ease; }
+@keyframes gateIn { from { opacity: 0; transform: translateY(8px) scale(.995); } }
+.gate-card.shake { animation: gateShake .34s var(--ease-in-out); }
 @keyframes gateShake { 20% { transform: translateX(-7px); } 45% { transform: translateX(6px); } 70% { transform: translateX(-3px); } }
-.gate-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
-.gate-mark { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; flex: none;
-  background: var(--accent); color: var(--accent-fg); font-family: var(--kai); font-size: 20px; line-height: 1;
-  box-shadow: var(--shadow-sm); }
-.gate-word { font-family: var(--kai); font-size: 17px; letter-spacing: .05em; color: var(--fg); }
-.gate-card h1 { font-family: var(--kai); font-size: 21px; font-weight: 600; letter-spacing: .02em; }
-.gate-sub { color: var(--muted); font-size: 12.5px; margin: 6px 0 18px; line-height: 1.75; }
-.gate-card .field { margin-bottom: 12px; }
-.gate-card .btn { margin-top: 6px; height: 42px; border-radius: var(--r); font-weight: 600; letter-spacing: .08em; }
-/* 密码框里的「显示/隐藏」：成熟登录页的标配（输长密码时能自查一遍） */
+/* 品牌行（框内抬头行）：标 + 字标一条线，版本号贴右，下压一条发丝线 */
+.gate-brand { display: flex; align-items: center; gap: 8px; padding-bottom: 12px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--line); }
+.gate-logo { width: 22px; height: 22px; color: var(--accent); flex: none; }
+.gate-brand b { font-family: var(--kai); font-size: var(--fs-lg); font-weight: 600; letter-spacing: .04em; line-height: 1; }
+.gate-ver { margin-left: auto; font-family: var(--mono); font-size: var(--fs-2xs); color: var(--faint); letter-spacing: .04em; }
+.gate-card h1 { font-family: var(--kai); font-size: 19px; font-weight: 600; letter-spacing: .02em; }
+.gate-sub { color: var(--muted); font-size: var(--fs-sm); margin: 5px 0 14px; line-height: 1.7; }
+/* 盘状态行（#lkDisk）的样式在 settings.css 里（它加载在后，这里是登录页的其它规则） */
+.gate-card .field { margin-bottom: 10px; }
+.gate-card .field-label { font-family: var(--mono); font-size: var(--fs-2xs); letter-spacing: .08em; color: var(--faint); font-weight: 400; }
+.gate-card .input { height: 40px; font-size: var(--fs-body); border-color: var(--line); }
+.gate-card .btn { margin-top: 4px; height: 40px; border-radius: var(--r); font-weight: 600; letter-spacing: .06em; }
+/* 密码框：左侧一个等宽 ">"（Claude Code 的提示符），右侧小眼睛 */
 .pw-wrap { position: relative; display: block; }
-.pw-wrap .input { padding-right: 40px; }
-.pw-eye { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 30px; height: 30px;
-  display: grid; place-items: center; border-radius: 8px; color: var(--faint); }
+.pw-wrap .input { padding-right: 38px; padding-left: 28px; }
+.pw-lead { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); font-family: var(--mono);
+  font-size: var(--fs-ui); color: var(--faint); pointer-events: none; }
+.pw-eye { position: absolute; right: 5px; top: 50%; transform: translateY(-50%); width: 28px; height: 28px;
+  display: grid; place-items: center; border-radius: var(--r-sm); color: var(--faint); }
 .pw-eye:hover { background: var(--hover); color: var(--fg); }
-.gate-hint { margin-top: 12px; text-align: center; font-size: 11.5px; color: var(--faint); letter-spacing: .02em; }
-.gate-help { margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--line); font-size: 12px; color: var(--faint); }
-.gate-help summary { cursor: pointer; }
-.gate-help p { margin-top: 7px; line-height: 1.8; }
-
+.gate-hint { margin-top: 9px; text-align: center; font-family: var(--mono); font-size: var(--fs-2xs); color: var(--faint); letter-spacing: .02em; }
+/* 小提示（Claude Code 的 "Tips for getting started"：发丝线上方、等宽标题、编号两行） */
+.gate-tips { margin-top: 15px; padding: 12px 0 14px; border-top: 1px solid var(--line); }
+.gate-tips .tips-title { font-family: var(--mono); font-size: var(--fs-2xs); letter-spacing: .12em; color: var(--faint); margin: 0 0 7px; }
+.gate-tips ol { margin: 0; padding-left: 17px; display: grid; gap: 5px; }
+.gate-tips li { font-size: var(--fs-sm); color: var(--muted); line-height: 1.7; }
+.gate-tips code { font-family: var(--mono); font-size: var(--fs-xs); background: var(--hover); padding: 1px 5px; border-radius: var(--r-xs); }

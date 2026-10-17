@@ -148,5 +148,8 @@ export function initLock(opts = {}) {
   // 表单绑定放在最前面：后面任何一处出错都不该让密码屏失灵
   $("#lockForm").onsubmit = (e) => { e.preventDefault(); goLock(); };
   initGate();
+  // 品牌行右侧的版本号（学 Claude Code 框内那行元信息；页面上本来就有 meta，取一次即可）
+  const ver = $("#lkVer");
+  if (ver) ver.textContent = "v" + (document.querySelector('meta[name="ua-version"]')?.content || "");
 }
 export { showLock, initGate };
