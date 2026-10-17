@@ -1,10 +1,11 @@
 // 对话区：消息渲染、SSE 收发、工具/计划卡、高危确认、斜杠命令、附件
 import { api, net } from "./api.js";
 import { S, setMode, MODES, MODE_HINT, MODE_HINT_EN, ACTION_META } from "./state.js";
-import { $, $$, el, esc, icon, md, toast, kb, tok } from "./ui.js";
-import { renderModelBtn, renderModeBtn, renderDepthBtn, cycleMode, openModelPop, openModePop, openDepthPop, providerReady } from "./picker.js";
+import { $, $$, askConfirm, el, esc, icon, md, toast, kb, tok, relTime } from "./ui.js";
+import { renderModelBtn, renderModeBtn, renderDepthBtn, cycleMode, openModelPop, openModePop, openDepthPop, providerReady, pickDepthByValue, pickProviderByName, pickWorkspace, depthLevels } from "./picker.js";
 import { t, getLang } from "./i18n.js";
 import { ping, askPermission } from "./notify.js";
+import { pref, applyTheme } from "./theme.js";
 
 const taskLabel = (it) => (getLang() === "en" && it.tEn ? it.tEn : it.t);
 const T_ICON = {
@@ -132,55 +133,17 @@ export async function sendMessage(text, opts = {}) {
   const clean = String(text ?? "").trim();
   askPermission(); // 用户手势里顺手要一次通知权限，拒绝了不影响任何功能
 
-  if (clean.startsWith("/remember ")) {
-    const content = clean.slice(10).trim();
-    if (content) {
-      const cur = await api.memory().catch(() => ({ text: "" }));
-      const merged = ((cur.text || "").trim() + String.fromCharCode(10) + "- " + content).trim();
-      await api.saveMemory(merged).then(() => toast("已写进跨会话记忆", "ok")).catch((e) => toast(e.message, "err"));
-    }
+  // 斜杠命令：名字/别名对齐三家主流（Claude Code / Codex / OpenCode），统一走 runCmd。
+  // 不是命令的（比如 "/users 是路径"）照常当消息发出去。
+  const hit = clean.startsWith("/") ? resolveCmd(clean) : null;
+  if (hit) {
+    if (!keepsComposer(hit.cmd, hit.arg)) clearComposer();
+    runCmd(hit.cmd, hit.arg);
     return;
   }
-  // /compact 后面可以点名保住什么：/compact 保留 API 细节
-  if (clean === "/compact" || clean.startsWith("/compact ")) {
-    const rest = clean.slice("/compact".length).trim();
-    clearComposer();
-    doCompact(rest);
-    return;
-  }
-  if (clean === "/export") {
-    clearComposer();
-    exportSession();
-    return;
-  }
-  if (clean === "/thinking") {
-    clearComposer();
-    toggleThinking();
-    return;
-  }
-  if (clean === "/details") {
-    clearComposer();
-    toggleDetails();
-    return;
-  }
-  if (clean === "/goal" || clean.startsWith("/goal ")) {
-    const arg = clean.slice("/goal".length).trim();
-    clearComposer();
-    doGoal(arg);
-    return;
-  }
-  if (clean === "/check" || clean.startsWith("/check ")) {
-    const only = clean.slice("/check".length).trim();
-    clearComposer();
-    doCheck(only);
-    return;
-  }
-  // 不带参数的命令：直接给反馈（调弹层 / 出状态卡），别让它落回 default 把输入框清空、像"回车没反应"
-  if (clean === "/mode") { clearComposer(); openModePop(); return; }
-  if (clean === "/model") { clearComposer(); openModelPop(); return; }
-  if (clean === "/depth") { clearComposer(); openDepthPop(); return; } // 思考深度：跟 /model 一样就地弹
-  if (clean === "/help" || clean === "/status") { clearComposer(); showStatus(true); return; }
-
+  // 自定义命令（.agent 里的 /xxx）：打了名字回车 = 展开，跟面板点选走同一套（原先只有面板那条路通）
+  const cst = customByName(clean);
+  if (cst) { expandCustom(cst, clean); return; }
   let body = clean;
   const srcTexts = opts.texts || S.texts; // 排队消息用入队时的附件快照，别把之后贴的带进来（审查 #19）
   const srcImages = opts.images || S.images;
@@ -194,6 +157,7 @@ export async function sendMessage(text, opts = {}) {
 
   const needTitle = !S.title || S.title === "新会话";
   if (!S.sessionId) S.sessionId = "s-" + Date.now().toString(36);
+  if (!S.usageStart) S.usageStart = Date.now(); // /usage 的"用时"从第一句话算起
   pushHistory(clean);
   S.lastSent = body;
   S.changes = [];
@@ -539,10 +503,6 @@ export function clearStream() {
 /* 首屏那个水印：一个字母 U（领导说机器人线稿看着诡异，点名"干脆做成一个字母"）。
    细线描出字母的轮廓（学 ZCode 那个空心 Z 的做法），字母要够宽、上半截也要看得见；
    颜色吃 currentColor、明暗主题共用，底部渐隐。 */
-const WELCOME_MARK = `<svg viewBox="0 0 400 320" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linejoin="round" aria-hidden="true">
-  <path d="M50 30V140A150 150 0 0 0 350 140V30H260V140A60 60 0 0 1 140 140V30Z"/>
-</svg>`;
-
 /* 招呼语：每个时段一组（学 Claude 的多变写法），每次进首屏从当档里挑一句、避免连着重复；
    下面那行小字也从池子里挑——品牌那句留一条在里面就够了，不用每屏都念同一句。 */
 const GREETING_SLOTS = [
@@ -711,7 +671,7 @@ export function renderWelcome() {
   setHome(true);
   const g = greetingNow();
   colEl().innerHTML = `<div class="welcome">
-    <div class="welcome-mark">${WELCOME_MARK}</div>
+    <div class="welcome-brand" aria-hidden="true"><svg viewBox="0 0 48 48"><use href="#i-brand"/></svg></div>
     <p class="welcome-hello" id="welcomeHello">${esc(g.hello)}</p>
     <p class="welcome-sub" id="welcomeSub">${esc(g.sub)}</p>
   </div>`;
@@ -801,7 +761,6 @@ const isDropped = (ranges, i) => ranges.some((r) => i > r.atIndex && i < r.marke
 async function rewindTo(node, onlyChat) {
   if (!S.sessionId) return toast("还没有可以回退的对话", "err");
   if (S.sending) return toast("等这一轮跑完再回退", "err");
-  const raw = node.__raw || "";
   const btn = node.querySelector(".rw-btn");
   if (!node.dataset.armed) {
     node.dataset.armed = "1";
@@ -816,6 +775,13 @@ async function rewindTo(node, onlyChat) {
     return;
   }
   clearTimeout(node._rwTimer);
+  delete node.dataset.armed;
+  return rewindDo(node, onlyChat);
+}
+
+// 真正执行回退（「从这儿重来」第二次点击 / /undo 命令共用同一条）：对话从那句起不再算数，默认连文件改动一起回滚
+async function rewindDo(node, onlyChat) {
+  const raw = node.__raw || "";
   try {
     const at = await findUserEventIndex(node);
     if (at < 0) return toast("没在日志里找到这条消息（可能已被压缩）", "err");
@@ -828,8 +794,26 @@ async function rewindTo(node, onlyChat) {
     const nf = (r.files?.reverted || []).length;
     toast(`已回退 ${r.dropped} 条记录` + (nf ? `，回滚了 ${nf} 个文件改动` : "，文件改动不受影响"), "ok");
   } catch (e) {
+    const btn = node.querySelector(".rw-btn");
+    if (btn) { delete node.dataset.armed; btn.classList.remove("armed"); btn.innerHTML = icon("refresh", "ic ic-sm") + "从这儿重来"; } // 没退成就把按钮复原，别留下"再点一次"的假状态
     if (e.message !== "已取消") toast(e.message, "err");
   }
+}
+
+// /undo（对齐 Claude 的 /rewind、OpenCode 的 undo）：回退最近一轮——对话也算数了（原文放回输入框），文件改动一起回滚
+async function rewindLast() {
+  const rows = [...colEl().querySelectorAll(".msg-user")];
+  const last = rows[rows.length - 1];
+  if (!last) return toast("还没有可回退的对话", "err");
+  if (S.sending) return toast("等这一轮跑完再回退", "err");
+  const ok = await askConfirm({
+    title: "回退最近一轮？",
+    body: "这句和之后的对话不再进上下文；这一轮的文件改动也一起回滚。\n你的原话会放回输入框，不丢。",
+    okText: "回退",
+    danger: true,
+  });
+  if (!ok) return;
+  await rewindDo(last, false);
 }
 
 // 统一回退（v0.9.9）：默认对话+文件一起；文件撞车先问一句再强制
@@ -842,7 +826,12 @@ async function rewindRequest(at, withFiles) {
       const unsafe = (e.data.conflicts || []).slice(0, 6).map((c) => `  · ${c.rel}（${c.since}）`).join("\n");
       const more = (e.data.conflicts || []).length > 6 ? `\n  · … 等共 ${e.data.conflicts.length} 个` : "";
       const safeN = (e.data.safe || []).length;
-      const ok = confirm(`这次回退涉及的文件：\n\n✅ 安全（会自动恢复）：${safeN} 个\n⚠️ 不安全（之后又被改过）：\n${unsafe}${more}\n\n仍要强制回退吗？（不安全的那几个会恢复到更早的样子）`);
+      const ok = await askConfirm({
+        title: "强制回退？",
+        body: `这次回退涉及的文件：\n\n✅ 安全（会自动恢复）：${safeN} 个\n⚠️ 不安全（之后又被改过）：\n${unsafe}${more}\n\n不安全的那几个会恢复到更早的样子。`,
+        okText: "强制回退",
+        danger: true,
+      });
       if (!ok) throw new Error("已取消");
       return await api.rewind(S.sessionId, at, { withFiles: true, force: true });
     }
@@ -874,8 +863,8 @@ async function forkTo(node) {
     const at = await findUserEventIndex(node);
     if (at < 0) return toast("没在日志里找到这条消息（可能已被压缩）", "err");
     const r = await api.fork(S.sessionId, at);
-    setInput(raw.split("\n\n【文件 ")[0] || raw);
-    window.dispatchEvent(new CustomEvent("ua:open-session", { detail: { id: r.id } }));
+    // 切会话会把输入框换成新会话的草稿槽（刚分叉那条是空的）：原话随事件带过去，加载完再放回（不然"已放回输入框"是句空话）
+    window.dispatchEvent(new CustomEvent("ua:open-session", { detail: { id: r.id, keepInput: raw.split("\n\n【文件 ")[0] || raw } }));
     toast("已分叉出一条新会话（原会话没动），那句原话已放回输入框", "ok");
   } catch (e) {
     toast(e.message, "err");
@@ -1457,6 +1446,7 @@ export function renderPlan(items) {
 /* ---- 历史回放 ---- */
 export function renderHistory(events) {
   clearStream();
+  S.usageStart = events?.[0]?.ts ? Date.parse(events[0].ts) : null; // /usage 的"用时"基准 = 这条会话第一条记录的时间
   const map = {};
   const cpCards = new Map(); // 检查点 id → 改动卡：回滚过的事件要标回当时那张卡片
   const ranges = rewindRanges(events); // 被回退掉的那段不再显示
@@ -1824,23 +1814,64 @@ function renderAskForm(questions) {
 }
 
 /* ================= 斜杠命令 / @ 提及文件 ================= */
+/* 命令表：名字与别名对齐三家主流 Agent 的叫法（Claude Code / Codex / OpenCode），不再自造名字。
+   同名三家都有的：clear / compact / export / help / init / status / model / memory / goal / review / diff / copy
+   Claude+Codex：permissions(=approvals) / plan / usage(=cost,stats) / context / rename / resume(=continue) / undo(=rewind,checkpoint)
+   OpenCode：cd / sessions(=resume) / effort(=depth) / skills / theme
+   —— alias 里是我方旧名，全部留着，老习惯照打不误。group 只影响面板分组，argHint 是参数提示。 */
 const CMDS = [
-  { cmd: "/new", desc: "开始新会话" },
-  { cmd: "/mode", desc: "切换权限模式", sub: "mode" },
-  { cmd: "/model", desc: "切换模型通道", sub: "model" },
-  { cmd: "/depth", desc: "调思考深度（档位跟着模型走，就地切）", sub: "depth" },
-  { cmd: "/compact", desc: "压缩上下文；后面可以接要求，如「/compact 保留接口细节」" },
-  { cmd: "/export", desc: "把这次会话导出成 Markdown 文件" },
-  { cmd: "/thinking", desc: "显示 / 隐藏模型的思考过程" },
-  { cmd: "/details", desc: "展开 / 收起所有工具调用的参数与结果" },
-  { cmd: "/skill", desc: "加载一个技能（放在 .agent/skills 里的做事方法）", sub: "skill" },
-  { cmd: "/check", desc: "现在跑一次检查命令（test / lint）" },
-  { cmd: "/goal", desc: "设定完成标准（空格后接内容；/goal clear 清除），没达成它会一直做下去" },
-  { cmd: "/init", desc: "让 agent 通读工作区，生成 AGENTS.md" },
-  { cmd: "/status", desc: "查看当前状态" },
-  { cmd: "/remember", desc: "写入跨会话记忆（空格后接内容）" },
-  { cmd: "/help", desc: "显示所有命令" },
+  { cmd: "/clear", alias: ["/new", "/reset"], group: "会话", desc: "开一条新会话（旧的留在侧栏，之后 /resume 还能找回）" },
+  { cmd: "/resume", alias: ["/sessions", "/continue"], group: "会话", desc: "接着某条旧会话聊（列出最近会话）" },
+  { cmd: "/rename", group: "会话", argHint: "[名字]", desc: "给当前会话改个名字" },
+  { cmd: "/compact", group: "会话", argHint: "[保住什么]", desc: "压缩上下文；后面可接要求，如「/compact 保留接口细节」" },
+  { cmd: "/undo", alias: ["/rewind", "/checkpoint"], group: "会话", desc: "撤销最近一轮的文件改动" },
+  { cmd: "/fork", group: "会话", desc: "从你最后一句那里分叉出一条新会话（原会话不动）" },
+  { cmd: "/export", group: "会话", desc: "把这次会话导出成 Markdown 文件" },
+  { cmd: "/copy", group: "会话", desc: "复制上一条回答的原文" },
+  { cmd: "/model", alias: ["/models"], group: "模型与权限", argHint: "[通道名]", desc: "切换模型通道" },
+  { cmd: "/effort", alias: ["/depth", "/thinking-level"], group: "模型与权限", argHint: "[档位]", desc: "调思考深度（档位跟着模型走，就地切）" },
+  { cmd: "/permissions", alias: ["/mode", "/approvals"], group: "模型与权限", argHint: "[模式]", desc: "切换权限模式（只读 / 计划 / 谨慎 / 自动 / 完全权限）" },
+  { cmd: "/plan", group: "模型与权限", desc: "切到计划模式：先出计划再动手" },
+  { cmd: "/cd", alias: ["/workspace"], group: "模型与权限", desc: "换工作区（打开工作区选择器）" },
+  { cmd: "/context", group: "上下文与用量", desc: "看上下文占用（用了多少 / 窗口多大 / 压缩阈值）" },
+  { cmd: "/usage", alias: ["/cost", "/stats"], group: "上下文与用量", desc: "本次会话的用量（输入 / 输出 / 缓存）" },
+  { cmd: "/details", group: "上下文与用量", desc: "展开 / 收起所有工具调用的参数与结果" },
+  { cmd: "/thinking", group: "上下文与用量", desc: "显示 / 隐藏模型的思考过程" },
+  { cmd: "/init", group: "工作区与代码", desc: "让 agent 通读工作区，生成 AGENTS.md" },
+  { cmd: "/review", group: "工作区与代码", argHint: "[关注点]", desc: "让 agent 审一遍当前改动，找出问题" },
+  { cmd: "/diff", group: "工作区与代码", desc: "看工作区里未提交的改动" },
+  { cmd: "/check", group: "工作区与代码", argHint: "[test|lint]", desc: "现在跑一次检查命令（test / lint）" },
+  { cmd: "/skills", alias: ["/skill"], group: "工作区与代码", argHint: "[名字]", desc: "加载一个技能（放在 .agent/skills 里的做事方法）" },
+  { cmd: "/memory", alias: ["/remember"], group: "记忆与设置", argHint: "[内容]", desc: "写入跨会话记忆（空格后接内容）" },
+  { cmd: "/goal", group: "记忆与设置", argHint: "[完成标准|clear]", desc: "设定完成标准，没达成它会一直做下去" },
+  { cmd: "/config", alias: ["/settings"], group: "记忆与设置", desc: "打开设置面板" },
+  { cmd: "/theme", group: "记忆与设置", desc: "切换主题（浅色 / 暗色 / 跟随系统）" },
+  { cmd: "/status", group: "记忆与设置", desc: "看当前状态（通道 / 权限 / 工作区 / 占用）" },
+  { cmd: "/help", group: "记忆与设置", desc: "显示所有命令" },
 ];
+// 把输入解析成命令（支持别名，打旧名字照样认）："/mode rw" → { cmd: "/permissions", arg: "rw" }；不是命令就 null（照常当消息发出去）
+export function resolveCmd(input) {
+  const s = String(input || "").trim();
+  if (!s.startsWith("/")) return null;
+  const sp = s.search(/\s/);
+  const name = (sp < 0 ? s : s.slice(0, sp)).toLowerCase();
+  const arg = sp < 0 ? "" : s.slice(sp + 1).trim();
+  const hit = CMDS.find((c) => c.cmd === name || (c.alias || []).includes(name));
+  return hit ? { cmd: hit.cmd, arg } : null;
+}
+// 模糊匹配（学 Claude Code 的 "Type to search"）：命令名按子序列匹配优先，其次匹配说明文字
+function fuzzyCmds(list, q) {
+  const needle = q.toLowerCase();
+  const score = (c) => {
+    const name = c.cmd.slice(1);
+    let i = 0;
+    for (const ch of name) if (ch === needle[i]) i++;
+    if (i === needle.length) return 100 - name.length + i; // 名字命中：越短越靠前
+    const hay = (c.desc || "").toLowerCase() + (c.alias || []).join(" ").toLowerCase();
+    return hay.includes(needle) ? 50 - name.length : -1;
+  };
+  return list.map((c) => ({ c, s: score(c) })).filter((x) => x.s >= 0).sort((a, b) => b.s - a.s).map((x) => x.c);
+}
 // 自定义命令与技能都来自 .agent 目录下的 Markdown（跟 U 盘/工作区走），开机拉一次
 export async function refreshCustomCommands() {
   try {
@@ -1852,12 +1883,200 @@ export async function refreshCustomCommands() {
     S.skills = [];
   }
 }
+
+/* ---- 命令总入口：不管是从面板点选还是打完整命令回车，都走这里（原先两条 switch 各写一半） ---- */
+// 这几条在无参时会自己往输入框里放半截命令（/rename 、/skills ），执行前别先清空；其余命令执行前先清，别让命令行赖在框里
+const keepsComposer = (cmd, arg) => !arg && (cmd === "/rename" || cmd === "/memory" || cmd === "/skills");
+// 自定义命令（.agent/commands 与 U 盘 .agent 里的 Markdown）：按第一个词找，找不到返回 null
+function customByName(text) {
+  const s = String(text || "");
+  if (!s.startsWith("/")) return null;
+  const name = s.trim().split(/\s+/)[0];
+  return (S.customCommands || []).find((c) => "/" + c.name === name) || null;
+}
+// 展开自定义命令（$ARGUMENTS / $1..$9 / @文件 由服务端做）：结果放回输入框，让人看一眼再回车
+function expandCustom(cst, line) {
+  const s = String(line || "");
+  const args = s.includes(" ") ? s.slice(s.indexOf(" ") + 1).trim() : "";
+  clearComposer();
+  api.expandCommand(cst.name, args)
+    .then((r) => { setInput(r.text); toast("已展开自定义命令「" + cst.name + "」（来自" + (r.kind || "?") + "），看一眼再回车", "ok"); })
+    .catch((e) => toast(e.message, "err"));
+}
+// 改名后本地标题立刻跟上（顶栏；侧栏行由 refreshSessions 刷）。app.js 里那个 setTitle 是模块私有的，这边按同一套写法来
+function setLocalTitle(t) {
+  S.title = t || "新会话";
+  const el = $("#topTitle");
+  if (el) el.textContent = S.title;
+}
+
+export function runCmd(cmd, arg = "") {
+  palClose(); // 两条入口都汇到这里：先收面板，免得命令跑完了还挂着一个候选列表
+  const a = String(arg || "").trim();
+  switch (cmd) {
+    case "/clear":
+      if (S.sessionId || colEl().querySelector(".msg")) { $("#newChat").click(); toast("已开一条新会话（旧的留在侧栏，/resume 能找回）", "ok"); }
+      else toast("已经是一条新会话了", "ok");
+      return;
+    case "/resume": openSessionPalette(a); return;
+    case "/rename":
+      if (!a) return setInput("/rename ");
+      if (!S.sessionId) return toast("还没有会话可改名", "err");
+      api.renameSession(S.sessionId, a).then(() => { setLocalTitle(a); S.onSessionTouched?.(); toast("已改名为「" + a + "」", "ok"); }).catch((e) => toast(e.message, "err"));
+      return;
+    case "/compact": doCompact(a); return;
+    case "/undo": rewindLast(); return; // 对齐 Claude 的 /rewind、OpenCode 的 undo：回退最近一轮（对话 + 文件一起）
+    case "/fork": forkLast(); return;
+    case "/export": exportSession(); return;
+    case "/copy": copyLastReply(a); return;
+    case "/model":
+      if (a) { if (pickProviderByName(a)) return; toast("没有叫「" + a + "」的通道，打开选择器看看", "err"); }
+      openModelPop(); return;
+    case "/effort":
+      if (a) { setEffortByName(a); return; }
+      openDepthPop(); return;
+    case "/permissions":
+      if (a) {
+        const hit = MODES.find((m) => m.id === a || m.name === a);
+        if (hit) { setMode(hit.id); window.dispatchEvent(new CustomEvent("ua:mode-change", { detail: { mode: hit.id } })); toast("已切到" + hit.name, "ok"); return; }
+        toast("没有叫「" + a + "」的模式（可选：" + MODES.map((m) => m.id).join(" / ") + "）", "err");
+      }
+      openModePop(); return;
+    case "/plan":
+      setMode("plan");
+      window.dispatchEvent(new CustomEvent("ua:mode-change", { detail: { mode: "plan" } }));
+      toast("已切到计划模式：先出计划再动手", "ok");
+      return;
+    case "/cd":
+      if (a) { if (a === S.workspace) return toast("已经在这个工作区了", "ok"); pickWorkspace(a); return; } // 对齐 OpenCode：/cd <路径> 直接切
+      $("#sbWs").click(); return;
+    case "/context": showContext(); return;
+    case "/usage": showUsage(); return;
+    case "/details": toggleDetails(); return;
+    case "/thinking": toggleThinking(); return;
+    case "/init":
+      setInput("请通读工作区（用 fs_list / fs_search / fs_read），在工作区根目录生成一份 AGENTS.md：说明这个文件夹的用途、关键文件、常用命令和注意事项，精炼实用。");
+      return;
+    case "/review":
+      setInput("审一遍当前工作区里未提交的改动（先 git_status / git_diff 看全貌，再读关键文件）：找出真正的 bug、边界问题和不一致的地方；每条给文件:行号 + 为什么是问题 + 建议怎么改。只报你能指认的问题，别客套。" + (a ? "重点看：" + a : ""));
+      return;
+    case "/diff":
+      setInput("跑 git_diff（含未跟踪文件）把工作区里未提交的改动看一遍，然后用中文讲清楚：改了哪些文件、每处改动的意图、有没有看起来不对或漏掉的地方。");
+      return;
+    case "/check": doCheck(a); return;
+    case "/skills": {
+      // 学 Claude Code：第一个词是技能名，后面都算额外要求（面板点选也拼成同一种输入）
+      const parts = a.split(/\s+/).filter(Boolean);
+      const name = parts.shift() || "";
+      if (!name) { setInput("/skills "); palUpdate(); return; } // 不带名字：列出所有技能
+      setInput("请用 skill 工具加载「" + name + "」技能，然后照它说的做。" + (parts.length ? "另外：" + parts.join(" ") : ""));
+      return;
+    }
+    case "/memory":
+      if (a) { writeMemory(a); return; }
+      window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "memory" } })); // 对齐 Claude：无参 = 打开记忆编辑面板
+      return;
+    case "/goal": doGoal(a); return;
+    case "/config": window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: {} })); return;
+    case "/theme": cycleTheme(); return;
+    default: showStatus(true);
+  }
+}
+
+/* ---- 几个新命令的实现（都复用现成的接口/交互） ---- */
+async function writeMemory(content) {
+  try {
+    const cur = await api.memory().catch(() => ({ text: "" }));
+    const merged = ((cur.text || "").trim() + String.fromCharCode(10) + "- " + content).trim();
+    await api.saveMemory(merged);
+    toast("已写进跨会话记忆", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function cycleTheme() {
+  const order = ["light", "dark", "system"];
+  const next = order[(order.indexOf(pref()) + 1) % order.length];
+  const real = applyTheme(next);
+  toast(`主题：${{ light: "浅色", dark: "暗色", system: "跟随系统" }[next]}${next === "system" ? `（现在是${real === "dark" ? "暗" : "亮"}色）` : ""}`, "ok");
+}
+
+// /copy [N]（对齐 Claude：倒数第 N 条回答，不写 N 就是上一条）
+function copyLastReply(nRaw) {
+  const texts = [...colEl().querySelectorAll(".msg .text")];
+  const n = Math.max(1, Number.parseInt(nRaw, 10) || 1);
+  const node = texts[texts.length - n];
+  if (!node) return toast(texts.length ? "这次会话里只有 " + texts.length + " 条回答" : "还没有可复制的回答", "err");
+  navigator.clipboard
+    .writeText(node.textContent)
+    .then(() => toast("已复制" + (n === 1 ? "上一条回答" : "倒数第 " + n + " 条回答"), "ok"))
+    .catch(() => toast("复制失败：浏览器没给剪贴板权限", "err"));
+}
+
+// /effort <档位>：先按当前通道给的合法档位校验，打错字提示可选值，别把脏值存进配置
+async function setEffortByName(a) {
+  const want = a === "默认" ? "" : a;
+  if (want) {
+    const levels = await depthLevels();
+    if (!levels.includes(want)) return toast("没有叫「" + a + "」的档位" + (levels.length ? "（可选：" + levels.join(" / ") + "）" : ""), "err");
+  }
+  pickDepthByValue(want);
+}
+
+function forkLast() {
+  const rows = [...colEl().querySelectorAll(".msg-user")];
+  const last = rows[rows.length - 1];
+  if (!last) return toast("还没有你的话可分叉", "err");
+  forkTo(last);
+}
+
+function showContext() {
+  const b = S.budget || {};
+  const win = b.windowTokens || b.limitTokens || 0;
+  const threshold = Number(S.autoCompactAt) > 0 ? `${Math.round(Number(S.autoCompactAt) * 100)}%（到点自动压缩）` : "关";
+  const lines = [
+    `上下文占用：${tok(b.tokens || 0)}${win ? " / " + tok(win) : ""}${b.pct ? "（" + b.pct + "%）" : ""}`,
+    `窗口：${win ? tok(win) : "未知（通道没填窗口）"} · 自动压缩阈值：${threshold}`,
+    `字符数：${kb((b.chars || 0) * 2)}`,
+    b.over ? "⚠ 已经超过窗口，建议 /compact" : "还有余量；输入框上面那条进度条就是它",
+  ];
+  toast(lines.join(String.fromCharCode(10)), b.over ? "err" : "ok");
+}
+
+// /usage（对齐 Claude 的 cost/duration：用时 + 分词用量；花费看通道，u-agent 自己不收）
+function showUsage() {
+  const t0 = S.tokens || {};
+  const ms = S.usageStart ? Date.now() - S.usageStart : 0;
+  const dur = ms <= 0 ? "刚开" : ms < 60000 ? Math.max(1, Math.round(ms / 1000)) + " 秒" : ms < 3600000 ? Math.round(ms / 60000) + " 分钟" : (ms / 3600000).toFixed(1) + " 小时";
+  const lines = [
+    `本次会话：用时 ${dur} · 输入 ${t0.input || 0} / 输出 ${t0.output || 0}${t0.cached ? " / 缓存命中 " + t0.cached : ""}`,
+    "每轮末尾那行「首字 / 生成 / 缓存命中」是单轮明细；花费取决于你接的通道，u-agent 自己不收费",
+  ];
+  toast(lines.join(String.fromCharCode(10)), "ok");
+}
+
+// /resume [词]：把最近会话塞进命令面板（复用面板的 ↑↓/点击/滚动，不另造弹窗）；给词就按标题/编号过滤
+async function openSessionPalette(filter = "") {
+  const q = String(filter || "").trim().toLowerCase();
+  const list = await api.sessions().catch(() => []);
+  const mine = list
+    .filter((s) => !s.id.startsWith("sub-"))
+    .filter((s) => !q || (s.title || "").toLowerCase().includes(q) || s.id.toLowerCase().includes(q))
+    .slice(0, 40);
+  if (!mine.length) return toast(q ? "没有匹配「" + filter + "」的会话（不带给词就列全部）" : "还没有别的会话", "err");
+  palKind = "session";
+  palIdx = 0;
+  palMoved = false;
+  pal = mine.map((s) => ({ cmd: s.id, session: true, show: s.title || s.id, desc: s.mtime ? relTime(s.mtime) : "" }));
+  palRender("会话 · ↑↓ 选择，Enter 打开，Esc 关闭");
+}
+
 // 命令面板 = 内置命令 + 自定义命令
 const allCmds = () =>
   CMDS.concat(
     (S.customCommands || []).map((c) => ({
       cmd: "/" + c.name,
       desc: (c.description || "自定义命令") + (c.kind === "项目" ? " · 项目" : " · U 盘"),
+      group: "自定义",
     }))
   );
 
@@ -1891,18 +2110,45 @@ function palRender(hintOverride) {
     ? hintOverride
     : palKind === "file"
       ? "工作区文件 · ↑↓ 选择，Enter 插入「@路径」，Esc 关闭"
-      : "命令 · ↑↓ 选择，Enter 确认，Esc 关闭";
+      : palKind === "session"
+        ? "会话 · ↑↓ 选择，Enter 打开，Esc 关闭"
+        : "命令 · ↑↓ 选择，Enter 确认，Esc 关闭 · 也可直接打名字回车";
+  // 命令列表按分组显示（查询为空时才有分组——学 OpenCode：一输入就拍平按相似度排）；
+  // 选中那条显示参数提示（argumentHint，学 Claude Code）
+  const grouped = palKind === "cmd" && pal.length > 1 && pal[0].group;
+  let lastGroup = "";
   box.innerHTML = `<div class="palette-head">${head}</div>` +
     pal
-      .map(
-        (c, i) => `<div class="pal-item ${palKind === "file" ? "file" : ""} ${i === palIdx ? "on" : ""} ${c.disabled ? "off" : ""}" data-i="${i}">
+      .map((c, i) => {
+        let sep = "";
+        if (grouped && c.group && c.group !== lastGroup) { lastGroup = c.group; sep = `<div class="pal-grp">${esc(c.group)}</div>`; }
+        const hint = i === palIdx && c.argHint ? `<span class="p-arg">${esc(c.argHint)}</span>` : "";
+        return sep + `<div class="pal-item ${palKind === "file" ? "file" : ""} ${i === palIdx ? "on" : ""} ${c.disabled ? "off" : ""}" data-i="${i}">
         ${palKind === "file" ? icon("file", "ic ic-sm") : ""}
         <span class="p-cmd">${esc(c.show || c.cmd)}</span>
-        <span class="p-desc">${esc(c.desc || "")}</span></div>`
-      )
+        ${hint}
+        <span class="p-desc">${esc(c.desc || "")}</span></div>`;
+      })
       .join("");
-  $$(".pal-item", box).forEach((d) => (d.onmousedown = (e) => { e.preventDefault(); palIdx = +d.dataset.i; palPick(); }));
+  // 点某一条 = 明确选择：palMoved 置真，否则会被「没按过 ↑↓ 就先别替他决定」的防误触守卫拦下
+  // （那个守卫是为回车设计的：打个「/」直接回车不该误触 /new；但用鼠标点了具体某条，意图已经很清楚）
+  $$(".pal-item", box).forEach(
+    (d) =>
+      (d.onmousedown = (e) => {
+        e.preventDefault();
+        palIdx = +d.dataset.i;
+        palMoved = true;
+        palPick();
+      })
+  );
   box.hidden = false;
+  // 面板往上长，但别顶出窗口（命令有 15 条时会比窗口还高，上面的条目就点不到了）：
+  // 可用高度 = 面板下沿到窗口顶（留 12px），上限 460。home 布局里输入框在屏幕中间，这一步尤其必要。
+  box.style.maxHeight = "";
+  const rect = box.getBoundingClientRect();
+  box.style.maxHeight = Math.min(Math.max(180, Math.round(rect.bottom - 12)), 460) + "px";
+  const on = box.querySelector(".pal-item.on");
+  if (on) on.scrollIntoView({ block: "nearest" }); // ↑↓ 会整块重渲染，得把选中项滚回可视区
 }
 
 // 光标前正在打的那个 @token；@ 必须在行首或空白之后，且 @ 到光标之间不能有空白
@@ -1931,21 +2177,37 @@ function palUpdate() {
   if (!v.startsWith("/")) return palClose();
   palKind = "cmd";
   const sp = v.indexOf(" ");
-  if (sp < 0) { pal = allCmds().filter((c) => c.cmd.startsWith(v)); palIdx = 0; return palRender(); }
-  const cmd = v.slice(0, sp);
+  // 命令名先用 resolveCmd 归一（打旧名 /mode、/depth 也认），再按归一名走"带参数"那几条分支
+  const canon = resolveCmd(sp < 0 ? v : v.slice(0, sp))?.cmd || (sp < 0 ? v : v.slice(0, sp));
+  if (sp < 0) {
+    // 空查询：按分组列出全部（学 OpenCode 的"查询为空按分类显示"）；有输入：模糊匹配后拍平
+    pal = v === "/" ? allCmds() : fuzzyCmds(allCmds(), v.slice(1));
+    // 打的是命令全名或别名（/mode、/memory）时，把那条顶到第一位并选中——
+    // 否则模糊匹配可能把 /model 排前面，回车就被"候选不止一条"的防误触守卫拦下
+    const exactHit = resolveCmd(v)?.cmd;
+    if (exactHit) {
+      const i = pal.findIndex((c) => c.cmd === exactHit);
+      if (i > 0) pal.unshift(pal.splice(i, 1)[0]);
+    }
+    palIdx = 0;
+    return palRender();
+  }
   const rest = v.slice(sp + 1).toLowerCase();
-  if (cmd === "/mode") {
-    pal = MODES.filter((m) => m.id.startsWith(rest)).map((m) => ({ cmd: m.id, show: "/mode " + m.id, desc: m.name }));
-  } else if (cmd === "/model") {
+  const typedName = v.slice(0, sp); // 显示按你打的拼法（打 /mode 就显示 /mode），执行时由 paramCmd 归一回 /permissions
+  if (canon === "/permissions") {
+    pal = MODES.filter((m) => m.id.startsWith(rest)).map((m) => ({ cmd: m.id, paramCmd: "/permissions", show: typedName + " " + m.id, desc: m.name }));
+  } else if (canon === "/model") {
     // 只列能用的通道（providerReady：mock、地址+模型+钥匙，或者本机/免钥匙的 Ollama 这类）
     pal = S.providers
       .filter((p) => providerReady(p))
-      .map((p) => ({ cmd: p.name, show: "/model " + p.name, desc: p.model || "" }))
+      .map((p) => ({ cmd: p.name, paramCmd: "/model", show: typedName + " " + p.name, desc: p.model || "" }))
       .filter((c) => c.cmd.toLowerCase().startsWith(rest));
-  } else if (cmd === "/skill") {
+  } else if (canon === "/skills") {
+    // 技能名后面还能跟"额外要求"：筛选只看第一个词，别让空格把整个列表筛没了（选中的那条会带上要求一起执行）
+    const q1 = rest.split(/\s+/)[0];
     pal = (S.skills || [])
-      .filter((k) => k.name.includes(rest) || (k.description || "").toLowerCase().includes(rest))
-      .map((k) => ({ cmd: k.name, show: "/skill " + k.name, desc: (k.description || "") + (k.kind === "项目" ? " · 项目" : " · U 盘") }));
+      .filter((k) => k.name.toLowerCase().includes(q1) || (k.description || "").toLowerCase().includes(q1))
+      .map((k) => ({ cmd: k.name, paramCmd: "/skills", show: typedName + " " + k.name, desc: (k.description || "") + (k.kind === "项目" ? " · 项目" : " · U 盘") }));
     if (!pal.length) pal = [{ cmd: "__none", show: "还没有技能：在工作区或 U 盘的 .agent/skills/<名字>/SKILL.md 放一个", desc: "", disabled: true }];
   } else return palClose();
   palIdx = 0;
@@ -1986,7 +2248,11 @@ function palPick() {
   // 候选多于一条、又没按过 ↑↓：先别替他决定。打个「/」就回车不会误触 /new（原来会静默开新会话、像"啥也没发生"）
   const usable = pal.filter((c) => !c.disabled);
   const typed = palKind === "file" ? atToken()?.q || "" : txtEl().value.trim();
-  const exact = it.cmd === typed || "/" + it.cmd === typed || (palKind === "file" && "@" + it.cmd === typed);
+  const exact =
+    it.cmd === typed ||
+    "/" + it.cmd === typed ||
+    resolveCmd(typed)?.cmd === it.cmd || // 打的是别名（/mode）也算打全了
+    (palKind === "file" && "@" + it.cmd === typed);
   if (!palMoved && usable.length > 1 && !exact) {
     palRender(palKind === "file" ? "候选不止一条：↑↓ 选一条再回车" : "命令不止一条：↑↓ 选一条再回车（也可以把命令名打全）");
     return;
@@ -2006,46 +2272,43 @@ function palPick() {
     return;
   }
 
+  // /resume 面板：选中某条会话 → 打开它
+  if (palKind === "session" && it.session) {
+    palClose();
+    clearComposer();
+    window.dispatchEvent(new CustomEvent("ua:open-session", { detail: { id: it.cmd } }));
+    return;
+  }
+
   const v = txtEl().value;
   const typedCmd = v.indexOf(" ") < 0 ? v : v.slice(0, v.indexOf(" "));
   // 执行拿「选中项的命令名」：打个 / 再用 ↑↓ 选 /mode 时，输入框里只有 "/"，不能拿它去 switch
-  const cmd = it.cmd && String(it.cmd).startsWith("/") ? it.cmd : typedCmd;
-  if (it.show?.startsWith("/mode ")) { setMode(it.cmd); window.dispatchEvent(new CustomEvent("ua:mode-change", { detail: { mode: it.cmd } })); toast("已切到 " + it.desc, "ok"); clearComposer(); return; }
-  if (it.show?.startsWith("/model ")) { S.active = it.cmd; window.dispatchEvent(new CustomEvent("ua:model-change", { detail: { name: it.cmd } })); clearComposer(); return; }
-  if (it.show?.startsWith("/skill ")) {
-    const extra = txtEl().value.slice(txtEl().value.indexOf(" ") + 1).replace(it.cmd, "").trim();
-    setInput("请用 skill 工具加载「" + it.cmd + "」技能，然后照它说的做。" + (extra ? "另外：" + extra : ""));
-    return;
-  }
-  // 自定义命令：交给服务端展开（$ARGUMENTS / $1..$9 / @file），展开结果放回输入框让人过一眼
-  if (it.custom) {
+  const raw = it.cmd && String(it.cmd).startsWith("/") ? it.cmd : typedCmd;
+  // 带参数命令的候选（面板里列出的 /modelX、/permissionsX、/skillsX 项）：选中的那条本身就是参数，交给总入口——
+  // 与「把整条命令打全再回车」是同一条路（原先这里各写两行，/model 那条甚至只改内存不落盘）
+  if (it.paramCmd) {
     const line = txtEl().value.trim();
-    const args = line.includes(" ") ? line.slice(line.indexOf(" ") + 1).trim() : "";
-    api.expandCommand(it.custom, args)
-      .then((r) => { setInput(r.text); toast("已展开自定义命令「" + it.custom + "」（来自" + (r.kind || "?") + "），看一眼再回车", "ok"); })
-      .catch((e) => toast(e.message, "err"));
-    return;
+    const extra = it.paramCmd === "/skills" ? line.split(/\s+/).slice(2).join(" ").trim() : ""; // /skills：技能名后面跟的「额外要求」要带上
+    palClose();
+    if (!keepsComposer(it.paramCmd, it.cmd)) clearComposer();
+    return runCmd(it.paramCmd, it.cmd + (extra ? " " + extra : ""));
   }
-  switch (cmd) {
-    case "/new": clearComposer(); $("#newChat").click(); return;
-    case "/compact": clearComposer(); doCompact(); return;
-    case "/export": clearComposer(); exportSession(); return;
-    case "/thinking": clearComposer(); toggleThinking(); return;
-    case "/details": clearComposer(); toggleDetails(); return;
-    case "/check": clearComposer(); doCheck(""); return;
-    case "/goal": clearComposer(); doGoal(""); return;
-    // 不带参数的 /mode、/model：直接把对应弹层调出来（原来会清空输入框、什么都不发生，像个死键）
-    case "/mode": clearComposer(); openModePop(); return;
-    case "/model": clearComposer(); openModelPop(); return;
-    case "/remember": $("#txt").value = "/remember "; focusInput(); return;
-    case "/init": setInput("请通读工作区（用 fs_list / fs_search / fs_read），在工作区根目录生成一份 AGENTS.md：说明这个文件夹的用途、关键文件、常用命令和注意事项，精炼实用。"); return;
-    default: clearComposer(); showStatus(true);
-  }
+  // 自定义命令：交给服务端展开（$ARGUMENTS / $1..$9 / @文件），跟打字回车同一条路
+  const cst = customByName(txtEl().value);
+  if (cst) return expandCustom(cst, txtEl().value);
+  // 其余全部交给总入口（打完整命令回车走的是同一个）：带上输入框里已打的参数
+  const canon = resolveCmd(raw)?.cmd || raw;
+  const arg = v.includes(" ") ? v.slice(v.indexOf(" ") + 1).trim() : "";
+  palClose();
+  if (!canon.startsWith("/")) { clearComposer(); return showStatus(true); }
+  if (!keepsComposer(canon, arg)) clearComposer(); // 无参的 /rename、/memory、/skills 会把命令放进输入框，别先清
+  runCmd(canon, arg);
 }
 
 /* ================= 状态 / 压缩 / 导出 ================= */
 export async function doCompact(instruction = "") {
-  if (!S.sessionId) return toast("还没有会话，不需要压缩", "err");
+  // 判断改成"有没有对话内容"（/goal、/check 会为首页就地建会话，光看 sessionId 已经不准了）
+  if (!S.sessionId || !colEl().querySelector(".msg-user")) return toast("还没有对话内容，不需要压缩", "err");
   toast(instruction ? "正在压缩（按你的要求保住重点）…" : "正在压缩上下文…");
   try {
     const j = await api.compact(S.sessionId, S.active, instruction);
@@ -2057,7 +2320,7 @@ export async function doCompact(instruction = "") {
 
 // 导出当前会话为 Markdown：留个能带走、能搜索的记录
 async function exportSession() {
-  if (!S.sessionId) return toast("还没有会话可导出", "err");
+  if (!S.sessionId || !colEl().querySelector(".msg-user")) return toast("还没有对话内容可导出", "err");
   try {
     const j = await api.session(S.sessionId);
     const name = (S.title || "u-agent 会话").replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 40);
@@ -2096,22 +2359,31 @@ function sessionMarkdown(title, events) {
 }
 
 // 完成标准：设 / 看 / 清（/goal <内容>、/goal clear）
+// 有些命令（/goal、/check）要把结果记进会话日志，所以得先有会话 id。
+// 首页（还没聊过一句）用它们时不再拒绝：就地开一个会话 id——跟 sendMessage 里的懒创建同一条路子，
+// 之后第一条消息会接着这个会话走（领导 2026-10-16 报「第一句话就用 /goal 用不了」）。
+function ensureSessionId() {
+  if (!S.sessionId) S.sessionId = "s-" + Date.now().toString(36);
+  return S.sessionId;
+}
+
 export async function doGoal(arg) {
-  if (!S.sessionId) return toast("还没有会话，先聊一句再用 /goal", "err");
+  if (!S.sessionId && !String(arg || "").trim()) return toast("还没设完成标准。用法：/goal 测试全绿且 README 写清楚", "err");
+  const sid = ensureSessionId();
   const text = String(arg || "").trim();
   try {
     if (!text) {
-      const cur = await api.getGoal(S.sessionId);
+      const cur = await api.getGoal(sid);
       if (!cur.goal) return toast("还没设完成标准。用法：/goal 测试全绿且 README 写清楚", "err");
       toast("当前完成标准：" + cur.goal, "ok");
       renderGoalChip();
       return;
     }
     if (text === "clear" || text === "清除") {
-      await api.setGoal(S.sessionId, "");
+      await api.setGoal(sid, "");
       toast("已清除完成标准", "ok");
     } else {
-      await api.setGoal(S.sessionId, text);
+      await api.setGoal(sid, text);
       toast("已记下完成标准，它会一直做到真有实据为止", "ok");
     }
     renderGoalChip();
@@ -2140,10 +2412,14 @@ export async function renderGoalChip() {
 
 // 手动跑一次检查（/check 或设置里的「现在跑一次」）
 export async function doCheck(only = "") {
-  if (!S.sessionId) return toast("还没有会话，先随便聊一句再检查", "err");
+  const sid = ensureSessionId(); // 首页直接用 /check 也可以：结果会记进这个新会话
   toast("正在跑检查…");
   try {
-    const r = await api.check(S.sessionId, only);
+    const r = await api.check(sid, only);
+    // 首页直接 /check：让欢迎页让位（clearStream 是首条用户消息走的那条路），检查卡就是这条会话的第一条内容
+    const fromHome = $(".welcome") ? captureComposerTop() : null;
+    setHome(false);
+    if ($(".welcome")) { clearStream(); glideComposer(fromHome); }
     addCheckCard(r);
     toast(r.summary || (r.ok ? "检查通过" : "检查没过"), r.ok ? "ok" : "err");
   } catch (e) {

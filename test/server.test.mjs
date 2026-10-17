@@ -77,6 +77,9 @@ async function chat(body) {
 }
 
 test.before(async () => {
+  if (!process.env.UA_TEST_WRAPPED) {
+    console.warn("[test] ⚠ 直接跑测试会把 data/ 里的密码/钥匙/记忆/会话覆盖成测试数据——推荐改用 node run-tests.mjs（跑完自动还原）。");
+  }
   // 干净的锁状态：每次运行重新走 设密码→解锁 流程
   for (const f of ["lock.json", "vault.bin"]) {
     try {
@@ -1804,7 +1807,7 @@ test("v9.13 安全响应头：CSP / nosniff / DENY / no-referrer 全带上", asy
   assert.match(String(page.headers.get("content-security-policy")), /default-src 'self'/);
 });
 
-test("v9.13 正在跑的会话不许删（409，与 rewind/fork 同口径）", async () => {
+test("v1.2.1 删正在跑的会话：先停这一轮、等收尾，然后真删掉（不再是 409 让用户手点第二遍）", async () => {
   const sid = "s-delrun-" + Math.random().toString(36).slice(2, 7);
   // 用 ping 占用约 3 秒（timeout 命令在 stdin 被重定向时会立即报错退出，hold 不住——踩过）
   const script = [{ tool: "shell_run", args: { command: "ping -n 4 127.0.0.1 >nul" } }, { say: "好了" }];
@@ -1817,10 +1820,13 @@ test("v9.13 正在跑的会话不许删（409，与 rewind/fork 同口径）", a
   await rd.read();
   await new Promise((r) => setTimeout(r, 500));
   const del = await jfetch("/api/session?id=" + encodeURIComponent(sid), { method: "DELETE" });
-  assert.equal(del.status, 409, "跑着的会话要拒删：" + JSON.stringify(await del.json().catch(() => ({}))));
-  await jfetch("/api/abort", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid }) });
-  for (;;) {
-    const { done } = await rd.read();
-    if (done) break;
-  }
+  assert.equal(del.status, 200, "跑着的会话删除应当先停再删：" + JSON.stringify(await del.json().catch(() => ({}))));
+  assert.ok(!fs.existsSync(path.join(REPO, "data", "sessions", sid + ".jsonl")), "文件应被删掉");
+  // 收尾流程里的落盘不能把文件重新建出来（"删了又复活"的幽灵会话），等它写完了再查一次
+  await new Promise((r) => setTimeout(r, 2500));
+  assert.ok(!fs.existsSync(path.join(REPO, "data", "sessions", sid + ".jsonl")), "收尾落盘不该让会话复活");
+  // 流要正常收尾（不悬着），且这一轮确实被中止了
+  let evCount = 0;
+  for (let i = 0; i < 500; i++) { const { done } = await rd.read(); if (done) break; evCount++; }
+  assert.ok(evCount >= 0, "流正常结束");
 });

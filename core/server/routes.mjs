@@ -643,10 +643,16 @@ export async function handleRequest(req, res) {
     }
     if (req.method === "DELETE" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
+      // 正在跑：先停掉这一轮，等它把收尾写完（≤3 秒）再删——用户点删除就是要删掉，
+      // 不该让人「等一两秒再点一次」（旧行为回 409 等用户手点第二遍，领导报过两次删不掉）。
+      // 必须等 running 摘锁再删：收尾流程里的 append 会把文件重新建出来（删了又「复活」）。
       if (running.has(id)) {
-        // 正在跑：顺手把这一轮停掉再拒（旧行为只回 409，前端还把失败吞了、谎报"已删除"——领导报"无法删除对话"）
         try { running.get(id)?.abort?.abort(); } catch {}
-        return sendJson(res, 409, { error: "这个会话正在跑——已顺手帮你停止这一轮，等一两秒再点一次删除即可" });
+        const t0 = Date.now();
+        while (running.has(id) && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 100));
+        if (running.has(id)) {
+          return sendJson(res, 409, { error: "这个会话还在跑，而且这会儿没停下来（多半卡在模型响应上）——等它自己超时结束（最多两分钟）再删一次" });
+        }
       }
       try {
         fs.rmSync(sessions.fileOf(id), { force: true });
@@ -654,6 +660,11 @@ export async function handleRequest(req, res) {
         return sendJson(res, 404, { error: "会话不存在" });
       }
       checkpoints.drop(id); // 会话没了，它的检查点也没有意义
+      const titles = loadTitles();
+      if (titles[id] !== undefined) {
+        delete titles[id];
+        saveTitles(titles); // 顺手清标题，别留孤儿条目
+      }
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === "GET" && u.pathname === "/api/session") {

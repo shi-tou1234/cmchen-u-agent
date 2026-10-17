@@ -2,7 +2,7 @@
 // 原生 select 放不下说明文字也不好搜，改成弹出面板：可搜索、可键盘操作、带厂商标记与状态
 import { S, setMode, MODES } from "./state.js";
 import { api } from "./api.js";
-import { $, $$, el, esc, icon, toast } from "./ui.js";
+import { $, $$, el, esc, icon, toast, hideOverlay, showOverlay } from "./ui.js";
 import { matchPreset } from "./catalog.js";
 import { t, getLang } from "./i18n.js";
 
@@ -25,13 +25,27 @@ function closeAll(except) {
     if (pop === except) continue;
     const node = $(pop);
     if (!node) continue;
-    node.hidden = true;
+    hideOverlay(node); // 退场动效：先播 140ms 再 hidden（见 ui.js）
     $(btn).setAttribute("aria-expanded", "false");
   }
 }
+// 弹层别顶出窗口：输入框那排的弹层是"朝上开"的（bottom:100%），home 布局里输入框在屏幕中间，
+// 通道/模型一多就会超出窗口上沿（点不到、要滚也没得滚）。打开后按实际位置给 .pop-body 补一个限高。
+function clampPop(pop) {
+  const body = pop.querySelector(".pop-body");
+  if (!body) return;
+  body.style.maxHeight = "";
+  const b = pop.getBoundingClientRect();
+  const over = Math.max(0, Math.round(8 - b.top), Math.round(b.bottom - (innerHeight - 8)));
+  if (!over) return;
+  const cur = body.getBoundingClientRect().height;
+  body.style.maxHeight = Math.max(120, Math.round(cur - over)) + "px";
+}
+
 function openPop(btnSel, popSel) {
   closeAll(popSel);
-  $(popSel).hidden = false;
+  showOverlay($(popSel));
+  clampPop($(popSel));
   $(btnSel).setAttribute("aria-expanded", "true");
   const q = $(popSel).querySelector("input");
   if (q) { q.value = ""; q.focus(); }
@@ -94,14 +108,11 @@ function renderModelList() {
   }
   box.innerHTML = list
     .map(({ p, i }) => {
-      const preset = matchPreset(p);
       const ready = providerReady(p);
-      return `<button class="pop-item ${p.name === S.active ? "on" : ""}" data-i="${i}" role="option">
+      // 只显示厂商（2026-10-17 领导：模型名每天都在变、写着就是过时的；要看具体模型去设置里看）
+      return `<button class="pop-item ${p.name === S.active ? "on" : ""}" data-i="${i}" role="option" title="${esc(p.model || "未填模型")}">
         ${brandChip(p)}
-        <span class="pop-main">
-          <b>${esc(p.name)}</b>
-          <span class="pop-sub">${esc(p.model || "未填模型")}${preset ? " · " + esc(preset.name) : ""}</span>
-        </span>
+        <span class="pop-main"><b>${esc(p.name)}</b></span>
         <span class="pop-dot ${ready ? "ok" : "warn"}" title="${ready ? "能用" : "还没填钥匙或模型"}"></span>
         ${p.name === S.active ? icon("check", "ic ic-sm") : ""}
       </button>`;
@@ -324,6 +335,17 @@ async function pickDepth(level) {
 }
 
 export function openDepthPop() { openPop("#depthBtn", "#depthPop"); }
+// 给 /model <名>、/effort <档位> 这类"带参数的命令"用：与面板点选走同一条路（含落盘与事件）
+export const pickProviderByName = (name) => {
+  const i = S.providers.findIndex((p) => p.name === name);
+  return i >= 0 ? pickProvider(i) : false;
+};
+export const pickDepthByValue = (v) => pickDepth(v);
+// 给 /effort <档位> 用：当前通道的合法档位（空数组 = 拿不到清单，那就别拦）
+export async function depthLevels() {
+  const info = await depthInfoOf(activeProvider());
+  return info.levels || [];
+}
 
 /* ---------- 绑定 ---------- */
 // 给 /model、/mode 命令用：输入框里打命令也能直接调出这两个弹层（原来会走 palPick 的 default 分支清空输入框、什么都不发生）
