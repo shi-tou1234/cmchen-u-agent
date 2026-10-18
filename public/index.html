@@ -104,17 +104,17 @@
     <p class="gate-sub" id="lkSub">所有配置与会话都留在这只 U 盘里，换台电脑不用重配</p>
     <p class="gate-note" id="lkDisk" hidden></p>
     <label class="field" id="lkWrap1" hidden>
-      <span class="field-label">设置启动密码</span>
+      <span class="field-label" data-i18n="lock.setPw">设置启动密码</span>
       <span class="pw-wrap">
-        <input class="input" id="lkPw1" type="password" placeholder="至少 4 位" autocomplete="new-password">
+        <input class="input" id="lkPw1" type="password" data-i18n-ph="lock.setPwPh" placeholder="至少 4 位" autocomplete="new-password">
         <span class="pw-lead" aria-hidden="true">&gt;</span>
         <button class="pw-eye" type="button" data-eye="lkPw1" aria-label="显示密码" title="显示密码"><svg class="ic ic-sm"><use href="#i-eye"/></svg></button>
       </span>
     </label>
     <label class="field" id="lkWrap2" hidden>
-      <span class="field-label">再输一遍</span>
+      <span class="field-label" data-i18n="lock.again">再输一遍</span>
       <span class="pw-wrap">
-        <input class="input" id="lkPw2" type="password" placeholder="确认密码" autocomplete="new-password">
+        <input class="input" id="lkPw2" type="password" data-i18n-ph="lock.againPh" placeholder="确认密码" autocomplete="new-password">
         <span class="pw-lead" aria-hidden="true">&gt;</span>
         <button class="pw-eye" type="button" data-eye="lkPw2" aria-label="显示密码" title="显示密码"><svg class="ic ic-sm"><use href="#i-eye"/></svg></button>
       </span>
@@ -134,7 +134,7 @@
       <p class="tips-title">小提示</p>
       <ol>
         <li>密码跟着这只盘走：换电脑、重装都一样，不用重新配置。</li>
-        <li>忘了密码：删掉 U 盘里的 <code>data\lock.json</code> 重新设一个即可（钥匙不受影响）。</li>
+        <li>忘了密码：只能把 U 盘里的 <code>data\lock.json</code> 与 <code>data\vault.bin</code> 一起删掉重设（已保存的钥匙会丢失）；只删 lock.json 会被拒绝，避免新密码覆盖旧钥匙库。</li>
       </ol>
     </div>
   </form>
@@ -241,7 +241,7 @@
             <div class="pop pop-up pop-model" id="modelPop" hidden>
               <div class="pop-search"><svg class="ic ic-sm"><use href="#i-search"/></svg><input placeholder="搜通道" autocomplete="off"></div>
               <div class="pop-body" id="modelList" role="listbox"></div>
-              <div class="pop-foot"><span class="pop-note" id="popNote"></span><button id="popManage"><svg class="ic ic-sm"><use href="#i-settings"/></svg>管理通道…</button></div>
+              <div class="pop-foot"><span class="pop-note" id="popNote"></span><button id="popManage"><svg class="ic ic-sm"><use href="#i-settings"/></svg><span data-i18n="composer.manage">管理通道…</span></button></div>
             </div>
           </div>
           <div class="pop-anchor">
@@ -306,7 +306,7 @@
               <div class="path-row">
                 <span class="path-icon"><svg class="ic"><use href="#i-folder-open"/></svg></span>
                 <input class="input path-input" id="wsInput" data-i18n-ph="gen.wsInputPh" placeholder="还没选，点右边「浏览」挑一个文件夹" spellcheck="false">
-                <button class="btn btn-ghost" id="wsBrowse"><svg class="ic"><use href="#i-folder"/></svg>浏览</button>
+                <button class="btn btn-ghost" id="wsBrowse"><svg class="ic"><use href="#i-folder"/></svg><span data-i18n="gen.browse">浏览</span></button>
               </div>
               <p class="field-help" id="wsHint"></p>
             </div>
@@ -321,7 +321,7 @@
               <div id="extraRoots" class="extra-roots"><span class="field-help">还没有 —— 点右边「添加目录」</span></div>
               <div class="row-between mt">
                 <span class="field-help">和主工作区同等对待；最多 10 个</span>
-                <button class="btn btn-ghost" id="extraAdd"><svg class="ic"><use href="#i-folder"/></svg>添加目录</button>
+                <button class="btn btn-ghost" id="extraAdd"><svg class="ic"><use href="#i-folder"/></svg><span data-i18n="gen.addDir">添加目录</span></button>
               </div>
             </div>
           </div>
@@ -337,9 +337,9 @@
               </label>
               <p class="field-help" data-i18n="gen.langDesc">界面语言只影响这台电脑；答话用哪种语言在「人格」面板里设</p>
               <div class="segmented mt" id="themeSeg" role="radiogroup" aria-label="主题">
-                <button data-theme="light"><svg class="ic ic-sm"><use href="#i-sun"/></svg><span data-i18n="gen.themeLight">浅色</span></button>
-                <button data-theme="dark"><svg class="ic ic-sm"><use href="#i-moon"/></svg><span data-i18n="gen.themeDark">深色</span></button>
-                <button data-theme="system"><svg class="ic ic-sm"><use href="#i-monitor"/></svg><span data-i18n="gen.themeSystem">跟随系统</span></button>
+                <button data-theme="light" role="radio" aria-checked="false"><svg class="ic ic-sm"><use href="#i-sun"/></svg><span data-i18n="gen.themeLight">浅色</span></button>
+                <button data-theme="dark" role="radio" aria-checked="false"><svg class="ic ic-sm"><use href="#i-moon"/></svg><span data-i18n="gen.themeDark">深色</span></button>
+                <button data-theme="system" role="radio" aria-checked="false"><svg class="ic ic-sm"><use href="#i-monitor"/></svg><span data-i18n="gen.themeSystem">跟随系统</span></button>
               </div>
             </div>
           </div>

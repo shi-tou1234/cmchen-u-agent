@@ -64,29 +64,31 @@ test("auto 模式：fs_delete（高危）直接拦截不执行", async () => {
   assert.ok(fs.existsSync(path.join(ws, "keep.txt")), "文件必须还在");
 });
 
-test("confirm 模式：fs_write 新文件（medium）自动执行；覆盖已有（high 动态风险）走确认", async () => {
+test("confirm 模式：写文件要过一次审（没勾「改文件」）；勾了才自动跑", async () => {
   const { r } = await freshRegistry();
   const ws = tmpDir();
   const script = [{ tool: "fs_write", args: { path: "n.txt", content: "new" } }];
   let evs = await collect(
-    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, mode: "confirm", registry: r }) })
+    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, mode: "confirm", registry: r, settings: { autoApprove: aa({}) } }) })
   );
-  assert.equal(evs.find((e) => e.type === "tool_call").gate, "run");
-  assert.ok(fs.existsSync(path.join(ws, "n.txt")));
+  // SEC-001：新建文件是 medium，但 confirm 档不能再静默放行——editFiles 没勾就得问
+  assert.equal(evs.find((e) => e.type === "tool_call").gate, "confirm", "新建文件也要过一次审");
+  assert.ok(fs.existsSync(path.join(ws, "n.txt")), "测试 ctx 自动批准，文件应已创建");
 
+  // 勾了「改文件」才回到自动放行（覆盖已有文件 = high，走开关而不是 medium 漏洞）
   const script2 = [{ tool: "fs_write", args: { path: "n.txt", content: "overwrite" }, say: "覆盖" }];
-  const asks = [];
   evs = await collect(
     runAgent({
       provider: { protocol: "mock" },
       messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script2) }],
       registry: r,
-      ctx: makeCtx({ workspace: ws, mode: "confirm", registry: r, confirmImpl: (info) => asks.push(info) || true }),
+      ctx: makeCtx({ workspace: ws, mode: "confirm", registry: r, settings: { autoApprove: aa({ editFiles: true }) } }),
     })
   );
-  assert.equal(evs.find((e) => e.type === "tool_call").gate, "confirm", "覆盖已有文件应为高危");
-  assert.equal(asks.length, 1);
-  assert.ok(fs.readFileSync(path.join(ws, "n.txt"), "utf8") === "overwrite");
+  const tc = evs.find((e) => e.type === "tool_call");
+  assert.equal(tc.gate, "run", "勾了「改文件」才自动放行");
+  assert.equal(tc.auto, true, "要标出是自动放行的");
+  assert.equal(fs.readFileSync(path.join(ws, "n.txt"), "utf8"), "overwrite");
 });
 
 test("计划模式系统提示词包含出计划指令", async () => {
@@ -121,6 +123,23 @@ test("安全命令：命令名再无害，越界路径 / .. / 裸 set·env 都�
   assert.ok(!isSafeCommand("set"), "裸 set（倒全部环境变量）不算只读");
   assert.ok(!isSafeCommand("env"), "裸 env 不算只读");
   assert.ok(!isSafeCommand("type C:\\Users\\me\\.ssh\\id_rsa | findstr KEY"), "复合命令里有一段越界就整条不算");
+  // SEC-009：.. 不在 token 起始、盘符相对路径也要拦住
+  assert.ok(!isSafeCommand("type sub\\..\\..\\secret.txt"), "路径中间的 .. 也要拦");
+  assert.ok(!isSafeCommand("cat ./../../secret.txt"), "POSIX 路径中间的 .. 也要拦");
+  assert.ok(!isSafeCommand("dir C:secret.txt"), "盘符相对路径（C:）不算只读");
+});
+
+test("SEC-001：confirm 档的写类动作不再被 medium 静默放行", () => {
+  // 没勾「改文件」：medium 的新建/编辑/建目录/提交都要问
+  for (const toolName of ["fs_write", "fs_edit", "fs_mkdir", "fs_move", "git_commit", "git_pull", "memory"]) {
+    assert.equal(gateWith("confirm", "medium", { toolName, autoApprove: aa({}) }).g, "confirm", `${toolName} 不该静默放行`);
+  }
+  // 勾了「改文件」才自动放行
+  assert.equal(gateWith("confirm", "medium", { toolName: "fs_write", autoApprove: aa({ editFiles: true }) }).g, "run");
+  // auto 档语义不变（medium 自动执行，high 才拦）
+  assert.equal(gateWith("auto", "medium", { toolName: "fs_write" }).g, "run");
+  // critical 依旧不能被开关放行
+  assert.equal(gateWith("confirm", "critical", { toolName: "fs_write", autoApprove: aa({ editFiles: true }) }).g, "confirm");
 });
 
 test("v7 gateWith：套餐没要求确认时，开关不起作用", () => {

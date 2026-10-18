@@ -82,7 +82,7 @@ async function main() {
   await verifyZip(zip);
 
   fs.mkdirSync(NODE_DIR, { recursive: true });
-  log("解压到 runtime\\node（U 盘小文件写入，约 1-2 分钟）…");
+  log("解压 node.exe 到 runtime\\node（只取运行时，几百毫秒）…");
   extractZip(zip, NODE_DIR);
 
   const exe = path.join(NODE_DIR, "node.exe");
@@ -95,8 +95,20 @@ async function main() {
 }
 
 function extractZip(zip, dest) {
-  // 优先系统 tar（bsdtar 能识别 zip），失败退回 PowerShell
-  let r = spawnSync("tar", ["-xf", zip, "-C", dest], { timeout: 600000 });
+  // 优先系统 tar（bsdtar 能识别 zip），并且只解 node.exe + LICENSE——
+  // 整个 zip 里还有 npm/corepack（~94MB / 2299 个文件），在 FAT32 U 盘上逐个小文件写很慢（PERF-003）。
+  // 失败就整包解压，功能不受影响。
+  const inner = `node-v${VER}-win-x64`;
+  let r = spawnSync("tar", ["-xf", zip, "-C", dest, `${inner}/node.exe`, `${inner}/LICENSE`], { timeout: 600000 });
+  const keptExe = path.join(dest, inner, "node.exe");
+  if (r.status === 0 && fs.existsSync(keptExe)) {
+    fs.copyFileSync(keptExe, path.join(dest, "node.exe"));
+    const lic = path.join(dest, inner, "LICENSE");
+    if (fs.existsSync(lic)) fs.copyFileSync(lic, path.join(dest, "LICENSE"));
+    fs.rmSync(path.join(dest, inner), { recursive: true, force: true });
+    return;
+  }
+  r = spawnSync("tar", ["-xf", zip, "-C", dest], { timeout: 600000 });
   if (r.status === 0 && fs.existsSync(path.join(dest, "node.exe"))) return;
   log("tar 解压不可用，改用 PowerShell Expand-Archive …");
   r = spawnSync(
@@ -105,10 +117,10 @@ function extractZip(zip, dest) {
     { timeout: 900000 }
   );
   // Expand-Archive 会多包一层 node-vX.Y.Z 目录，把内容提上来
-  const inner = path.join(dest, `node-v${VER}-win-x64`);
-  if (fs.existsSync(inner) && !fs.existsSync(path.join(dest, "node.exe"))) {
-    for (const f of fs.readdirSync(inner)) fs.renameSync(path.join(inner, f), path.join(dest, f));
-    fs.rmdirSync(inner);
+  const innerDir = path.join(dest, inner);
+  if (fs.existsSync(innerDir) && !fs.existsSync(path.join(dest, "node.exe"))) {
+    for (const f of fs.readdirSync(innerDir)) fs.renameSync(path.join(innerDir, f), path.join(dest, f));
+    fs.rmdirSync(innerDir);
   }
   if (!fs.existsSync(path.join(dest, "node.exe"))) throw new Error("解压失败（tar 与 PowerShell 都不行）");
 }

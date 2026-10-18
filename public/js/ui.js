@@ -57,6 +57,7 @@ export function toast(msg, type = "") {
 /* ---------- 浮层开合（2026-10-17） ----------
    [hidden] 是 display:none !important（theme.css 的兜底规则），过渡管不了它：进场走 CSS 的
    @starting-style，退场由这里挂 .closing 把退场动画播完再真正 hidden。时长与 --t-fast 对齐。 */
+const overlayReturn = new WeakMap(); // 打开弹层前焦点在哪：关闭时还回去（WCAG 2.4.3）
 export function hideOverlay(node, ms = 140) {
   if (!node || node.hidden || node.classList.contains("closing")) return;
   node.classList.add("closing");
@@ -65,11 +66,22 @@ export function hideOverlay(node, ms = 140) {
     node.classList.remove("closing");
     node.hidden = true;
     node._hideTimer = null;
+    const back = overlayReturn.get(node);
+    overlayReturn.delete(node);
+    // 延后一帧再还焦点：MutationObserver 先把下层/inert 恢复完，否则焦点会落到 still-inert 的节点上失败
+    if (back && back !== document.body && document.contains(back) && typeof back.focus === "function" && back.getClientRects().length) {
+      setTimeout(() => {
+        if (document.contains(back) && back.getClientRects().length) {
+          try { back.focus({ preventScroll: true }); } catch {}
+        }
+      }, 0);
+    }
   }, ms);
 }
 // 打开：顺手取消上一次还没播完的退场（不然那个定时器会把刚打开的又关上）
 export function showOverlay(node) {
   if (!node) return;
+  if (node.hidden) overlayReturn.set(node, document.activeElement); // 只在「从关到开」时记一次
   clearTimeout(node._hideTimer);
   node._hideTimer = null;
   node.classList.remove("closing");

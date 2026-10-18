@@ -2928,6 +2928,8 @@ export function initChat() {
   });
   window.addEventListener("beforeunload", saveDraftNow);
   txtEl().addEventListener("keydown", (e) => {
+    // 中文/日文输入法组合期间，回车是「选词」不是「发送」——不拦就会把半截输入发出去（UX-001）
+    if (e.isComposing || e.keyCode === 229) return;
     if (palOpen()) {
       if (e.key === "ArrowDown") { e.preventDefault(); palMoved = true; palIdx = (palIdx + 1) % pal.length; return palRender(); }
       if (e.key === "ArrowUp") { e.preventDefault(); palMoved = true; palIdx = (palIdx - 1 + pal.length) % pal.length; return palRender(); }

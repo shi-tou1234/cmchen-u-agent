@@ -364,6 +364,18 @@ function bindGlobal() {
     if (!app) return;
     const lockOn = !$("#lock")?.classList.contains("hide");
     app.toggleAttribute("inert", lockOn || overlayRoots.some((n) => !n.hidden));
+    // 嵌套弹层（A11Y-003）：上层开着时把下层置 inert，Tab 才不会从「目录/向导/确认框」
+    // 逃回后面的设置面板。按 DOM 顺序当成栈，越靠后越上层。
+    const stack = ["#setRoot", "#dirRoot", "#wizRoot", "#askRoot"];
+    for (let i = 0; i < stack.length; i++) {
+      const n = $(stack[i]);
+      if (!n) continue;
+      const above = stack.slice(i + 1).some((s) => {
+        const m = $(s);
+        return m && !m.hidden;
+      });
+      n.toggleAttribute("inert", above);
+    }
   };
   overlayMo = new MutationObserver(syncAppInert);
   overlayRoots.forEach((n) => overlayMo.observe(n, { attributes: true, attributeFilter: ["hidden"] }));

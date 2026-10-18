@@ -4,7 +4,7 @@
 export const MODES = ["confirm", "readonly", "plan", "auto", "full"];
 
 export const MODE_LABEL = {
-  confirm: "确认模式（高危需确认）",
+  confirm: "确认模式（改文件/高危需确认）",
   readonly: "只读模式",
   plan: "计划模式",
   auto: "自动审批（高危不执行）",
@@ -41,6 +41,7 @@ export const TOOL_CATEGORY = {
   fs_write: "write", fs_edit: "write", fs_mkdir: "write", fs_move: "write",
   git_commit: "write", git_pull: "write",
   fs_delete: "delete",
+  memory: "write", // 记忆写入是持久化的上下文注入，按「改文件」一类管（SEC-010）
   shell_run: "exec",
   web_search: "web", web_fetch: "web",
   spawn_subagent: "sub",
@@ -123,7 +124,9 @@ export function commandSegments(cmd) {
 
 // 「只读」也得看参数：命令名再无害，配上越界路径就是偷看（审查 #7 同族；领导 2026-10-15 复审点出）
 const ABS_PATH = /(^|[\s"'=])([a-zA-Z]:[\\/]|\\\\|\/(?!\/))/; // C:\ / \\server\ / 以 / 开头
-const DOTDOT = /(^|[\s"'=])\.\.([\\/]|$)/; // ..\ 或 ../
+const DOTDOT = /(^|[\s"'=])\.\.([\\/]|$)/; // ..\ 或 ../（token 起始）
+const DOTDOT_SEG = /(^|[\\/])\.\.([\\/]|$)/; // 任意位置的一段 ..（sub\..\..\x、./../../x）
+const DRIVE_REL = /(^|[\s"'=])[a-zA-Z]:(?![\\/])/; // C:secret.txt（盘符相对路径，不是绝对路径但照样越界）
 const ENV_DUMP = /^\s*(set|env)\s*$/i; // 裸 set（cmd 倒全部环境变量）/ 裸 env —— 环境变量里可能有钥匙
 export function isSafeCommand(cmd) {
   const segs = commandSegments(cmd);
@@ -132,7 +135,7 @@ export function isSafeCommand(cmd) {
   return segs.every((seg) => {
     if (seg.includes(">")) return false;
     if (RISKY_TOKEN.test(seg)) return false;
-    if (ABS_PATH.test(seg) || DOTDOT.test(seg)) return false; // type C:\Users\…\id_rsa、cat ../../secret 都不算只读
+    if (ABS_PATH.test(seg) || DOTDOT.test(seg) || DOTDOT_SEG.test(seg) || DRIVE_REL.test(seg)) return false; // type C:\Users\…\id_rsa、cat ../../secret 都不算只读
     if (ENV_DUMP.test(seg)) return false;
     return SAFE_CMD.test(seg);
   });
@@ -191,6 +194,10 @@ export function gateWith(mode, risk, opts = {}) {
   // 联网 / 派子任务：确认模式下也必须过一次审（勾了「联网」「子任务」开关才自动放）。
   // 审查 #6 实测：这俩是 low/medium，套餐判定直接 run，开关永远查不到——用户以为关了联网，agent 照样发包。
   if (base === "run" && mode === "confirm" && (cat === "web" || cat === "sub")) base = "confirm";
+  // 改文件 / 删文件同理：确认档里「新建文件」虽然是 medium，也不该绕过用户——
+  // 原先 medium 直接 run，「改文件」开关根本没被查询（SEC-001：静默写 .git/hooks 再提交 = 未确认执行）。
+  // 勾了「改文件」才自动放行；没勾就至少问一次。
+  if (base === "run" && mode === "confirm" && (cat === "write" || cat === "delete") && risk !== "low") base = "confirm";
   if (base !== "confirm") return { g: base, auto: false };
   // critical（agent 自查面）：细粒度开关没有资格放行，必须人来点
   if (risk === "critical") return { g: "confirm", auto: false, reason: "agent 自己的配置/代码/数据，必须人工确认" };

@@ -2,7 +2,7 @@
 // （2026-10-15 从 server.mjs 拆出；一个功能一个文件）
 import path from "node:path";
 import { normalizeBase } from "../providers.mjs";
-import { buildHistory, budgetOf, rewindRanges, isDropped, wasLastTurnAborted } from "../context.mjs";
+import { buildHistory, budgetOf, rewindRanges, isDropped, wasLastTurnAborted, estTokens, toolsTokensOf } from "../context.mjs";
 import { loadSkills, skillsPromptSection } from "../skills.mjs";
 import { MODES } from "../modes.mjs";
 import { loadHookSources, matchHooks, runHookBatch } from "../hooks.mjs";
@@ -16,7 +16,7 @@ import { LOG_TYPES, sendJson, sse, sseHead } from "./reply.mjs";
 import { pruneCheckpointsSoon, snapPathsOf } from "./checkpoints.mjs";
 import { GOAL_MAX_JUDGE, autoTitle, judgeGoal, lastGoal, pickAssist } from "./assist.mjs";
 import { agentRunWithOverflowRetry, autoCompactIfNeeded, compactSession, keepTokensOf, keepUserBudgetOf, patchCurrentUser } from "./compact.mjs";
-import { turnReminder } from "../agent/prompt.mjs";
+import { systemPrompt, turnReminder } from "../agent/prompt.mjs";
 async function handleChat(req, res, body) {
   const st = loadState();
   const sessionId = body.sessionId || sessions.create("s");
@@ -77,8 +77,28 @@ async function handleChat(req, res, body) {
     allowAnyPath: mode === "full", // 跟权限模式一起走（模式变了才变，正好和这段的位置一致）
     extraRoots: st.extraRoots,
   });
+  // PERF-001：上下文预算要算上「系统提示 + 工具 schema」这两块固定开销。
+  // 先在这里算一次（主循环复用同一份系统提示，避免重复拼），预算显示/压缩阈值才不会偏低。
+  const personaText = readPersona(); // 人格正文（空 = 不注入）
+  const agentsMdText = agentsMdOf(st.workspace);
+  const skillsText = skillsPromptSection(loadSkills({ workspace: st.workspace, uaHome: UA_HOME })); // 技能清单：只有名字与说明
+  const platformText = `${process.platform} ${process.arch}`;
+  const systemText = systemPrompt({
+    workspace: st.workspace,
+    platform: platformText,
+    agentsMd: agentsMdText,
+    skillsText,
+    allowAnyPath: mode === "full",
+    extraRoots: st.extraRoots,
+    provider,
+    persona: personaText,
+    voice: st.voice,
+  });
+  const promptOverheadTokens = estTokens(systemText) + toolsTokensOf(registry.list());
+  const limitsWithOverhead = { ...limits, overheadTokens: promptOverheadTokens };
+
   messages = [...history, { role: "user", text: outgoingText, reminder: turnReminderText, ...(images.length ? { images } : {}) }];
-  let budget = budgetOf(messages, limits);
+  let budget = budgetOf(messages, limitsWithOverhead);
   sessions.append(sessionId, { type: "mode", mode });
   sessions.append(sessionId, { type: "user", text, images });
   if (turnReminderText) sessions.append(sessionId, { type: "turn_context", text: turnReminderText }); // 与上面那条 user 成对（缓存前缀要逐字稳定）
@@ -88,13 +108,13 @@ async function handleChat(req, res, body) {
 
   // 上下文涨到阈值（默认 80%）就自动压缩一遍再问模型——别等模型报超限，也别让人手动盯着用量条
   try {
-    const auto = await autoCompactIfNeeded(sessionId, provider, st, limits);
+    const auto = await autoCompactIfNeeded(sessionId, provider, st, limitsWithOverhead);
     if (auto) {
       sse(res, { type: "compact", auto: true, before: auto.before, after: auto.after, summary: auto.summary });
       pastEvents = sessions.read(sessionId);
       history = buildHistory(pastEvents);
       messages = patchCurrentUser([...history], outgoingText, images); // 本轮消息贴在历史最后那条 user 上（摘要与留存的用户原文已在历史里）
-      budget = budgetOf(messages, limits);
+      budget = budgetOf(messages, limitsWithOverhead);
     }
   } catch {}
 
@@ -111,16 +131,19 @@ async function handleChat(req, res, body) {
     subDepth: 0,
     state: lastPlan ? { plan: lastPlan } : {},
     autoCount: 0, // 本轮连续自动放行的次数（上限到了就回来问）
+    platform: platformText,
     memory: readMemory(),
-    persona: readPersona(), // 人格正文（空 = 不注入）
+    persona: personaText, // 人格正文（空 = 不注入）
     voice: st.voice, // 表达风格三档（默认/简短/详细 …）
-    agentsMd: agentsMdOf(st.workspace),
-    skillsText: skillsPromptSection(loadSkills({ workspace: st.workspace, uaHome: UA_HOME })), // 技能清单：只有名字与说明
+    agentsMd: agentsMdText,
+    skillsText,
+    systemText, // 本轮系统提示（预算已按它算 overhead；主循环直接复用，逐字节一致）
+    promptOverheadTokens, // 系统提示 + 工具 schema 的固定 token 开销（PERF-001）
     checks: st.checks, // test / lint 命令（run_checks 工具与轮末自动检查共用）
     goal: lastGoal(sessionId), // 本次任务的完成标准（/goal 设的）
     note: resumeNote, // 「上一轮被手动停止」的提醒（已并进 turnReminderText）
     turnReminderText, // 本轮冻结的那段（与日志里那条 turn_context 逐字一致）
-    limits, // 当前模型的可用 token 预算（get_context_remaining 工具用它算余量）
+    limits: limitsWithOverhead, // 当前模型的可用 token 预算（get_context_remaining 工具用它算余量）
     jobLogDir: path.join(DATA, "jobs"), // 后台任务的输出落这里
 
     sessionId,
@@ -144,7 +167,7 @@ async function handleChat(req, res, body) {
         try {
           const msgs = buildHistory(sessions.read(sessionId));
           if (msgs.length < 3) return null;
-          const b = budgetOf(msgs, limits);
+          const b = budgetOf(msgs, limitsWithOverhead);
           if (b.tokens < b.limitTokens * threshold) return null;
           const p = pickAssist(st, provider);
           if (!p) return null; // 没有可用模型（离线演示）就不硬压
@@ -152,7 +175,7 @@ async function handleChat(req, res, body) {
           used++;
           lastAt = step;
           const rebuilt = patchCurrentUser(buildHistory(sessions.read(sessionId)), outgoingText, images);
-          return { messages: rebuilt, before: r.before, after: budgetOf(rebuilt, limits), summary: r.summary };
+          return { messages: rebuilt, before: r.before, after: budgetOf(rebuilt, limitsWithOverhead), summary: r.summary };
         } catch {
           return null; // 压缩失败就当没发生，绝不挡住这一轮
         }
@@ -346,7 +369,7 @@ async function handleChat(req, res, body) {
     running.delete(sessionId);
     // 一轮跑完上下文又长了：把最新的预算推回去，前端那根用量条才是活的
     try {
-      sse(res, { type: "budget", budget: budgetOf(buildHistory(sessions.read(sessionId)), limits), context });
+      sse(res, { type: "budget", budget: budgetOf(buildHistory(sessions.read(sessionId)), limitsWithOverhead), context });
     } catch {}
     sse(res, { type: "stream_end", sessionId });
     res.end();

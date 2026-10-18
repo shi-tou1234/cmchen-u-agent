@@ -20,7 +20,7 @@ test("端到端：Mock 两步剧本创建文件并汇报", async () => {
     { say: "已创建 hello.txt，内容是「你好，来自 u-agent」。" },
   ];
   const evs = await collect(
-    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, registry: r, mode: "confirm" }) })
+    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, registry: r, mode: "confirm", settings: { autoApprove: { enabled: true, actions: { editFiles: true } } } }) })
   );
   assert.equal(fs.readFileSync(path.join(ws, "hello.txt"), "utf8"), "你好，来自 u-agent");
   const done = evs.at(-1);

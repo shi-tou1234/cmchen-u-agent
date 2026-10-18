@@ -64,16 +64,35 @@ export function resolveInside(roots, p, cwd) {
 // public/ 换界面、.git 埋钩子……（审查报告 H5：U 盘可写 → 持久化提权）。
 // 命中这些路径的文件类工具风险按 critical 处理：即使「新建文件」也不许静默放行（低权限模式下必须人来点头）。
 const SELF_SURFACE = [".agent", "data", "tools", "core", "public", "runtime", ".git", "server.mjs", "launcher.mjs", "setup.mjs", "启动U-Agent.bat", "config.json", "VERSIONS.json"];
-export function isSelfSurface(p, ctx) {
-  const home = ctx?.uaHome;
-  if (!home || !p) return false;
-  const h = path.resolve(home).toLowerCase().replace(/[\\/]+$/, "");
-  const c = path.resolve(String(p)).toLowerCase();
-  if (!(c === h || c.startsWith(h + "\\") || c.startsWith(h + "/"))) return false;
-  const rel = path.relative(h, c).replace(/\\/g, "/");
-  // rel 归一成小写，清单也要按小写比——不然 VERSIONS.json / 启动U-Agent.bat 这两条会哑
-  return SELF_SURFACE.some((s) => {
+// 工作区自身也有「一改就能在宿主上执行」的面：.git/hooks、.agent/hooks.json、.vscode/tasks.json、
+// .husky/*、.github/workflows/*。SEC-001 的 PoC 就是往工作区 .git/hooks 里写 pre-commit——
+// 这些路径必须和 agent 自查面同等对待（critical），不能只认 uaHome。
+const WORKSPACE_SELF_SURFACE = [".git", ".agent", ".husky", ".vscode", ".github"];
+
+function hitSurface(c, root, list) {
+  if (!root) return false;
+  const r = path.resolve(root).toLowerCase().replace(/[\\/]+$/, "");
+  if (!(c === r || c.startsWith(r + "\\") || c.startsWith(r + "/"))) return false;
+  const rel = path.relative(r, c).replace(/\\/g, "/");
+  return list.some((s) => {
     const t = s.toLowerCase();
     return rel === t || rel.startsWith(t + "/");
   });
+}
+
+export function isSelfSurface(p, ctx) {
+  if (!p) return false;
+  const c = path.resolve(String(p)).toLowerCase();
+  // rel 归一成小写，清单也要按小写比——不然 VERSIONS.json / 启动U-Agent.bat 这两条会哑
+  return hitSurface(c, ctx?.uaHome, SELF_SURFACE) || hitSurface(c, ctx?.workspace, WORKSPACE_SELF_SURFACE);
+}
+
+// 新建/编辑「本身就可能被执行」的文件：脚本与构建入口。新建=medium 的口子不能拿来落载荷
+// （SEC-001 的变体：往工作区写 .bat / 改 package.json 的 scripts，等一次 git/npm 就执行）。
+const EXEC_EXT = /\.(bat|cmd|ps1|psm1|vbs|vbe|hta|scr|lnk|url|reg|exe|dll|com|msi|jar|sh)$/i;
+const BUILD_ENTRY = /(^|[\\/])(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.npmrc|\.yarnrc|makefile|gnumakefile|cmakelists\.txt|dockerfile|docker-compose\.ya?ml|setup\.py|pyproject\.toml|requirements\.txt|\.gitconfig|\.gitattributes|\.gitmodules)$/i;
+const SCRIPT_DIR = /(^|[\\/])\.(git|agent|husky)([\\/]|$)/i;
+export function isExecutablePath(p) {
+  const s = String(p || "").replace(/\\/g, "/");
+  return EXEC_EXT.test(s) || BUILD_ENTRY.test(s) || SCRIPT_DIR.test(s);
 }

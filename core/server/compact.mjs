@@ -7,18 +7,25 @@ import { DEFAULT_KEEP_TOKENS, VERSION, registry, sessions } from "./runtime.mjs"
 import { limitsOf } from "./state.mjs";
 import { pickAssist } from "./assist.mjs";
 const KEEP_USER_TOKENS = 12000;
+// 真正能留给「对话正文」的预算：扣掉系统提示 + 工具 schema 的固定开销（PERF-001），
+// 小窗口模型才不会按全额算保留量、压不下去。
+function usableLimitOf(limits) {
+  const total = Number(limits?.limitTokens) || 150000;
+  const overhead = Math.max(0, Number(limits?.overheadTokens) || 0);
+  return Math.max(0, total - overhead);
+}
 // 压缩时保留最近多少 token 的原文（设置 → 上下文里可调；默认 15000，照 OpenCode 的 compaction.keep）
 function keepTokensOf(st, limits) {
   const n = Number(st?.keepTokens);
   const want = !Number.isFinite(n) || n < 0 ? DEFAULT_KEEP_TOKENS : Math.min(Math.round(n), 100000);
   // 再按这个模型的可用预算封顶（最多留 1/4）：小窗口模型别被默认 15k 的保留量撑住、压不下去
-  const cap = Math.round(((Number(limits?.limitTokens) || 150000) * 0.25));
+  const cap = Math.round(usableLimitOf(limits) * 0.25);
   return Math.max(0, Math.min(want, cap));
 }
 
 // 保留预算按「主模型」算（不是压缩用的轻量通道——轻量通道认不出模型时会退回默认大预算，把上限带偏）
 function keepUserBudgetOf(limits) {
-  return Math.max(2000, Math.min(KEEP_USER_TOKENS, Math.round((Number(limits?.limitTokens) || 150000) * 0.1)));
+  return Math.max(2000, Math.min(KEEP_USER_TOKENS, Math.round(usableLimitOf(limits) * 0.1)));
 }
 
 // 「上下文超限」的兜底识别：各家措辞不同，尽量都认（压缩重试与溢出兜底都用它）

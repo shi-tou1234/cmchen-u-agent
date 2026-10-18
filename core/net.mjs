@@ -128,11 +128,32 @@ function fetchDirect(rawUrl, { timeoutMs, headers, maxBytes, redirects, guard })
 // 内网/保留地址判定（防 SSRF，审查报告 H3）：字面 IP 与明显的本机名直接拦。
 // 域名解析（DNS 重绑定）不在射程内——本工具的主威胁是「网页内容里的注入指令」，
 // 那类攻击用不着域名。真要访问本机服务，让用户走 shell_run（有审批和黑名单）。
+// IPv4-mapped IPv6 的十六进制分组 → 点分 IPv4（::ffff:7f00:1 → 127.0.0.1）。
+// 只认最后两组；不是合法十六进制就返回空串（交给外层判非内网）。
+function mappedV4(rest) {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(rest)) return rest;
+  const groups = rest.split(":").filter(Boolean).slice(-2);
+  if (!groups.length) return "";
+  const vals = groups.map((g) => (/^[0-9a-f]{1,4}$/i.test(g) ? parseInt(g, 16) : NaN));
+  if (vals.some((n) => !Number.isFinite(n))) return "";
+  const v4 = vals.length === 1 ? vals[0] : ((vals[0] << 16) >>> 0) + vals[1];
+  if (v4 < 0 || v4 > 0xffffffff) return "";
+  return [24, 16, 8, 0].map((s) => (v4 >>> s) & 255).join(".");
+}
+
 export function isPrivateHost(hostname) {
-  const h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  let h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  h = h.replace(/\.+$/, ""); // 尾点：localhost. / 127.0.0.1. 都是同一个地址（SEC-005）
   if (!h) return true;
   if (h === "localhost" || h.endsWith(".localhost") || h === "0") return true;
   if (h === "::1" || h === "::" || h === "0:0:0:0:0:0:0:1") return true;
+  // 纯数字 / 0x 十六进制形式的 IPv4（URL 解析器通常已归一，这里再兜一层）
+  if (/^\d+$/.test(h) || /^0x[0-9a-f]+$/i.test(h)) {
+    const n = /^0x/i.test(h) ? parseInt(h, 16) : Number(h);
+    if (Number.isFinite(n) && n >= 0 && n <= 0xffffffff) {
+      return isPrivateHost([24, 16, 8, 0].map((s) => (n >>> s) & 255).join("."));
+    }
+  }
   const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (m) {
     const a = Number(m[1]);
@@ -147,8 +168,12 @@ export function isPrivateHost(hostname) {
   if (h.includes(":")) {
     if (/^f[cd][0-9a-f]{2}:/.test(h)) return true; // fc00::/7 内网段
     if (/^fe[89ab][0-9a-f]:/.test(h)) return true; // fe80::/10 link-local
-    const v4 = h.match(/::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-    if (v4) return isPrivateHost(v4[1]); // IPv4 映射地址
+    // IPv4 映射/兼容地址：::ffff:127.0.0.1、::ffff:7f00:1、::127.0.0.1 等
+    const mapped = h.match(/^::(?:ffff:)?(.+)$/i);
+    if (mapped) {
+      const v4 = mappedV4(mapped[1]);
+      if (v4) return isPrivateHost(v4);
+    }
     return false;
   }
   return false;

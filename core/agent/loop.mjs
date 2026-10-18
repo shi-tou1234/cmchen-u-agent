@@ -82,7 +82,7 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
       //   ① 系统提示词每步都重算，但只放"基本不变"的东西 —— 跨轮逐字节一致；
       //   ② 会变的那段（计划/模式/记忆/时间）由 turnReminder 贴在最新一条用户消息后面，
       //      一个用户轮次只算一次（冻结），且不改 history 本体（也就不会写进会话日志）。
-      if (sysText === null) sysText = systemPrompt({ ...ctx, provider });
+      if (sysText === null) sysText = ctx.systemText || systemPrompt({ ...ctx, provider });
       if (reminder === null) reminder = ctx.turnReminderText ?? turnReminder(ctx); // 服务端给的那份与日志逐字一致；没有就自己算（测试/子代理路径）
       const stream = streamChat(provider, [{ role: "system", text: sysText }, ...withReminder(history, reminder)], toolList, ctx.signal);
       while (true) {
@@ -119,8 +119,9 @@ export async function* runAgent({ provider, messages, registry, ctx }) {
 
       history.push({ role: "assistant", text: roundText, toolCalls: ended.toolCalls, ...(thinkForHistory ? { thinking: thinkForHistory } : {}) });
 
-      // 给 get_context_remaining 用的实时预算（含刚回填的这一步）
-      ctx.budgetNow = () => budgetOf([{ role: "system", text: sysText || systemPrompt({ ...ctx, provider }) }, ...withReminder(history, reminder)], ctx.limits);
+      // 给 get_context_remaining 用的实时预算（含刚回填的这一步）。
+      // 系统提示 + 工具 schema 走 overheadTokens（与 chat 侧同一口径），别把系统提示再塞进 messages 重复计。
+      ctx.budgetNow = () => budgetOf(withReminder(history, reminder), { ...ctx.limits, overheadTokens: ctx.promptOverheadTokens });
 
       // ── 一轮里的多个工具调用 ──
       // 门禁判定、弹窗、检查点按顺序做（要排队、要追加写清单，必须串行）；

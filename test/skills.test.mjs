@@ -46,6 +46,22 @@ test("展开自定义命令：$ARGUMENTS / $1 / $2 / @file", () => {
   assert.ok(!/\$\d|ARGUMENTS/.test(bare), "没传参数就不该留下 $ 占位");
 });
 
+test("SEC-004：@file 越界（绝对路径 / ..）不读盘，原样保留", () => {
+  const { ws, usb } = fixture();
+  const outside = tmpDir("ua-sk-out-");
+  const secret = path.join(outside, "secret.txt");
+  fs.writeFileSync(secret, "TOP-SECRET", "utf8");
+  const cmd = { name: "probe", kind: "项目", template: `看看这个文件 @${secret}` };
+  const text = expandCommand(cmd, "", { workspace: ws, uaHome: usb });
+  assert.ok(!text.includes("TOP-SECRET"), "工作区外的文件不许读进上下文");
+  assert.ok(text.includes(`@${secret}`), "越界的 @ 要原样保留（不假装展开成功）");
+
+  const up = { name: "up", kind: "项目", template: "看看 @../../secret.txt" };
+  const t2 = expandCommand(up, "", { workspace: ws, uaHome: usb });
+  assert.ok(!t2.includes("TOP-SECRET"));
+  assert.match(t2, /@\.\.\/\.\.\/secret\.txt/, "越界路径原样保留");
+});
+
 test("技能：frontmatter 名字/说明、附件清单、渐进披露只给名字", () => {
   const { ws, usb } = fixture();
   const skills = loadSkills({ workspace: ws, uaHome: usb });

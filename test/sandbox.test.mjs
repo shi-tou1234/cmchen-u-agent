@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveInside, isSelfSurface, SandboxDenyError } from "../core/sandbox.mjs";
+import { resolveInside, isSelfSurface, isExecutablePath, SandboxDenyError } from "../core/sandbox.mjs";
 import { tmpDir } from "./helpers.mjs";
 
 test("白名单内相对/绝对路径放行", () => {
@@ -81,4 +81,27 @@ test("v9.12 isSelfSurface：命中 agent 自己身上（大小写不敏感），
   const miss = ["G:\\agent\\README.md", "G:\\agent\\docs\\x.md", "C:\\tmp\\x.txt", "G:\\agent-evil\\data\\x"];
   for (const p of miss) assert.equal(isSelfSurface(p, ctx), false, p);
   assert.equal(isSelfSurface("G:\\agent\\data\\x", {}), false, "没有 uaHome 就不判");
+});
+
+test("SEC-001 isSelfSurface：工作区里的 .git/.agent/.husky/.vscode 也算自查面", () => {
+  const ws = "G:\\proj\\demo";
+  const ctx = { uaHome: "G:\\agent", workspace: ws };
+  const hit = [
+    "G:\\proj\\demo\\.git\\hooks\\pre-commit",
+    "g:\\proj\\demo\\.GIT\\config",
+    "G:\\proj\\demo\\.agent\\hooks.json",
+    "G:\\proj\\demo\\.husky\\pre-commit",
+    "G:\\proj\\demo\\.vscode\\tasks.json",
+    "G:\\proj\\demo\\.github\\workflows\\ci.yml",
+  ];
+  for (const p of hit) assert.equal(isSelfSurface(p, ctx), true, p);
+  const miss = ["G:\\proj\\demo\\src\\index.js", "G:\\proj\\demo\\README.md", "G:\\proj\\demo2\\.git\\config"];
+  for (const p of miss) assert.equal(isSelfSurface(p, ctx), false, p);
+});
+
+test("SEC-001 isExecutablePath：脚本与构建入口要认出来", () => {
+  const hit = ["build.bat", "tools\\run.ps1", "package.json", "Makefile", "Dockerfile", "setup.py", ".gitconfig"];
+  for (const p of hit) assert.equal(isExecutablePath(p), true, p);
+  const miss = ["src/index.js", "docs/readme.md", "普通.txt", "src/hooks/useThing.js"];
+  for (const p of miss) assert.equal(isExecutablePath(p), false, p);
 });

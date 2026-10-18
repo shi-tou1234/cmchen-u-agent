@@ -1,19 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
-import { resolveInside, rootsOf, isSelfSurface } from "../core/sandbox.mjs";
+import { resolveInside, rootsOf, isSelfSurface, isExecutablePath } from "../core/sandbox.mjs";
 import { makeDiff, diffStat } from "../core/diff.mjs";
 import { truncate, decodeTextSmart } from "../core/util.mjs";
 
 export default {
   name: "fs_write",
   description: "写文件（UTF-8）。覆盖已存在的文件属于高危操作，需要审批",
-  // 动态风险：新建=medium，覆盖=high；命中 agent 自查面（.agent/data/tools/core/runtime…）
-  // 一律 critical——低权限模式下连「静默新建」都不许（审查报告 H5 的持久化提权链就靠这个口子）
+  // 动态风险：新建=medium（脚本/构建入口例外，升 high），覆盖=high；命中 agent 自查面
+  // （.agent/data/tools/core/runtime…）或工作区里的 .git/.husky/.vscode 一律 critical——
+  // 低权限模式下连「静默新建」都不许（SEC-001 的持久化提权链就靠这个口子）
   risk: (args, ctx) => {
     try {
       const p = resolveInside(rootsOf(ctx), args?.path, ctx.workspace);
       if (isSelfSurface(p, ctx)) return "critical";
-      return fs.existsSync(p) ? "high" : "medium";
+      if (fs.existsSync(p)) return "high";
+      return isExecutablePath(p) ? "high" : "medium";
     } catch {
       return "high";
     }

@@ -2,16 +2,23 @@
 
 // token 估算：中日韩字符基本 1 字 = 1 token，其余文字约 3.6 字符 = 1 token。
 // （原来一律按 2.5 字/token 估，中文场景会低估、代码场景会高估，两个方向都影响压缩时机）
-const CJK_RE = /[\u2E80-\uD7FF\uF900-\uFAFF\uFF00-\uFFEF]/;
+// 逐字符 CJK_RE.test 在大会话里是热点（PERF-002）：改成一次性全局匹配，行为不变、常数小一截。
+const CJK_G = /[\u2E80-\uD7FF\uF900-\uFAFF\uFF00-\uFFEF]/g;
 export function estTokens(text) {
   const s = String(text ?? "");
-  let cjk = 0;
-  let n = 0;
-  for (const ch of s) {
-    n++;
-    if (CJK_RE.test(ch)) cjk++;
-  }
-  return Math.ceil(cjk + (n - cjk) / 3.6);
+  const cjk = (s.match(CJK_G) || []).length;
+  return Math.ceil(cjk + (s.length - cjk) / 3.6);
+}
+
+// 每轮请求里「不随消息增长」的固定开销：系统提示 + 工具 schema（+ 兜底余量）。
+// PERF-001 实测约 3.5k token（28 工具 ≈3.1k + 系统提示 ≈1.5k），原先 budgetOf 完全没算，
+// 导致逼近窗口时压缩偏晚、provider 400/截断。这里给一个保守基线；chat 侧会把精确值传进来。
+export const DEFAULT_OVERHEAD_TOKENS = 3500;
+
+// 工具 schema 的 token 估算（三种协议的字段名略有差异，按公共字段序列化足够近似）
+export function toolsTokensOf(tools) {
+  if (!tools?.length) return 0;
+  return estTokens(JSON.stringify(tools.map((t) => ({ name: t.name, description: t.description, params: t.params }))));
 }
 
 // 兜底预算（认不出模型时用）：≈ 200k 窗口留 25% 给输出与工具结果
@@ -245,15 +252,21 @@ export function wasLastTurnAborted(events) {
 }
 
 // 预算：按「这个模型真实能吃多少 token」算占比，而不是拿一个写死的字数上限吓唬人。
-// opts: { limitTokens 可用预算, windowTokens 模型窗口 }
+// opts: { limitTokens 可用预算, windowTokens 模型窗口, overheadTokens 固定开销 }
 export function budgetOf(messages, opts = {}) {
   const limitTokens = Number(opts.limitTokens) > 0 ? Number(opts.limitTokens) : DEFAULT_LIMIT_TOKENS;
   const windowTokens = Number(opts.windowTokens) > 0 ? Number(opts.windowTokens) : limitTokens;
+  const overheadTokens = Number.isFinite(Number(opts.overheadTokens)) && Number(opts.overheadTokens) >= 0 ? Number(opts.overheadTokens) : DEFAULT_OVERHEAD_TOKENS;
   let chars = 0;
-  let tokens = 0;
+  let tokens = overheadTokens;
   for (const m of messages || []) {
     chars += (m.text || "").length;
     tokens += estTokens(m.text) + 4; // 每条消息一点固定开销
+    // 每轮补充（时间/模式/计划/记忆）也是真实请求的一部分，原先漏算（PERF-001）
+    if (m.reminder) {
+      chars += m.reminder.length;
+      tokens += estTokens(m.reminder);
+    }
     if (m.toolCalls?.length) {
       const j = JSON.stringify(m.toolCalls);
       chars += j.length;
@@ -270,6 +283,7 @@ export function budgetOf(messages, opts = {}) {
     tokens,
     limitTokens,
     windowTokens,
+    overheadTokens,
     pct,
     warn: tokens > limitTokens * 0.8, // 到 80% 就该提醒压缩了
     over: tokens > limitTokens,

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { resolveInside, rootsOf, isSelfSurface } from "../core/sandbox.mjs";
+import { resolveInside, rootsOf, isSelfSurface, isExecutablePath } from "../core/sandbox.mjs";
 import { decodeTextSmart } from "../core/util.mjs";
 
 // 读入 + 编码嗅探：UTF-8 解析不了就按 GBK 解（中文 Windows 的 .txt/.bat/.ini 很常见）。
@@ -14,11 +14,13 @@ function readForEdit(p) {
 export default {
   name: "fs_edit",
   description: "局部替换文本：old 必须在文件中恰好出现一次，否则拒绝",
-  // 命中 agent 自查面（.agent/data/tools/core/runtime…）按 critical：编辑它 = 改下次启动的 agent 本体
+  // 命中 agent 自查面（.agent/data/tools/core/runtime…）按 critical：编辑它 = 改下次启动的 agent 本体。
+  // 脚本/构建入口（.bat、package.json…）按 high：改一行就可能变成下次执行的载荷
   risk: (args, ctx) => {
     try {
       const p = resolveInside(rootsOf(ctx), args?.path, ctx.workspace);
-      return isSelfSurface(p, ctx) ? "critical" : "medium";
+      if (isSelfSurface(p, ctx)) return "critical";
+      return isExecutablePath(p) ? "high" : "medium";
     } catch {
       return "medium";
     }

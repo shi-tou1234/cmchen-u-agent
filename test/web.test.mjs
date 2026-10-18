@@ -96,6 +96,13 @@ test("v9.12 assertPublicUrl：本机/内网直接拒，公网放行", () => {
     "http://172.16.0.1/",
     "http://[::1]:9000/",
     "http://[fe80::1]/",
+    // SEC-005：尾点与 IPv4-mapped IPv6 的十六进制写法
+    "http://localhost./x",
+    "http://127.0.0.1./x",
+    "http://[::ffff:127.0.0.1]/",
+    "http://[::ffff:7f00:1]/",
+    "http://[::ffff:a9fe:a9fe]/",
+    "http://2130706433/",
     "ftp://example.com/",
   ]) {
     assert.throws(() => assertPublicUrl(u), /拦下|只支持/, u);

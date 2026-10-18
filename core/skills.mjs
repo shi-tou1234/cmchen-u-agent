@@ -7,6 +7,7 @@
 // 技能走「渐进披露」：系统提示里只放 name + description（各约几十 token），正文等模型调 skill 工具时才读。
 import fs from "node:fs";
 import path from "node:path";
+import { resolveInside } from "./sandbox.mjs";
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "out"]);
 
@@ -146,28 +147,31 @@ export function skillFiles(skill, limit = 30) {
   return out;
 }
 
-// 命令正文里的 @file 引用：把文件内容附进提示词（只读，不执行任何东西）
+// 命令正文里的 @file 引用：把文件内容附进提示词（只读，不执行任何东西）。
+// SEC-004：这里必须和 fs 工具走同一套沙箱——原先用 path.resolve，`@..\..\secret` 或绝对路径
+// 能把工作区/UA_HOME 之外的文件读进上下文（再经模型回显出去）。越界就原样保留 `@`，不读盘。
 function injectFiles(body, base, ctx) {
-  const files = [];
+  const roots = [ctx?.workspace, ctx?.uaHome, ...(ctx?.extraRoots || [])].filter(Boolean);
+  const allow = roots.length ? roots : [base];
+  const picked = [];
   const text = body.replace(/(^|\s)@([^\s@`"']+)/g, (all, sp, rel) => {
+    if (picked.length >= 4) return all;
     let abs;
     try {
-      abs = path.resolve(base, rel);
+      abs = resolveInside(allow, rel, base);
       const st = fs.statSync(abs);
       if (!st.isFile() || st.size > 65536) return all;
-      if (files.length >= 4) return all;
-      const content = fs.readFileSync(abs, "utf8");
-      files.push(rel);
+      picked.push({ rel, abs });
       return `${sp}${rel}`; // 原文里保留路径，内容附在末尾
     } catch {
       return all;
     }
   });
-  if (!files.length) return text;
-  const blocks = files
-    .map((rel) => {
+  if (!picked.length) return text;
+  const blocks = picked
+    .map(({ rel, abs }) => {
       try {
-        const content = fs.readFileSync(path.resolve(base, rel), "utf8").slice(0, 65536);
+        const content = fs.readFileSync(abs, "utf8").slice(0, 65536);
         return `【文件 ${rel}】\n\`\`\`\n${content}\n\`\`\``;
       } catch {
         return "";

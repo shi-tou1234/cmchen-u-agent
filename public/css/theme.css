@@ -20,10 +20,10 @@
   --surface: #fdf9f0;     /* 卡片 / 输入区 / 顶栏 */
   --surface-2: #f1e9d9;   /* 侧栏 / 次级面 */
   --elev: #fffcf6;        /* 弹层 / 浮层 */
-  /* 墨色三档（同一墨） */
+  /* 墨色三档（同一墨）。--faint 从 .46 提到 .64：原值对纸底只有 2.73:1，正文小字不达 AA（A11Y-002） */
   --fg: #2a2318;
-  --muted: rgba(42, 35, 24, .68);
-  --faint: rgba(42, 35, 24, .46);
+  --muted: rgba(42, 35, 24, .74);
+  --faint: rgba(42, 35, 24, .64);
   /* 交互态三档（叠在任意底色上都干净） */
   --hover: rgba(42, 35, 24, .05);
   --active: rgba(42, 35, 24, .085);
@@ -36,10 +36,10 @@
   --accent-hover: #74380e;
   --accent-fg: #fdf9f0;
   --accent-soft: rgba(139, 69, 19, .1);
-  --ok: #2f7d3a;
-  --ok-soft: rgba(47, 125, 58, .12);
-  --warn: #a67c00;
-  --warn-soft: rgba(166, 124, 0, .13);
+  --ok: #2c7537;
+  --ok-soft: rgba(44, 117, 55, .12);
+  --warn: #8a6600;
+  --warn-soft: rgba(138, 102, 0, .13);
   --danger: #b3382c;
   --danger-soft: rgba(179, 56, 44, .1);
   --diff-add: rgba(47, 125, 58, .12);
@@ -92,8 +92,8 @@
   --surface-2: #1b1611;
   --elev: #262019;
   --fg: #eae0d0;
-  --muted: rgba(234, 224, 208, .66);
-  --faint: rgba(234, 224, 208, .44);
+  --muted: rgba(234, 224, 208, .72);
+  --faint: rgba(234, 224, 208, .52);
   --hover: rgba(234, 224, 208, .05);
   --active: rgba(234, 224, 208, .085);
   --selected: rgba(234, 224, 208, .065);

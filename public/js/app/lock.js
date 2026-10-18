@@ -1,7 +1,7 @@
 // 登录页（密码锁）：设密码 / 解锁 / 冷却倒计时 / 显示密码 一个文件管完。
 // （2026-10-15 从 public/js/app.js 拆出；解锁成功后调用注入进来的 onUnlocked）
 import { api } from "../api.js";
-import { $, $$, icon, esc } from "../ui.js";
+import { $, $$, icon, esc, toast } from "../ui.js";
 import { t } from "../i18n.js";
 
 /* ================= 密码锁 =================
@@ -116,12 +116,16 @@ async function goLock() {
 
 async function unlock(pw) {
   try {
-    await api.unlock(pw);
+    const r = await api.unlock(pw);
     clearInterval(coolTimer);
     $("#lkGo").disabled = false;
     $("#lock").classList.add("hide");
     $("#app")?.removeAttribute("inert");
     onUnlocked();
+    // SEC-003：旧库迁移到密码派生 / 迁移失败时的明确提示（不打断进入）
+    if (r?.vaultMigrated) toast("钥匙库已升级：现在用启动密码派生加密，旧版程序将读不了它", "ok");
+    if (r?.vaultMigrateFailed) toast("钥匙库没能升级写入（盘可能只读），本次仍可用；能写盘时下次解锁会再试", "err");
+    if (r?.vaultUnreadable) toast("密码对了，但钥匙库解不开（可能是另一套密码留下的）。已保留原文件备份，请到设置里重新填一次钥匙", "err");
   } catch (e) {
     lockError(e.message || "密码不对");
     $("#lkPw").value = "";

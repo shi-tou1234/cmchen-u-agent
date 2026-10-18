@@ -68,7 +68,14 @@ function saveState(patch) {
   stateCache = null; // 写盘了，缓存作废
   return loadState();
 }
-if (!fs.existsSync(CONFIG)) saveState({});
+if (!fs.existsSync(CONFIG)) {
+  // 有密码锁时，未解锁不允许写钥匙库（vaultSave 会拒）——启动不能被这个卡住
+  try { saveState({}); } catch (e) { console.error("[u-agent] 首次配置初始化失败（不影响启动，解锁后会重试）：", e.message); }
+}
+// 解锁/改密后必须清缓存：loadState 里的 providers.secret 来自 vaultLoad，缓存早于解锁就会全是空
+function invalidateState() {
+  stateCache = null;
+}
 
 function settingsReady(st) {
   return !!st.workspace;
@@ -91,4 +98,4 @@ function contextInfoOf(p) {
 }
 
 
-export { contextInfoOf, isLocalProvider, limitsOf, loadState, saveState, settingsReady, stateCache };
+export { contextInfoOf, invalidateState, isLocalProvider, limitsOf, loadState, saveState, settingsReady, stateCache };

@@ -13,8 +13,8 @@ import { PERSONA_PRESETS, VOICE_LENGTHS, VOICE_STYLES, VOICE_LANGS, normalizeVoi
 import { readJson, writeJson, writeFileAtomic, truncate } from "../util.mjs";
 import { runChecks, checkSummary } from "../checks.mjs";
 import { listJobs, jobLog, stopJob, runningCount } from "../jobs.mjs";
-import { DATA, LOCK, MASK, UA_HOME, VERSION, applyMcp, checkpoints, confirmGate, mcpHub, readMcpRaw, registry, sessions } from "./runtime.mjs";
-import { contextInfoOf, limitsOf, loadState, saveState, settingsReady } from "./state.mjs";
+import { DATA, LOCK, MASK, UA_HOME, VERSION, applyMcp, checkpoints, confirmGate, mcpHub, readMcpRaw, registry, sessions, vaultRewrap, vaultSetup, vaultUnlock } from "./runtime.mjs";
+import { contextInfoOf, invalidateState, limitsOf, loadState, saveState, settingsReady } from "./state.mjs";
 import { FREE_PATHS, TOKEN_TTL_MS, cooldownLeft, lockFail, lockHash, lockVerify, maskState, noteFail, sessionTokens, unlocked } from "./auth.mjs";
 import { dropPermPrefix, running, savePermPrefix, savedPrefixes, sessionCmdAllow } from "./perm.mjs";
 import { MEMORY, PERSONA, listWorkspaceFiles, loadTitles, readMemory, readPersona, saveTitles } from "./workspace.mjs";
@@ -22,6 +22,20 @@ import { LOG_TYPES, SEC_HEADERS, readBody, sendJson } from "./reply.mjs";
 import { askOnce, lastGoal, pickAssist } from "./assist.mjs";
 import { compactSession, keepTokensOf, keepUserBudgetOf } from "./compact.mjs";
 import { handleChat } from "./chat.mjs";
+
+// 已存的真实钥匙只跟随「同名 + 同地址」的通道。
+// SEC-002：/api/test-provider 与 /api/list-models 原先只按 name 取 secret，请求体把 baseURL
+// 改到任意主机就会把钥匙发过去（与「已保存不回显」的承诺相反）。改地址就必须重新输入钥匙。
+function boundSecretOf(cur, p, base) {
+  if (p.secret && p.secret !== MASK) return { secret: String(p.secret), mismatch: false };
+  const saved = (cur.providers || []).find((o) => o.name === p.name);
+  if (!saved) return { secret: "", mismatch: false };
+  const savedBase = normalizeBase(saved.baseURL || "");
+  if (!savedBase || savedBase !== base) return { secret: "", mismatch: true };
+  return { secret: saved.secret || "", mismatch: false };
+}
+const KEY_MOVED = "服务地址改过了，请重新填一次钥匙（已保存的钥匙只会发往原来保存的地址）";
+
 export async function handleRequest(req, res) {
   for (const [k, v] of Object.entries(SEC_HEADERS)) res.setHeader(k, v);
   const u = new URL(req.url, "http://127.0.0.1");
@@ -37,7 +51,8 @@ export async function handleRequest(req, res) {
     if (req.method !== "GET" && u.pathname.startsWith("/api/")) {
       const origin = String(req.headers.origin || "");
       let host = "";
-      if (origin) { try { host = new URL(origin).hostname; } catch {} }
+      // IPv6 的 URL.hostname 带方括号（[::1]），不摘掉就永远匹配不上（SEC-011：经 http://[::1] 访问时写请求全 403）
+      if (origin) { try { host = new URL(origin).hostname.replace(/^\[|\]$/g, ""); } catch {} }
       if (origin && !["127.0.0.1", "localhost", "::1"].includes(host)) {
         return sendJson(res, 403, { error: "来源不被接受：只允许本机页面调用（跨站请求一律拒绝）" });
       }
@@ -58,13 +73,27 @@ export async function handleRequest(req, res) {
     }
     if (req.method === "POST" && u.pathname === "/api/lock-set") {
       const b = await readBody(req);
-      if (fs.existsSync(LOCK)) return sendJson(res, 409, { error: "这只盘已经设过密码了，请输入原密码解锁。忘记密码只能删掉 U 盘 data\\lock.json 重设（钥匙不受影响）。" });
+      if (fs.existsSync(LOCK)) return sendJson(res, 409, { error: "这只盘已经设过密码了，请输入原密码解锁。忘记密码只能同时删掉 data\\lock.json 与 data\\vault.bin 重设（已保存的钥匙会丢）。" });
       const pw = String(b.password || "");
       if (pw.length < 4) return sendJson(res, 400, { error: "密码至少 4 位" });
       const salt = crypto.randomBytes(16).toString("hex");
       let host = "";
       try { host = os.hostname(); } catch {}
-      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now(), host });
+      // SEC-003：钥匙库从这一刻起用「密码派生钥」加密。先写锁再改装钥匙库；
+      // 如果现有钥匙库属于另一个密码（解不开），把新锁撤掉并明确拒绝——绝不静默覆盖别人的钥匙。
+      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now(), host, vault: "scrypt" });
+      try {
+        if (!vaultSetup(pw, salt)) {
+          fs.rmSync(LOCK, { force: true });
+          return sendJson(res, 409, {
+            error: "这只盘上的钥匙库（data\\vault.bin）是用原来的密码加密的，新密码解不开。要重设密码，只能把 data\\lock.json 与 data\\vault.bin 一起删掉（已保存的钥匙会丢失）；记得原密码的话，恢复原来的 lock.json 再解锁。",
+          });
+        }
+      } catch (e) {
+        try { fs.rmSync(LOCK, { force: true }); } catch {}
+        throw e;
+      }
+      invalidateState();
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === "POST" && u.pathname === "/api/unlock") {
@@ -74,10 +103,15 @@ export async function handleRequest(req, res) {
         return sendJson(res, 429, { error: `错得太多了，请 ${Math.ceil(wait / 1000)} 秒后再试`, cooldown: Math.ceil(wait / 1000) });
       }
       if (!lockVerify(b.password)) {
-        await new Promise((r) => setTimeout(r, 600)); // 每次失败都有固定延迟
+        // 先计数再等：失败计数若放在 await 之后，并发请求会全部穿过冷却检查（SEC-007）
         const sec = noteFail();
+        await new Promise((r) => setTimeout(r, 600)); // 每次失败都有固定延迟
         return sendJson(res, 403, { error: sec ? `密码不对（已连错 ${lockFail.n} 次，冷却 ${sec} 秒）` : "密码不对", cooldown: sec });
       }
+      const info = readJson(LOCK, null);
+      // 密码对了：派生钥匙库密钥；旧库（固定串）在这里自动迁移，解不开则按 unreadable 告警
+      const vr = vaultUnlock(String(b.password || ""), info?.salt || "");
+      invalidateState(); // 解锁前 loadState 可能已缓存了「没有钥匙」的状态
       lockFail.n = 0;
       lockFail.until = 0;
       const tok = crypto.randomBytes(32).toString("hex");
@@ -88,7 +122,7 @@ export async function handleRequest(req, res) {
         "content-type": "application/json; charset=utf-8",
         "set-cookie": `ua_tok=${tok}; Path=/; HttpOnly; SameSite=Strict`,
       });
-      return res.end(JSON.stringify({ ok: true }));
+      return res.end(JSON.stringify({ ok: true, ...(vr.migrated ? { vaultMigrated: true } : {}), ...(vr.migrateFailed ? { vaultMigrateFailed: true } : {}), ...(vr.unreadable ? { vaultUnreadable: true } : {}) }));
     }
     if (req.method === "POST" && u.pathname === "/api/lock-change") {
       const b = await readBody(req);
@@ -99,10 +133,21 @@ export async function handleRequest(req, res) {
       }
       const pw = String(b.next || "");
       if (pw.length < 4) return sendJson(res, 400, { error: "新密码至少 4 位" });
+      const prev = readJson(LOCK, null);
       const salt = crypto.randomBytes(16).toString("hex");
       let host = "";
       try { host = os.hostname(); } catch {}
-      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now(), host });
+      writeJson(LOCK, { salt, hash: lockHash(pw, salt), ts: Date.now(), host, vault: "scrypt" });
+      try {
+        // 用当前（旧）钥解、新钥写；失败就把锁恢复回去，别把人锁在门外
+        vaultRewrap(pw, salt);
+      } catch (e) {
+        if (prev) writeJson(LOCK, prev);
+        return sendJson(res, 500, { error: "改密码时钥匙库没能重新加密，已恢复原密码：" + (e.message || e) });
+      }
+      invalidateState();
+      // 改密即失效所有旧会话令牌：否则改密前发出去的 cookie 还能继续用（SEC-006）
+      sessionTokens.clear();
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === "GET" && u.pathname === "/api/health") {
@@ -412,10 +457,13 @@ export async function handleRequest(req, res) {
       if (!p.name) return sendJson(res, 400, { error: "缺少名称" });
       if (p.protocol === "mock") return sendJson(res, 200, { ok: true, note: "离线演示通道，不需要联网" });
       if (!normalizeBase(p.baseURL)) return sendJson(res, 400, { error: "先填服务地址再测试" });
+      const base = normalizeBase(p.baseURL);
       const cur = loadState();
-      const secret = !p.secret || p.secret === MASK ? cur.providers.find((o) => o.name === p.name)?.secret || "" : p.secret;
+      const bound = boundSecretOf(cur, p, base);
+      if (bound.mismatch) return sendJson(res, 400, { error: KEY_MOVED });
+      const secret = bound.secret;
       // 网关（如 OpenCode Go）要求带会话标识：测试也带上，免得「测试失败但真跑能用」
-      const provider = { ...p, baseURL: normalizeBase(p.baseURL), secret, sessionId: "u-agent-connect-test", userAgent: `u-agent/${VERSION}` };
+      const provider = { ...p, baseURL: base, secret, sessionId: "u-agent-connect-test", userAgent: `u-agent/${VERSION}` };
       const ctrl = AbortSignal.timeout(Number(process.env.UA_TEST_TIMEOUT_MS) || 25000);
       const corrected = provider.baseURL !== String(p.baseURL || "").trim().replace(/\/+$/, "");
       try {
@@ -446,7 +494,9 @@ export async function handleRequest(req, res) {
       if (!base) return sendJson(res, 400, { error: "先填服务地址再拉取" });
       if (/[{<]/.test(base)) return sendJson(res, 400, { error: "服务地址里还有占位符，先换成真实地址" });
       const cur = loadState();
-      const secret = !p.secret || p.secret === MASK ? cur.providers.find((o) => o.name === p.name)?.secret || "" : p.secret;
+      const bound = boundSecretOf(cur, p, base);
+      if (bound.mismatch) return sendJson(res, 400, { error: KEY_MOVED });
+      const secret = bound.secret;
       const provider = { ...p, baseURL: base, secret, userAgent: `u-agent/${VERSION}`, sessionId: "u-agent-model-list" };
 
       // 候选路径：多数服务是 {base}/models；anthropic 的官方形式是 {base}/v1/models；

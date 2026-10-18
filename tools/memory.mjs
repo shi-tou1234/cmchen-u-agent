@@ -20,7 +20,9 @@ export default {
   name: "memory",
   description:
     "跨会话记忆（每轮都带进上下文，像给主人留的便签）：action=add 记一条长期有用的（偏好/约定/称呼/项目关键信息），forget 忘掉某条（给原文关键词），list 看现在记着什么。只在用户明确要求、或信息明显长期有用时才用；别记临时信息、别把对话内容抄进来",
-  risk: "low",
+  // 记忆每轮都会注入上下文，写进去等于「跨会话长期生效」——不能按 low 全模式静默写（SEC-010）：
+  // 只有 list 是只读；add/forget 按 medium 走门禁（readonly/plan 直接拒、confirm 过一次审）
+  risk: (args) => (String(args?.action || "") === "list" ? "low" : "medium"),
   parallel: false,
   params: {
     type: "object",

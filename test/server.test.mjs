@@ -43,6 +43,16 @@ const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9Q
 const TEST_PW = "test-pw-1234";
 let COOKIE = "";
 
+// 套件基线（DOC-001）：每个用例都从同一份 settings 出发。原先只在个别用例里复位，
+// 上一轮留下的 editFiles:true 会把「确认流」用例该弹的窗吞掉，造成 #144 间歇红。
+// 写操作默认放行（测试里不该靠每次点确认），专门的确认流用例会临时关掉。
+const BASE_AUTO = {
+  enabled: true,
+  actions: { readFiles: true, editFiles: true, deleteFiles: false, execSafe: false, execAll: false, useWeb: false, useSubagent: false },
+  maxRequests: 20,
+};
+const resetAuto = (actions = {}) => ({ ...BASE_AUTO, actions: { ...BASE_AUTO.actions, ...actions } });
+
 function jfetch(p, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (COOKIE) headers.cookie = COOKIE;
@@ -100,7 +110,7 @@ test.before(async () => {
   await jjson("/api/settings", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, searchKeys: {} }),
+    body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, searchKeys: {}, autoApprove: BASE_AUTO }),
   });
   // v0.3：启动本地假上游并注册为可用通道
   UP = await startUpstream();
@@ -128,8 +138,14 @@ test("验收L：未解锁 401、错密码 403、改密码流程", async () => {
   assert.equal(ch.status, 403, "旧密码错不许改");
   const ok = await jjson("/api/lock-change", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ old: TEST_PW, next: "new-pw-5678" }) });
   assert.equal(ok.status, 200, "旧密码对可改");
+  // SEC-006：改密后旧会话令牌必须失效
+  const stale = await fetch(`${BASE}/api/settings`, { headers: { cookie: COOKIE } });
+  assert.equal(stale.status, 401, "改密后旧 cookie 不该还能用");
   const re = await jjson("/api/unlock", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "new-pw-5678" }) });
   assert.equal(re.status, 200, "新密码可解锁");
+  const tok = /ua_tok=([a-f0-9]{64})/.exec(re.res.headers.get("set-cookie") || "");
+  assert.ok(tok, "新解锁应下发新令牌");
+  COOKIE = `ua_tok=${tok[1]}`; // 后续用例继续用新令牌
 });
 
 test("端到端（验收E）：Mock 建文件 → 文件出现 + 会话 jsonl", async () => {
@@ -171,66 +187,69 @@ test("验收J：模式门禁——readonly 拒写 / auto 拦高危 / full 直行
   assert.ok(!fs.existsSync(path.join(wsDir, "hello.txt")));
 });
 
-test("确认流：confirm 模式高危 → confirm_request → 批准后执行", async () => {
-  const script = [{ tool: "fs_write", args: { path: "cfm.txt", content: "v1" } }];
-  await chat({ message: { text: "MOCKSCRIPT:" + JSON.stringify(script) }, mode: "confirm" }); // 先建文件
-  // 覆盖已有文件 = 高危 → 弹确认；批准
-  const approving = chat({ message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cfm.txt", content: "v2" }, say: "覆盖" }]) }, mode: "confirm" });
-  const events = await approving.then((r) => r.events);
-  const req = events.find((e) => e.type === "confirm_request");
-  assert.ok(req, "应有确认请求");
-  // 上面的批准来不及发（流已结束即120s超时拒绝）——分开测：拒绝路径
-  assert.ok(events.some((e) => e.type === "confirm_result" && e.approved === false), "无人确认应超时拒绝");
-  assert.equal(fs.readFileSync(path.join(wsDir, "cfm.txt"), "utf8"), "v1", "未批准不得覆盖");
+test("确认流：confirm 模式高危 → confirm_request → 无人批准则拒绝", async () => {
+  await postSettings({ autoApprove: resetAuto({ editFiles: false }) }); // 这条用例必须真的弹窗
+  try {
+    fs.writeFileSync(path.join(wsDir, "cfm.txt"), "v1"); // 先建好，直接测覆盖
+    // 覆盖已有文件 = 高危 → 弹确认；没人点就超时拒绝
+    const approving = chat({ message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cfm.txt", content: "v2" }, say: "覆盖" }]) }, mode: "confirm" });
+    const events = await approving.then((r) => r.events);
+    const req = events.find((e) => e.type === "confirm_request");
+    assert.ok(req, "应有确认请求：" + JSON.stringify(events.map((e) => e.type)));
+    assert.equal(req.risk, "high", "覆盖已有文件应为高危");
+    assert.ok(events.some((e) => e.type === "confirm_result" && e.approved === false), "无人确认应超时拒绝");
+    assert.equal(fs.readFileSync(path.join(wsDir, "cfm.txt"), "utf8"), "v1", "未批准不得覆盖");
+  } finally {
+    await postSettings({ autoApprove: BASE_AUTO });
+  }
 });
 
 test("确认流（批准路径）：先起请求再裁决", async () => {
-  const pending = jfetch("/api/chat", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cfm2.txt", content: "old" } }]) }, mode: "confirm" }),
-  });
-  // 建好文件后，再次发起覆盖并立刻轮询确认单批准
-  await pending.then((r) => r.text());
-  const confirmPromise = (async () => {
-    const res = await jfetch("/api/chat", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cfm2.txt", content: "new" }, say: "覆盖" }]) }, mode: "confirm" }),
-    });
-    // 边收流边找 confirm_request
-    const rd = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "", confirmId = null;
-    while (confirmId === null) {
-      const { done, value } = await rd.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const line = buf.slice(0, i).trim();
-        buf = buf.slice(i + 2);
-        const m = /^data: (.*)$/.exec(line);
-        if (!m) continue;
-        let ev;
-        try {
-          ev = JSON.parse(m[1]);
-        } catch {
-          continue;
+  await postSettings({ autoApprove: resetAuto({ editFiles: false }) });
+  try {
+    fs.writeFileSync(path.join(wsDir, "cfm2.txt"), "old"); // 直接造出「已存在」，测覆盖批准
+    const confirmPromise = (async () => {
+      const res = await jfetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "cfm2.txt", content: "new" }, say: "覆盖" }]) }, mode: "confirm" }),
+      });
+      // 边收流边找 confirm_request
+      const rd = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "", confirmId = null;
+      while (confirmId === null) {
+        const { done, value } = await rd.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 2);
+          const m = /^data: (.*)$/.exec(line);
+          if (!m) continue;
+          let ev;
+          try {
+            ev = JSON.parse(m[1]);
+          } catch {
+            continue;
+          }
+          if (ev.type === "confirm_request") confirmId = ev.confirmId;
         }
-        if (ev.type === "confirm_request") confirmId = ev.confirmId;
       }
-    }
-    await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId, approve: true }) });
-    // 读到流结束为止
-    while (true) {
-      const { done } = await rd.read();
-      if (done) break;
-    }
-    return "stream-finished";
-  })();
-  await confirmPromise;
-  assert.equal(fs.readFileSync(path.join(wsDir, "cfm2.txt"), "utf8"), "new", "批准后应完成覆盖");
+      await jfetch("/api/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmId, approve: true }) });
+      // 读到流结束为止
+      while (true) {
+        const { done } = await rd.read();
+        if (done) break;
+      }
+      return "stream-finished";
+    })();
+    await confirmPromise;
+    assert.equal(fs.readFileSync(path.join(wsDir, "cfm2.txt"), "utf8"), "new", "批准后应完成覆盖");
+  } finally {
+    await postSettings({ autoApprove: BASE_AUTO });
+  }
 });
 
 test("设置：GET 掩码 / POST 持久化 / 工作区校验", async () => {
@@ -242,6 +261,8 @@ test("设置：GET 掩码 / POST 持久化 / 工作区校验", async () => {
   assert.equal(post.json.providers[0].secret, "•••已保存", "GET 回显应掩码");
   const vault = fs.readFileSync(path.join(REPO, "data", "vault.bin"));
   assert.ok(!vault.toString("utf8").includes("sk-secret"), "vault.bin 里不许有钥匙明文");
+  const { decryptVault, legacyKey } = await import("../core/vault.mjs");
+  assert.equal(decryptVault(vault, legacyKey()), null, "SEC-003：设过密码后，源码里的旧固定串不该还能解开");
   const cfg = fs.readFileSync(path.join(REPO, "config.json"), "utf8");
   assert.ok(!cfg.includes("sk-secret"), "config.json 不落真钥匙");
   assert.ok(!fs.existsSync(path.join(REPO, "data", "credentials.json")), "旧明文钥匙文件应已废弃");
@@ -258,6 +279,57 @@ test("设置：GET 掩码 / POST 持久化 / 工作区校验", async () => {
 test("验收M：设置回显不含钥匙原文", async () => {
   const st = await jjson("/api/settings");
   assert.ok(st.json.providers.every((p) => p.secret === "" || p.secret === "•••已保存"), "钥匙只能以掩码出现");
+});
+
+test("SEC-003：只删 lock.json 不能重设密码（防止静默覆盖旧钥匙）", async () => {
+  const lockFile = path.join(REPO, "data", "lock.json");
+  const vaultFile = path.join(REPO, "data", "vault.bin");
+  const lockBuf = fs.readFileSync(lockFile);
+  const vaultBuf = fs.readFileSync(vaultFile);
+  try {
+    fs.rmSync(lockFile, { force: true });
+    const r = await jjson("/api/lock-set", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "brand-new-pw" }),
+    });
+    assert.equal(r.status, 409, "钥匙库绑在旧密码上时应拒绝重设");
+    assert.match(r.json.error || "", /vault\.bin|钥匙库/, "要说清必须连 vault.bin 一起删");
+    assert.deepEqual(fs.readFileSync(vaultFile), vaultBuf, "拒绝时不许动钥匙库");
+    assert.ok(!fs.existsSync(lockFile), "失败时要把刚写的新锁撤掉");
+  } finally {
+    fs.writeFileSync(lockFile, lockBuf);
+  }
+});
+
+test("SEC-002：改 baseURL 时不许把已存钥匙发到新地址", async () => {
+  const captured = [];
+  const attacker = http.createServer((req, res) => {
+    captured.push({ url: req.url, headers: req.headers });
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n');
+  });
+  await new Promise((r) => attacker.listen(0, "127.0.0.1", r));
+  const attUrl = `http://127.0.0.1:${attacker.address().port}`;
+  const call = (p, body) => jjson(p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    await postSettings({ providers: [...EXAMPLE_PROVIDERS, { name: "Bound", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "sk-real-bound" }], active: "Mock", workspace: wsDir });
+    const moved = { name: "Bound", protocol: "openai-chat", baseURL: attUrl, model: "m", secret: "•••已保存" };
+    const r1 = await call("/api/test-provider", { provider: moved });
+    assert.equal(r1.status, 400, "改地址 + 掩码钥匙应被拒");
+    assert.match(r1.json.error || "", /重新填/, "要明确要求重新输入钥匙");
+    const r2 = await call("/api/list-models", { provider: moved });
+    assert.equal(r2.status, 400, "拉模型同样要拒");
+    assert.equal(captured.length, 0, "不许向新地址发出任何请求（更不许带 Authorization）");
+
+    // 地址没变时，掩码钥匙照常可用（不该把正常「测试连接」也弄坏）
+    const same = { name: "Bound", protocol: "openai-chat", baseURL: UP.url, model: "m", secret: "•••已保存" };
+    const r3 = await call("/api/test-provider", { provider: same });
+    assert.equal(r3.status, 200, "同地址应仍可测试：" + JSON.stringify(r3.json));
+  } finally {
+    attacker.close();
+    await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir });
+  }
 });
 
 test("验收N：用户可见文件无 api key 字样", () => {
@@ -388,8 +460,8 @@ test("v7 新增：自动放行开关可存可取，且真的能免掉确认弹�
     assert.ok(!r.events.some((e) => e.type === "confirm_request"), "不该再弹确认");
     assert.equal(fs.readFileSync(path.join(wsDir, "aa.txt"), "utf8"), "v2");
   } finally {
-    // 复位，免得影响同套件其它依赖「覆盖要确认」的用例
-    await post({ autoApprove: { enabled: true, actions: { readFiles: true }, maxRequests: 20 } }).catch(() => {});
+    // 复位到套件基线（DOC-001：别把 editFiles:true 留给后面的用例）
+    await post({ autoApprove: BASE_AUTO }).catch(() => {});
   }
 });
 
@@ -542,19 +614,23 @@ test("CSRF：写操作带外站 Origin 一律 403，本机/无 Origin 照常", a
 });
 
 test("验收Q：覆盖写 confirm_request 带 diff 预览", async () => {
-  await jjson("/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir }) });
-  const sid = "s-preview-test";
-  await chat({ sessionId: sid, message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "prev.txt", content: "第一版" } }]) }, mode: "confirm" });
-  const r = await chat({
-    sessionId: sid,
-    message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "prev.txt", content: "第二版\n新增行" } }]) },
-    mode: "confirm",
-  });
-  const req = r.events.find((e) => e.type === "confirm_request");
-  assert.ok(req, "应出现确认请求");
-  assert.equal(req.preview?.kind, "diff", "确认请求应带 diff 预览");
-  assert.ok((req.preview.lines || []).some((l) => l.op === "+" && l.text.includes("新增行")));
-  assert.ok((req.preview.lines || []).some((l) => l.op === "-" && l.text.includes("第一版")));
+  await postSettings({ providers: EXAMPLE_PROVIDERS, active: "Mock", workspace: wsDir, autoApprove: resetAuto({ editFiles: false }) });
+  try {
+    const sid = "s-preview-test";
+    fs.writeFileSync(path.join(wsDir, "prev.txt"), "第一版", "utf8"); // 直接造出已有文件，测覆盖预览
+    const r = await chat({
+      sessionId: sid,
+      message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "prev.txt", content: "第二版\n新增行" } }]) },
+      mode: "confirm",
+    });
+    const req = r.events.find((e) => e.type === "confirm_request");
+    assert.ok(req, "应出现确认请求");
+    assert.equal(req.preview?.kind, "diff", "确认请求应带 diff 预览");
+    assert.ok((req.preview.lines || []).some((l) => l.op === "+" && l.text.includes("新增行")));
+    assert.ok((req.preview.lines || []).some((l) => l.op === "-" && l.text.includes("第一版")));
+  } finally {
+    await postSettings({ autoApprove: BASE_AUTO });
+  }
 });
 
 test("验收R：update_plan 产生计划事件并记录", async () => {
@@ -897,8 +973,10 @@ test("v8 新增：整盘占用与一键清空", async () => {
 });
 
 test("v8 新增：确认时可附一句话——拒绝讲理由、批准提要求，都会转给模型", async () => {
+  await postSettings({ autoApprove: resetAuto({ editFiles: false }) }); // 这条用例必须真的弹窗
+  try {
   const f = path.join(wsDir, "note.txt");
-  await chat({ sessionId: "s-note", mode: "confirm", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "note.txt", content: "v1" } }]) } });
+  fs.writeFileSync(f, "v1", "utf8");
 
   const runWithConfirm = async (note, approve) => {
     const res = await jfetch("/api/chat", {
@@ -944,6 +1022,9 @@ test("v8 新增：确认时可附一句话——拒绝讲理由、批准提要�
   const approved = await runWithConfirm("顺序别弄乱了", true);
   assert.match(approved, /顺序别弄乱了/, "批准时的要求要转给模型");
   assert.equal(fs.readFileSync(f, "utf8"), "v2", "批准了就该执行");
+  } finally {
+    await postSettings({ autoApprove: BASE_AUTO });
+  }
 });
 
 test("v8 新增：/compact 可以点名保住什么", async () => {
@@ -1202,7 +1283,9 @@ test("v9.1 新增：上下文到阈值自动压缩（用轻量通道摘要旧轮
   // 2026-10-15 起压缩会保留最近一段原文（默认 15k，按模型预算封顶），所以不再保证"压到阈值以下"：
   // 真正的不变式 = 比压前小（旧轮次变成摘要）+ 落回窗口预算内 + 最近那轮的原文还在
   assert.ok(auto.after.tokens < auto.before.tokens, `压完要更小：${auto.before.tokens} → ${auto.after.tokens}`);
-  assert.ok(after.json.budget.tokens < 9000, `压缩后不该还在窗口预算边上，实际 ${after.json.budget.tokens}`);
+  // 预算现在包含系统提示 + 工具 schema 的固定开销（PERF-001），比较「正文部分」才是不变式
+  const contentAfter = after.json.budget.tokens - (after.json.budget.overheadTokens || 0);
+  assert.ok(contentAfter < 9000, `压缩后正文不该还在窗口预算边上，实际 ${contentAfter}`);
   assert.match(sessionLog(sid), /第4轮/, "最近那轮的原文要留着（保留尾段）");
   // 关掉后：继续灌长文本，也不该再自动压
   await postSettings({ autoCompactAt: 0 });
@@ -1546,14 +1629,19 @@ test("v9.7 Host 头校验：外部域名的 Host 一律 403，本机照常", asy
 });
 
 test("v9.7 同一会话并发聊天被拒（409）", async () => {
-  const sid = "s-conc";
-  // 先建文件（新建=非高危直接跑），再用「覆盖」占住确认弹窗，让第一轮处在跑的状态
-  await chat({ sessionId: sid, provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "conc.txt", content: "v1" } }]) }, mode: "confirm" });
-  const first = chat({ sessionId: sid, provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "conc.txt", content: "v2" }, say: "覆盖" }]) }, mode: "confirm" });
-  await new Promise((r) => setTimeout(r, 400));
-  const second = await jjson("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Mock", message: { text: "插队一条" }, mode: "confirm" }) });
-  assert.equal(second.status, 409, "并发应被拒：" + JSON.stringify(second.json));
-  await first; // 等第一轮走完（确认超时自动拒绝）
+  await postSettings({ autoApprove: resetAuto({ editFiles: false }) }); // 覆盖要弹窗，第一轮才占得住
+  try {
+    const sid = "s-conc";
+    // 先造出已有文件，再用「覆盖」占住确认弹窗，让第一轮处在跑的状态
+    fs.writeFileSync(path.join(wsDir, "conc.txt"), "v1", "utf8");
+    const first = chat({ sessionId: sid, provider: "Mock", message: { text: "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "conc.txt", content: "v2" }, say: "覆盖" }]) }, mode: "confirm" });
+    await new Promise((r) => setTimeout(r, 400));
+    const second = await jjson("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sid, provider: "Mock", message: { text: "插队一条" }, mode: "confirm" }) });
+    assert.equal(second.status, 409, "并发应被拒：" + JSON.stringify(second.json));
+    await first; // 等第一轮走完（确认超时自动拒绝）
+  } finally {
+    await postSettings({ autoApprove: BASE_AUTO });
+  }
 });
 
 /* ===== v0.9.8：AGENTS.md 层级发现 ===== */

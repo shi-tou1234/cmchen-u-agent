@@ -15,6 +15,17 @@ const BLACKLIST = [
   [/\bbcdedit\b/i, "改启动配置"],
   [/\bremove-item\b(?=[^&|>]*-recurse)(?=[^&|>]*[a-z]:\\)/i, "PowerShell 递归删绝对路径"],
   [/\b(format-volume|clear-disk|remove-partition|initialize-disk|new-partition|add-partition)\b/i, "PowerShell 磁盘/分区操作"],
+  // 下载执行 / 持久化族（SEC-008）：黑名单是防手滑的护栏，不是硬沙箱，但这几类属于
+  // 「一条命令就能落载荷并让它在下次开机/登录时自己跑」，值得无条件拦。
+  [/\bcertutil(\.exe)?\b[^&|>]*\s-(urlcache|decode|decodehex)\b/i, "certutil 下载/解码载荷"],
+  [/\bbitsadmin(\.exe)?\b[^&|>]*\/(transfer|addfile)\b/i, "bitsadmin 下载载荷"],
+  [/\bpowershell(\.exe)?\b[^&|>]*\s-(enc|encodedcommand)\b/i, "PowerShell 编码命令"],
+  [/\breg(\.exe)?\s+add\b[^&|>]*\\run(once)?(\\|"|\s|$)/i, "写注册表 Run/RunOnce 自启动"],
+  [/\bwmic(\.exe)?\s+process\s+call\s+create\b/i, "wmic 远程/隐藏创建进程"],
+  [/\brundll32(\.exe)?\b[^&|>]*javascript:/i, "rundll32 执行内联脚本"],
+  [/\bmshta(\.exe)?\b/i, "mshta 执行内联/远程脚本"],
+  [/\bschtasks(\.exe)?\b[^&|>]*\/create\b/i, "创建计划任务（持久化）"],
+  [/\b(curl|wget)(\.exe)?\b[^&|>]*\|\s*(cmd|powershell|pwsh|sh|bash)\b/i, "下载后直接管道执行"],
 ];
 
 // cmd 的 ^ 是转义符、引号在分词时会被吃掉：fo^rmat、f"or"mat 到 cmd 里都会还原成 format。
