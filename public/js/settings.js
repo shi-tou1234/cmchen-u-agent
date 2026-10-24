@@ -21,6 +21,7 @@ const PANELS = [
   { id: "general", label: "通用", icon: "monitor" },
   { id: "models", label: "模型", icon: "sparkle" },
   { id: "persona", label: "人格", icon: "pen" },
+  { id: "reading", label: "阅读", icon: "file" },
   { id: "perm", label: "权限", icon: "shield" },
   { id: "memory", label: "记忆", icon: "brain" },
   { id: "web", label: "联网", icon: "globe" },
@@ -72,6 +73,7 @@ export function openSettings(opts = {}) {
     .then(() => loadPersona().catch(() => {}))
     .then(() => {
       showOverlay($("#setRoot"));
+      fillReading(); // 阅读偏好每次打开都对齐（本机 localStorage，可能被别的标签页改过）
       selectPanel(opts.panel || "general");
     });
 }
@@ -80,6 +82,32 @@ function closeSettings() {
   hideOverlay($("#setRoot"));
   hideOverlay($("#dirRoot"));
   hideOverlay($("#wizRoot"));
+}
+
+/* ================= 阅读（评审：字号/字体，本机偏好存 localStorage） ================= */
+// 应用逻辑在 theme-boot.js 里也有一份（首帧前生效，防闪烁）——改判据记得两处一起改。
+function fillReading() {
+  const prefs = readReadingPrefs();
+  const size = $("#readSize"), font = $("#readFont");
+  if (size) size.value = String(prefs.size);
+  if (font) font.value = prefs.font;
+}
+function readReadingPrefs() {
+  try {
+    const j = JSON.parse(localStorage.getItem("ua_reading") || "{}");
+    return { size: [14, 16, 18].includes(Number(j.size)) ? Number(j.size) : 16, font: j.font === "system" ? "system" : "serif" };
+  } catch {
+    return { size: 16, font: "serif" };
+  }
+}
+function bindReading() {
+  const apply = () => {
+    const prefs = { size: Number($("#readSize")?.value) || 16, font: $("#readFont")?.value || "serif" };
+    try { localStorage.setItem("ua_reading", JSON.stringify(prefs)); } catch {}
+    window.__applyReading?.(prefs);
+  };
+  $("#readSize")?.addEventListener("change", apply);
+  $("#readFont")?.addEventListener("change", apply);
 }
 
 async function loadAll() {
@@ -291,11 +319,12 @@ function renderProviders() {
     // 有的网关按模型分协议：协议和模型名对不上时，卡片上直接给个一键改（多半就是「连不上」的原因）
     const want = preset?.protocolPerModel ? protocolForModel(p.model) : null;
     const badProto = want && want.protocol && want.protocol !== p.protocol;
-    const node = el(`<div class="prov ${ready ? "ready" : ""} ${p.name === (S.active || "") ? "on" : ""}">
+    const isOn = p.id === S.active || p.name === S.active; // 在用判定按 id（评审 #1）；老引用按名也认
+    const node = el(`<div class="prov ${ready ? "ready" : ""} ${isOn ? "on" : ""}">
       <div class="prov-head">
         ${brandChip(p)}
         <span class="prov-name">${esc(p.name || "未命名")}</span>
-        ${p.name === (S.active || "") ? `<span class="prov-tag on">在用</span>` : ""}
+        ${isOn ? `<span class="prov-tag on">在用</span>` : ""}
         ${badProto ? `<button class="ghost-btn" data-act="fixproto">协议不对，点我改</button>` : ""}
         <span class="grow"></span>
         <span class="prov-state ${stateLabel(p).cls}">${stateLabel(p).text}</span>
@@ -349,8 +378,8 @@ function renderProviders() {
 
     node.querySelector('[data-act="default"]').onclick = (e) => {
       e.stopPropagation();
-      S.active = p.name;
-      api.saveSettings({ active: p.name }).then((st) => fillProviders(st)).catch(() => {});
+      S.active = p.id || p.name; // 引用跟 id 走（评审 #1）
+      api.saveSettings({ active: S.active }).then((st) => fillProviders(st)).catch(() => {});
       renderProviders();
       renderCurrent();
       toast("默认通道已设为 " + p.name, "ok");
@@ -374,8 +403,14 @@ function renderProviders() {
       result.textContent = "正在连通测试…";
       try {
         const r = await api.testProvider(p);
-        result.className = "test-result ok";
-        result.textContent = "可用" + (r.note ? "（" + r.note + "）" : r.sample ? ` · 回了「${r.sample}」` : "");
+        // 评审 #6：空响应（连通但没内容）服务端会回 ok:false + 具体解释，照实说、别标成「可用」
+        if (r.ok === false) {
+          result.className = "test-result bad";
+          result.textContent = r.error || "没测出有效响应";
+        } else {
+          result.className = "test-result ok";
+          result.textContent = "可用" + (r.note ? "（" + r.note + "）" : r.sample ? ` · 回了「${r.sample}」` : "");
+        }
       } catch (err) {
         result.className = "test-result bad";
         result.textContent = err.message;
@@ -473,7 +508,7 @@ function renderProviders() {
 }
 
 function renderCurrent() {
-  const p = provs.find((x) => x.name === S.active) || provs[0];
+  const p = provs.find((x) => x.id === S.active || x.name === S.active) || provs[0];
   $("#curProv").innerHTML = p ? `${brandChip(p)} <b>${esc(p.name)}</b> · ${esc(p.model || "未填模型")}` : "还没有通道";
 }
 
@@ -481,9 +516,9 @@ function renderCurrent() {
 function renderAssist() {
   const ok = provs.filter((p) => p.protocol !== "mock");
   const opts = [`<option value="">跟随当前通道（不单独指定）</option>`]
-    .concat(ok.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}${p.model ? " · " + esc(p.model) : ""}</option>`));
+    .concat(ok.map((p) => `<option value="${esc(p.id || p.name)}">${esc(p.name)}${p.model ? " · " + esc(p.model) : ""}</option>`));
   $("#assistSel").innerHTML = opts.join("");
-  $("#assistSel").value = ok.some((p) => p.name === S.assist) ? S.assist : "";
+  $("#assistSel").value = ok.some((p) => p.id === S.assist || p.name === S.assist) ? S.assist : "";
   if (S.assist && $("#assistSel").value === "") S.assist = "";
   $("#assistSel").disabled = !ok.length;
 }
@@ -845,7 +880,7 @@ async function save(opts = {}) {
 
   const body = {
     providers: provs,
-    active: S.active || provs[0]?.name,
+    active: S.active || provs[0]?.id || provs[0]?.name,
     searchKeys: { tavily: $("#kTavily").value.trim(), brave: $("#kBrave").value.trim() },
     proxy: $("#kProxy").value.trim(),
     extraRoots,
@@ -981,6 +1016,7 @@ export function initSettings() {
       `<button data-panel="${p.id}">${icon(p.icon, "ic ic-sm")}${t("set.nav." + p.id)}</button>`
   ).join("");
   $$("#setNav button").forEach((b) => (b.onclick = () => selectPanel(b.dataset.panel)));
+  bindReading(); // 阅读偏好（评审：字号/字体）
   selectPanel("general");
 
   // 点 X、点「取消/关闭」、点背景遮罩都关面板。

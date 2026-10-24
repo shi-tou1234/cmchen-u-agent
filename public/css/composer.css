@@ -30,6 +30,7 @@
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .attach-list { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px 0; }
+.attach-count { flex-basis: 100%; font-size: var(--fs-xs); color: var(--faint); }
 .attach-item { position: relative; display: flex; align-items: center; gap: 7px; padding: 4px 8px;
   border: 1px solid var(--line); border-radius: var(--r-sm); font-size: var(--fs-xs); color: var(--muted); background: var(--surface-2); }
 .attach-item img { width: 30px; height: 30px; object-fit: cover; border-radius: var(--r-xs); display: block; }

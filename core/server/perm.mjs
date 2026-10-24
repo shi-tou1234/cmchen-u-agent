@@ -5,7 +5,20 @@ import path from "node:path";
 import { readJson, writeJson } from "../util.mjs";
 import { DATA } from "./runtime.mjs";
 // ---------- 会话运行态 ----------
-const running = new Map(); // sessionId → {abort: AbortController, mode}
+// sessionId → { abort, mode, runId, startedAt, seq, events:[{seq,ev}], clients:Set<res> }
+// 评审 #5：任务执行与页面连接分开管——一轮的事件在 run.events 里留底，页面刷新/断开后
+// 走 /api/chat-events 从任意 seq 重接；原始连接断了任务照跑。
+const running = new Map();
+// 最近结束的一轮（sessionId → { runId, events, endedAt }）：跑完才回来的用户也能看到刚才发生了什么。
+// 只留底 10 分钟、最多 20 个会话，别把内存吃穿。
+const finishedRuns = new Map();
+function stashFinished(sessionId, run) {
+  finishedRuns.set(sessionId, { runId: run.runId, mode: run.mode, events: run.events, endedAt: Date.now() });
+  const cutoff = Date.now() - 10 * 60_000;
+  for (const [k, v] of finishedRuns) {
+    if (v.endedAt < cutoff || finishedRuns.size > 20) finishedRuns.delete(k);
+  }
+}
 // 用户在弹窗里点过「本会话不再问这类命令」的前缀（内存态，服务重启即失效）
 const sessionCmdAllow = new Map(); // sessionId → Set<prefix>
 // 放行规则存盘（v0.9.9）：命令前缀写进 data/perm-saved.json，换会话/重启后仍然有效；界面上可查可删
@@ -53,4 +66,4 @@ const briefArgs = (a) => {
   }
 };
 
-export { AUDIT, approveHook, auditLine, briefArgs, dropPermPrefix, hookIsTrusted, hookPromptDenied, hookTrustCache, running, savePermPrefix, savedPrefixes, savedPrefixesCache, sessionCmdAllow };
+export { AUDIT, approveHook, auditLine, briefArgs, dropPermPrefix, finishedRuns, hookIsTrusted, hookPromptDenied, hookTrustCache, running, savePermPrefix, savedPrefixes, savedPrefixesCache, sessionCmdAllow, stashFinished };

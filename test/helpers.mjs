@@ -13,6 +13,19 @@ export function tmpDir(prefix = "uagent-t-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+// 评审（测试隔离）：给端到端测试一份临时 UA_HOME——服务端（core/server/runtime.mjs）认这个
+// 环境变量，data/、config.json 全部落进临时目录，真实数据全程不被碰。
+// 注意必须把 server.mjs + core/ + tools/ 成套拷进来并从拷贝里起服务：
+// tools 里 `../core/…` 的相对导入要落在同一份文件上，否则 core/jobs.mjs 这类有内存状态的
+// 模块会出现两个实例（服务端一个、工具一个），后台任务列表互相看不见。
+export function makeHome() {
+  const home = tmpDir("ua-home-");
+  for (const d of ["tools", "core", "public"]) fs.cpSync(path.join(REPO, d), path.join(home, d), { recursive: true });
+  fs.copyFileSync(path.join(REPO, "server.mjs"), path.join(home, "server.mjs"));
+  fs.copyFileSync(path.join(REPO, "config.example.json"), path.join(home, "config.example.json"));
+  return home;
+}
+
 // 直接 spawn（不经 cmd shell，绕开本机偶发的 "spawnSync cmd.exe EBUSY"），
 // 且对"进程没起来"的 EBUSY/EPERM 自动重试；失败时抛错（语义同 execSync）。
 const SPAWN_RETRYABLE_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);

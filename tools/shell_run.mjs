@@ -24,7 +24,9 @@ export default {
       args: ["/d", "/s", "/c", args.command],
       cwd,
       timeoutMs: 30000,
+      signal: ctx.signal, // 评审 #7：点「停止」要真能停掉前台命令（连子进程树）
     });
+    if (r.aborted) return "已中止（你点了停止）：命令连同它的子进程树都被终止了。它可能执行到一半——先用文件/git 检查现场，再决定要不要重做，别盲目整条重跑。";
     if (r.timedOut) return fmtOutput(r, "命令 30 秒未完成被终止（长命令请拆步或用后台方式）");
     return fmtOutput(r);
   },

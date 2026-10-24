@@ -33,10 +33,12 @@ test("端到端：Mock 两步剧本创建文件并汇报", async () => {
 test("subagent：派生独立子 agent 完成任务并返回汇报", async () => {
   const { r } = await freshRegistry();
   const ws = tmpDir();
+  // 子 agent 的会话日志写在 ctx.uaHome 下：不指到临时目录就会灌进仓库真实 data/sessions（评审·测试隔离补丁）
+  const ctx = { ...makeCtx({ workspace: ws, registry: r, mode: "confirm" }), uaHome: tmpDir() };
   const subTask = "MOCKSCRIPT:" + JSON.stringify([{ tool: "fs_write", args: { path: "sub-done.txt", content: "子任务成果" } }, { say: "子任务完成" }]);
   const script = [{ tool: "spawn_subagent", args: { task: subTask, name: "调研" }, say: "我派个子agent去调研。" }, { say: "主任务收尾。" }];
   const evs = await collect(
-    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx: makeCtx({ workspace: ws, registry: r, mode: "confirm" }) })
+    runAgent({ provider: { protocol: "mock" }, messages: [{ role: "user", text: "MOCKSCRIPT:" + JSON.stringify(script) }], registry: r, ctx })
   );
   assert.ok(fs.existsSync(path.join(ws, "sub-done.txt")), "子 agent 应该在工作区创建了文件");
   const subEvents = evs.filter((e) => e.type === "subagent_event");

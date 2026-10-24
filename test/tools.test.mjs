@@ -62,6 +62,23 @@ test("shell_run：正常执行 + 黑名单无条件拦截", async () => {
   await assert.rejects(() => run("shell_run", { command: "echo x", cwd: "C:\\Windows" }, ctx), /越界/);
 });
 
+test("评审#7：点停止要真停前台命令——子进程树被杀，后续标记不许写出", async () => {
+  const ws = tmpDir();
+  const marker = path.join(ws, "marker.txt");
+  const ctrl = new AbortController();
+  const ctx = { ...makeCtx({ workspace: ws, registry: reg }), signal: ctrl.signal };
+  // ping -n 3 ≈ 2 秒；跑 200ms 就点停止 → 树被杀，后面的 echo 标记不许执行
+  const pending = run("shell_run", { command: `ping -n 3 127.0.0.1 >nul & echo done > marker.txt` }, ctx);
+  await new Promise((r) => setTimeout(r, 200));
+  ctrl.abort();
+  const out = await pending;
+  assert.match(out, /已中止/, "要说明命令是被停止的：" + out);
+  assert.equal(fs.existsSync(marker), false, "中止后命令的后续步骤不许再执行");
+  // 已中止的信号再进来：不再起进程，直接返回
+  const out2 = await run("shell_run", { command: "echo should-not-run" }, ctx);
+  assert.match(out2, /已中止/);
+});
+
 test("SEC-008 黑名单：下载执行与持久化族也拦", async () => {
   const { assertCommandAllowed } = await import("../core/blacklist.mjs");
   for (const c of [

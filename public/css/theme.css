@@ -71,7 +71,7 @@
   --fs-xs: 11px;
   --fs-sm: 12px;
   --fs-ui: 13px;
-  --fs-body: 14px;
+  --fs-body: 16px; /* 评审（阅读）：回答正文 14→16；设置「阅读」里可调 14/16/18 */
   --fs-lg: 15px;
   --fs-xl: 17px;
   --fs-hero: 24px;

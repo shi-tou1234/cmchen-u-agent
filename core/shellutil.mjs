@@ -23,16 +23,18 @@ const SPAWN_RETRYABLE = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const SPAWN_ATTEMPTS = 3;
 
 export async function runCommand(opts) {
+  // 已中止就不该再起进程，也不该重试（评审 #7：点「停止」要真停）
+  if (opts.signal?.aborted) return { code: -1, stdout: "", stderr: "", timedOut: false, aborted: true };
   for (let attempt = 0; ; attempt++) {
     const r = await spawnOnce(opts);
-    const retryable = r.spawnErrorCode && SPAWN_RETRYABLE.has(r.spawnErrorCode);
+    const retryable = r.spawnErrorCode && SPAWN_RETRYABLE.has(r.spawnErrorCode) && !r.aborted;
     delete r.spawnErrorCode;
     if (!retryable || attempt >= SPAWN_ATTEMPTS - 1) return r;
     await new Promise((res) => setTimeout(res, 150 * (attempt + 1))); // 150ms / 300ms 退避
   }
 }
 
-function spawnOnce({ command, args = [], cwd, timeoutMs = 30000, maxOut = 200000, env = {} }) {
+function spawnOnce({ command, args = [], cwd, timeoutMs = 30000, maxOut = 200000, env = {}, signal }) {
   const t0 = Date.now();
   return new Promise((resolve) => {
     let child;
@@ -54,13 +56,25 @@ function spawnOnce({ command, args = [], cwd, timeoutMs = 30000, maxOut = 200000
     let outBytes = 0;
     let errBytes = 0;
     let timedOut = false;
+    let aborted = false;
     let settled = false;
+    // Windows 上杀 cmd 必须连子进程树一起杀（/T），不然孙进程照跑（评审 #7 的坑源）
+    const killTree = () => {
+      if (!child.pid) return;
+      try { spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true }); } catch {}
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true });
-      } catch {}
+      killTree();
     }, timeoutMs);
+    const onAbort = () => {
+      aborted = true;
+      killTree();
+    };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
     // 收字节不急着解码：按块解码会把多字节字符劈成两半，也会把 GBK 当 UTF-8
     child.stdout.on("data", (d) => {
       if (outBytes < maxOut * 2) { outChunks.push(d); outBytes += d.length; }
@@ -72,9 +86,10 @@ function spawnOnce({ command, args = [], cwd, timeoutMs = 30000, maxOut = 200000
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
       const out = truncate(decodeOutput(Buffer.concat(outChunks)), maxOut);
       const err = truncate(decodeOutput(Buffer.concat(errChunks)) + extraErr, maxOut);
-      resolve({ code, stdout: out, stderr: err, timedOut, ms: Date.now() - t0, spawnErrorCode });
+      resolve({ code, stdout: out, stderr: err, timedOut, aborted, ms: Date.now() - t0, spawnErrorCode });
     };
     child.on("error", (e) => finish(-1, e.message, sawSpawn ? undefined : e.code));
     child.on("close", (code) => finish(code));

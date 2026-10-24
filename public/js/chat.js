@@ -26,12 +26,33 @@ let lastRenderedMode = null; // 用来判断模式芯片要不要重画
 
 /* ---- 运行中排队的消息（回车排队 → 这一轮跑完自动发） ---- */
 const sendQueue = [];
+// 排队消息按会话归属管理（评审复核#2）：只排水「队头属于当前会话」的那条——
+// 切走了就不发（留在队列里，切回原会话再发），绝不把旧会话排的队灌进新会话
+export function drainQueueSoon() {
+  const next = sendQueue[0];
+  if (!next) return;
+  if ((next.sid || null) !== (S.sessionId || null)) { renderQueue(); return; }
+  if (S.sending) return;
+  sendQueue.shift();
+  renderQueue();
+  const sid = next.sid;
+  setTimeout(() => {
+    // 这 250ms 里用户可能抢先发了新的一条、或切了会话——放回队头：别抹他刚输入的字、也别发错会话（审查 #19）
+    if (S.sending || (next.sid || null) !== (S.sessionId || null)) {
+      sendQueue.unshift(next);
+      renderQueue();
+      return;
+    }
+    sendMessage(next.text, { fromQueue: true, texts: next.texts, images: next.images });
+  }, 250);
+}
 export function renderQueue() {
   const box = $("#queueList");
   if (!box) return;
   box.hidden = !sendQueue.length;
+  const foreign = sendQueue.length && (sendQueue[0].sid || null) !== (S.sessionId || null);
   box.innerHTML = sendQueue.length
-    ? `<div class="q-head">排队中 ${sendQueue.length} 条 · 这一轮跑完自动发</div>` +
+    ? `<div class="q-head">排队中 ${sendQueue.length} 条 · ${foreign ? "属于原会话，切回去后自动发" : "这一轮跑完自动发"}</div>` +
       sendQueue
         .map(
           (it, i) => `<div class="q-row" data-i="${i}">
@@ -86,7 +107,9 @@ function atBottom() {
 }
 // 滚动到底：每帧最多调度一次，且不在这里做布局读取（阅读位置由 scroll 监听维护）
 let scrollRaf = false;
+let historyPrepend = false; // 向上补历史（评审 #4）时禁止自动滚底，读完靠滚动锚点还原位置
 function scrollEnd(force) {
+  if (historyPrepend) return;
   if (force) nearBottom = true;
   if (force || nearBottom) {
     $("#scrollBtn").hidden = true;
@@ -118,6 +141,11 @@ const scale = (chars) => (chars >= 1000 ? (chars / 1000).toFixed(1) + "k 字" : 
 /* ================= 发送 / SSE ================= */
 export async function sendMessage(text, opts = {}) {
   const fromQueue = !!opts.fromQueue; // 排水自动发出：不碰输入框/附件，也不清附件的快照来源（审查 #19）
+  if (attachmentsBusy()) {
+    // 附件还在读盘（评审 #2）：这时候发出去，快照里没有那张还没读完的图——明说并拦下
+    toast("还有附件在读，等一下再发", "err");
+    return;
+  }
   if (S.sending) {
     // 正在跑的时候回车 = 排队（对标 MiniMax Code 的 Enter 排队 / Alt+Enter 引导）：
     // 不用干等，也不用打断它——这一轮跑完自动接着发
@@ -161,6 +189,8 @@ export async function sendMessage(text, opts = {}) {
   pushHistory(clean);
   S.lastSent = body;
   S.changes = [];
+  S.lastCheck = null;
+  let wasAborted = false;
   addUser(body, images);
   if (!fromQueue) {
     clearAttachments();
@@ -216,6 +246,7 @@ export async function sendMessage(text, opts = {}) {
         let ev;
         try { ev = JSON.parse(line.slice(5)); } catch { continue; }
         handleEvent(ev, {
+          send: true, // 首次发送：用户气泡已在本地 addUser 渲染过，SSE 里的 user 事件别再加一遍（复核3#2）
           tools,
           subs,
           think,
@@ -228,8 +259,15 @@ export async function sendMessage(text, opts = {}) {
       }
     }
   } catch (e) {
-    if (e.name === "AbortError") finishAi(streamNode, full || "（已中止）");
-    else { finishAi(streamNode); addError(e.message); toast(e.message, "err"); }
+    if (e.name === "AbortError") {
+      if (detachRequested) {
+        // 切会话时掐的本地连接（评审 #5）：任务在服务端照跑，这里静默收尾，别显示「已中止」
+        detachRequested = false;
+      } else {
+        wasAborted = true;
+        finishAi(streamNode, full || "（已中止）"); // 服务端由 abortRun 里的 api.abort 叫停
+      }
+    } else { finishAi(streamNode); addError(e.message); toast(e.message, "err"); }
   } finally {
     // 思考块收尾统一放这里：用户点停止或网络层直接断掉时 reader 抛错走 catch，
     // 之后不会再收到任何 SSE 事件（done/error 走不到），只有 finally 能兜住——
@@ -247,21 +285,21 @@ export async function sendMessage(text, opts = {}) {
     }
     setSendUI();
     S.onSessionTouched && S.onSessionTouched();
-    // 排队里的下一条：这一轮已经结束，接着发出去
-    if (sendQueue.length) {
-      const next = sendQueue.shift();
-      renderQueue();
-      const sid = S.sessionId;
-      setTimeout(() => {
-        // 这 250ms 里用户可能抢先发了新的一条、或切了会话——放回队头：别抹他刚输入的字、也别发错会话（审查 #19）
-        if (S.sending || S.sessionId !== sid) {
-          sendQueue.unshift(next);
-          renderQueue();
-          return;
-        }
-        sendMessage(next.text, { fromQueue: true, texts: next.texts, images: next.images });
-      }, 250);
-    }
+    // 任务结果卡（评审）：干过活的轮次给一张小结，别让人翻工具日志
+    try {
+      const planItems = S.plan || [];
+      if ((S.changes && S.changes.length) || S.lastCheck || wasAborted) {
+        addResultCard({
+          changed: S.changes || [],
+          check: S.lastCheck,
+          plan: planItems.length ? `${planItems.filter((i) => i.status === "done").length}/${planItems.length}` : "",
+          aborted: wasAborted,
+          replyHead: String(full || "").replace(/\s+/g, " ").trim().slice(0, 90),
+        });
+      }
+    } catch {}
+    try { localStorage.setItem("ua_step3", "1"); } catch {} // 三步引导的第三步：发出去并跑完过一轮就算数
+    drainQueueSoon(); // 排队里的下一条：这一轮结束了，接着发（只发属于当前会话的，复核#2）
     // 会话标题是这轮结束后在后台起的，稍等一下再刷一次侧栏，让它冒出来
     if (needTitle) setTimeout(() => S.onSessionTouched && S.onSessionTouched(), 2600);
     const list = colEl().querySelectorAll(".msg.assistant");
@@ -291,6 +329,7 @@ function handleEvent(ev, c) {
   switch (ev.type) {
     case "session":
       S.sessionId = ev.sessionId;
+      S.runId = ev.runId || S.runId; // 评审 #5：停止按钮凭这个 runId 精确叫停
       renderGoalChip();
       if (ev.budget) { S.budget = ev.budget; }
       if (ev.context) S.context = ev.context; // 这个模型的窗口多大、数据从哪来
@@ -298,10 +337,17 @@ function handleEvent(ev, c) {
       S.onSessionTouched && S.onSessionTouched();
       break;
     case "usage": S.tokens = { input: ev.input, output: ev.output, cached: ev.cached || 0 }; break;
+    case "stream_end": S.runId = null; break; // 这一轮结束了：旧 runId 从此失效
+    case "user":
+      // 复核3#2：重放路径要恢复本轮的用户气泡（历史快照已把在跑的轮次裁掉）；
+      // 首次发送已在本地渲染过这条，不能再加一遍
+      if (c.send) break;
+      ev.auto ? noteLine(ev.text.split("\n")[0] + "（自动）") : addUser(ev.text, ev.images, ev._log);
+      break;
     case "budget": if (ev.budget) S.budget = ev.budget; if (ev.context) S.context = ev.context; break;
     case "compact": {
-      // 自动压缩（服务端在发问之前做的）：说一声并刷新用量条
-      if (ev.auto) {
+      // 自动压缩（服务端在发问之前做的）：说一声并刷新用量条；重放路径不弹（复核3#2，历史快照里已有摘要卡）
+      if (ev.auto && !c.replay) {
         if (ev.after) S.budget = ev.after;
         toast("上下文快满了，已自动压缩：" + tok(ev.before?.tokens || 0) + " → " + tok(ev.after?.tokens || 0) + " tokens", "ok");
       }
@@ -414,14 +460,14 @@ function handleEvent(ev, c) {
     case "tool_call": clearReconnect(c); c.tools.set(ev.id, addTool(ev)); break;
     case "tool_result": { const n = c.tools.get(ev.id); if (n) finishTool(n, ev); break; }
     case "change": S.changes.push(ev); break;
-    case "check": addCheckCard(ev); break;
+    case "check": S.lastCheck = ev; addCheckCard(ev); break;
     case "mode":
       if (ev.mode) {
         setMode(ev.mode);
         renderModeBtn(); // 权限胶囊/状态条芯片归它（renderModelBtn 是模型通道那个）
         $("#planQuick")?.classList.toggle("on", S.mode === "plan");
         setSendUI();
-        toast(ev.note || "已切换权限模式", "ok");
+        if (!c.replay) toast(ev.note || "已切换权限模式", "ok"); // 重放路径静默（复核3#2）
       }
       break;
     case "goal_check":
@@ -606,6 +652,28 @@ export function renderHomeTasks() {
     box.innerHTML = "";
     return;
   }
+  // 离线时推荐对齐真实能力（评审）：离线演示只会答使用问题——推荐的得是当下真能兑现的入口
+  const activeP = (S.providers || []).find((p) => p.id === S.active || p.name === S.active);
+  const offline = activeP?.protocol === "mock";
+  if (offline) {
+    const items = [
+      { ic: "shield", t: "介绍一下你有哪些权限模式，各自能做什么" },
+      { ic: "sparkle", t: "离线演示模式下，你都能帮我做什么？" },
+      { ic: "sparkle", t: "怎么连接我自己的模型？" },
+    ];
+    box.innerHTML =
+      `<div class="ht-head"><span>离线演示 · 这些现在就能试</span><span class="ht-ops">
+        <button id="htHide" title="收起">${icon("close", "ic ic-sm")}</button>
+      </span></div>` +
+      items
+        .map((it) => `<button class="ht-item"><span class="ht-ic">${icon(it.ic, "ic ic-sm")}</span><span class="ht-text">${esc(it.t)}</span></button>`)
+        .join("") +
+      `<div class="ht-note">离线通道只会回答使用问题；连上真模型才能读写文件、跑命令。去设置「模型」里连一家。</div>`;
+    box.hidden = false;
+    box.querySelectorAll(".ht-item").forEach((b, i) => (b.onclick = () => setInput(items[i].t)));
+    $("#htHide").onclick = () => { tasksHidden = true; renderHomeTasks(); };
+    return;
+  }
   const idx = [];
   for (let k = 0; k < Math.min(TASK_PAGE, TASK_POOL.length); k++) idx.push((taskOffset + k) % TASK_POOL.length);
   box.innerHTML =
@@ -675,10 +743,62 @@ export function renderWelcome() {
     <p class="welcome-hello" id="welcomeHello">${esc(g.hello)}</p>
     <p class="welcome-sub" id="welcomeSub">${esc(g.sub)}</p>
   </div>`;
+  renderSetupSteps(); // 评审（首次使用）：没就绪时给三步清单，别把人直接丢进整套设置
   refreshWelcomeNote();
   renderHomeTasks();
   scheduleGreeting(); // 跨过时段边界时自己换一句
   glideComposer(from);
+}
+
+/* ---- 三步开张（评审：首次使用 → 选工作区 → 连模型/离线体验 → 做成一件小事） ---- */
+function setupState() {
+  const provs = S.providers || [];
+  const active = provs.find((p) => p.id === S.active || p.name === S.active);
+  const ready = (p) => p.protocol === "mock" || (p.baseURL && p.model && p.secret);
+  const connected = provs.some((p) => p.protocol !== "mock" && ready(p));
+  const offlinePicked = active?.protocol === "mock";
+  const done3 = (() => { try { return localStorage.getItem("ua_step3") === "1"; } catch { return false; } })();
+  return {
+    ws: !!S.workspace,
+    model: connected || offlinePicked,
+    offlinePicked,
+    task: done3,
+    pending: !(S.workspace && (connected || offlinePicked) && done3),
+  };
+}
+function renderSetupSteps() {
+  const st = setupState();
+  if (!st.pending) return;
+  const mock = (S.providers || []).find((p) => p.protocol === "mock");
+  const item = (done, num, text, btn, act) =>
+    `<div class="ss-item ${done ? "ok" : ""}"><span class="ss-box">${done ? "✓" : num}</span><span class="ss-text">${esc(text)}</span>${
+      done ? "" : `<button class="ss-go" data-act="${act}">${esc(btn)}</button>`
+    }</div>`;
+  const box = document.createElement("div");
+  box.className = "setup-steps";
+  box.innerHTML = [
+    `<div class="ss-head">三步开张</div>`,
+    item(st.ws, "①", "选一个工作区（agent 只在这片地里动手）", "去选", "ws"),
+    item(st.model, "②", st.offlinePicked ? "正在离线体验（连上真模型才能干活）" : "连接一个模型，或先用离线体验", "去连", "model"),
+    item(st.task, "③", "做成一件小事，收工", "试一件", "task"),
+  ].join("");
+  colEl().appendChild(box);
+  box.querySelector('[data-act="ws"]')?.addEventListener("click", () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "general" } })));
+  box.querySelector('[data-act="model"]')?.addEventListener("click", () => window.dispatchEvent(new CustomEvent("ua:open-settings", { detail: { panel: "models" } })));
+  box.querySelector('[data-act="task"]')?.addEventListener("click", () => setInput("在工作区新建 hello.txt，写一句话"));
+  // 还没模型时给一条「离线体验」的直通车：一键切到离线演示通道
+  if (!st.model && mock) {
+    const b = el(`<button class="ss-off">${icon("sparkle", "ic ic-sm")}先用离线体验走一遍</button>`);
+    b.onclick = async () => {
+      try {
+        const s = await api.saveSettings({ active: mock.id || mock.name });
+        fillProviders(s);
+        toast("已切到离线演示通道（不联网，只会答使用问题）", "ok");
+        renderWelcome();
+      } catch (e) { toast(e.message, "err"); }
+    };
+    box.appendChild(b);
+  }
 }
 
 /* ---- 回合导航条（v9.10）：会话左缘一列细条，鼠标扫过成"山峰"，点击直跳那个回合 ---- */
@@ -723,7 +843,7 @@ function refreshTurnRail() {
   rail.onmouseleave = () => [...rail.children].forEach((t) => (t.style.transform = ""));
 }
 
-function addUser(text, images) {
+function addUser(text, images, logIndex) {
   const from = $(".welcome") ? captureComposerTop() : null; // 首屏那条：输入框该从中间落回底部
   if ($(".welcome")) clearStream();
   // mediaType 来自会话日志：日志就在盘上、agent 也写得动它——属性里必须转义（防存储型 XSS），格式不对就兜底
@@ -739,6 +859,7 @@ function addUser(text, images) {
     <button class="rw-btn" title="回退到这里：之后的对话不再进上下文；默认连这段的文件改动一起回滚（按住 Alt 只回退对话）">${icon("refresh", "ic ic-sm")}从这儿重来</button>
     <button class="fk-btn" title="从这里分叉出一条新会话：原会话完全不动，这句原话放回输入框">${icon("git", "ic ic-sm")}分叉</button></div>`);
   node.__raw = text; // 原样存一份，回退/分叉时用它去日志里找对应那条
+  if (Number.isInteger(logIndex)) node.__log = logIndex; // 复核2#1：完整日志下标绑在节点上，回退/分叉直取
   node.querySelector(".rw-btn").onclick = (e) => rewindTo(node, e.altKey);
   node.querySelector(".fk-btn").onclick = () => forkTo(node);
   colEl().appendChild(node);
@@ -748,15 +869,8 @@ function addUser(text, images) {
 }
 
 /* ---- 只回退对话（不动文件） ---- */
-// 与 core/context.mjs 的 rewindRanges/isDropped 同一套规则：被回退的那段日志还留着，但不再算数
-function rewindRanges(events) {
-  const out = [];
-  (events || []).forEach((ev, i) => {
-    if (ev.type === "rewind" && Number.isInteger(ev.atIndex)) out.push({ atIndex: ev.atIndex, marker: i, dropped: ev.dropped || 0 });
-  });
-  return out;
-}
-const isDropped = (ranges, i) => ranges.some((r) => i > r.atIndex && i < r.marker);
+// （历史注记：这里曾是页内坐标版的 rewindRanges/isDropped，复核2#2 后回退区间统一走
+//   renderEventRange / findUserEventIndex 里的完整日志坐标（_log），这套页内版已无人使用。）
 
 async function rewindTo(node, onlyChat) {
   if (!S.sessionId) return toast("还没有可以回退的对话", "err");
@@ -787,7 +901,7 @@ async function rewindDo(node, onlyChat) {
     if (at < 0) return toast("没在日志里找到这条消息（可能已被压缩）", "err");
     const r = await rewindRequest(at, !onlyChat);
     const fresh = await api.session(S.sessionId);
-    renderHistory(fresh.events);
+    renderHistory(fresh.events, fresh); // 复核2#2：重渲染必须带分页元数据，否则「载入更早」入口会消失
     if (fresh.budget) { S.budget = fresh.budget; renderUsage(); }
     // 放回输入框时只回原话：附件块（【文件 …】）是发送时才拼进去的，不跟着回来
     setInput(raw.split("\n\n【文件 ")[0] || raw);
@@ -839,19 +953,30 @@ async function rewindRequest(at, withFiles) {
   }
 }
 
-// 在日志里找到这条用户消息对应的事件下标（回退与分叉共用）
+// 在日志里找到这条用户消息对应的事件下标（回退与分叉共用）。
+// 复核2#1：优先用渲染时绑在节点上的 __log（完整日志下标，跨分页/重复文本都不会错）；
+// 活动消息（本轮刚发、必然在服务端尾段里）按「同文本从后往前第几次」对齐——
+// 重复文本时旧的那几次都在更早的分页里，从尾数起只数到本次，不会错位。
 async function findUserEventIndex(node) {
   const raw = node.__raw || "";
+  if (Number.isInteger(node.__log)) return node.__log;
   const j = await api.session(S.sessionId);
-  const ranges = rewindRanges(j.events);
-  const ord = [...colEl().querySelectorAll(".msg-user")].filter((n) => n.__raw === raw).indexOf(node);
-  let seen = -1;
-  for (let i = 0; i < j.events.length; i++) {
-    const e = j.events[i];
-    if (e.type !== "user" || isDropped(ranges, i)) continue;
-    if ((e.text || "") === raw && ++seen === ord) return i;
+  const ranges = [];
+  for (const ev of j.events || []) {
+    if (ev.type === "rewind" && Number.isInteger(ev.atIndex)) ranges.push({ at: ev.atIndex, marker: Number.isInteger(ev._log) ? ev._log : null });
   }
-  return -1;
+  const dropped = (e) => ranges.some((r) => Number.isInteger(r.marker) && Number.isInteger(e._log) && e._log > r.at && e._log < r.marker);
+  const domSame = [...colEl().querySelectorAll(".msg-user")].filter((n) => n.__raw === raw);
+  const fromEnd = domSame.length - 1 - domSame.indexOf(node); // DOM 里同文本的倒数第几条
+  const arrSame = [];
+  for (let i = 0; i < (j.events || []).length; i++) {
+    const e = j.events[i];
+    if (e.type !== "user" || (e.text || "") !== raw || dropped(e)) continue;
+    arrSame.push(e);
+  }
+  const hit = arrSame[arrSame.length - 1 - fromEnd];
+  if (!hit) return -1;
+  return Number.isInteger(hit._log) ? hit._log : j.events.indexOf(hit);
 }
 
 // 从这条消息分叉出一条新会话（原会话不动）
@@ -911,6 +1036,24 @@ function stopThink(c) {
 function addError(msg) {
   colEl().appendChild(el(`<div class="err-box">${esc(msg)}</div>`));
   scrollEnd(true);
+}
+
+/* ---- 任务结果卡（评审）：轮末一行式小结——完成了什么 / 改了哪些文件 / 检查 / 计划 ---- */
+function addResultCard(r) {
+  const rows = [];
+  if (!r.aborted && r.replyHead) rows.push(["完成了什么", esc(r.replyHead) + (r.replyHead.length >= 90 ? "…" : "")]);
+  if (r.changed?.length) {
+    const names = [...new Set(r.changed.map((c) => c.rel || c.path || "").filter(Boolean))];
+    rows.push(["改了哪些文件", names.slice(0, 8).map(esc).join("、") + (names.length > 8 ? ` 等 ${names.length} 处` : "")]);
+  }
+  if (r.check) rows.push(["检查", `${r.check.ok ? "通过" : "没过"}${r.check.summary ? "：" + esc(r.check.summary) : ""}`]);
+  if (r.plan) rows.push(["计划进度", esc(r.plan)]);
+  if (r.aborted) rows.push(["状态", "这一轮被手动停止。已执行的改动不会自动撤回——点上面各轮的改动卡可逐个撤销"]);
+  if (!rows.length) return;
+  colEl().appendChild(el(`<div class="result-card">${icon("check", "ic ic-sm")}${rows
+    .map(([k, v]) => `<span class="rc-row"><b>${esc(k)}</b>${v}</span>`)
+    .join("")}</div>`));
+  scrollEnd();
 }
 
 // 本轮生成统计（v9.10；速度算法与实时化 v9.11）：先在生成过程中实时滚动「≈tokens · tok/s · 秒数」，定稿换精确值
@@ -1444,12 +1587,19 @@ export function renderPlan(items) {
 }
 
 /* ---- 历史回放 ---- */
-export function renderHistory(events) {
-  clearStream();
-  S.usageStart = events?.[0]?.ts ? Date.parse(events[0].ts) : null; // /usage 的"用时"基准 = 这条会话第一条记录的时间
+// 评审 #4：一段可见事件 → 一串卡片。renderHistory 只渲染服务端给的尾段；
+// 更早的由 loadOlder 向上补（同一套渲染，补完按高度差还原滚动位置）。
+let historyMore = null; // { total, loadedFrom, loading }：loadedFrom = 已载入的最早一条在可见事件里的下标
+function renderEventRange(events) {
   const map = {};
   const cpCards = new Map(); // 检查点 id → 改动卡：回滚过的事件要标回当时那张卡片
-  const ranges = rewindRanges(events); // 被回退掉的那段不再显示
+  // 复核2#2：回退区间统一用完整日志坐标——atIndex 是日志下标，marker 也认事件的 _log，
+  // 页内数组下标跟它对不上（分页/载入更早之后必然错位）
+  const ranges = [];
+  for (const ev of events || []) {
+    if (ev.type === "rewind" && Number.isInteger(ev.atIndex)) ranges.push({ at: ev.atIndex, marker: Number.isInteger(ev._log) ? ev._log : null, dropped: ev.dropped || 0 });
+  }
+  const dropped = (ev) => ranges.some((r) => Number.isInteger(r.marker) && Number.isInteger(ev._log) && ev._log > r.at && ev._log < r.marker);
   let pending = []; // 攒连续的 change 事件，攒完统一出一张卡
   const flushChanges = () => {
     if (!pending.length) return;
@@ -1460,13 +1610,13 @@ export function renderHistory(events) {
   for (let i = 0; i < (events || []).length; i++) {
     const ev = events[i];
     if (ev.type !== "change") flushChanges();
-    if (isDropped(ranges, i)) continue;
+    if (dropped(ev)) continue;
     switch (ev.type) {
       case "plan": renderPlan(ev.items); break;
       case "compact": break;
       case "reasoning": if (showThinking()) addThinkStatic(ev.text, ev.ms); break;
       case "rewind": colEl().appendChild(el(rewindLine({ dropped: ev.dropped, files: ev.files }))); break;
-      case "user": ev.auto ? noteLine(ev.text.split("\n")[0] + "（自动）") : addUser(ev.text, ev.images); break;
+      case "user": ev.auto ? noteLine(ev.text.split("\n")[0] + "（自动）") : addUser(ev.text, ev.images, ev._log); break;
       case "check": addCheckCard(ev); break;
       case "assistant_message": { const n = addStream(); finishAi(n, ev.text); break; }
       case "tool_call": map[ev.id] = addTool(ev); break;
@@ -1477,6 +1627,51 @@ export function renderHistory(events) {
     }
   }
   flushChanges();
+}
+
+function updateEarlierBtn() {
+  colEl().querySelector(".load-earlier")?.remove();
+  if (!historyMore?.more) return;
+  const btn = el(`<button class="load-earlier">${icon("refresh", "ic ic-sm")}载入更早的消息（还有 ${historyMore.loadedFrom} 条）</button>`);
+  btn.onclick = () => loadOlder();
+  colEl().insertBefore(btn, colEl().firstChild);
+}
+
+async function loadOlder() {
+  if (!historyMore?.more || historyMore.loading || S.sending) return;
+  historyMore.loading = true;
+  const btn = colEl().querySelector(".load-earlier");
+  if (btn) { btn.disabled = true; btn.textContent = "正在载入…"; }
+  try {
+    const r = await api.sessionPage(S.sessionId, historyMore.loadedFrom);
+    const sc = streamEl();
+    const h0 = sc.scrollHeight;
+    const countBefore = colEl().children.length;
+    historyPrepend = true;
+    try { renderEventRange(r.events || []); } finally { historyPrepend = false; }
+    const added = [...colEl().children].slice(countBefore);
+    const first = colEl().firstChild; // 「载入更早」按钮保持最上
+    for (const n of added) colEl().insertBefore(n, first);
+    historyMore.loadedFrom = r.from;
+    historyMore.more = !!r.more;
+    updateEarlierBtn();
+    sc.scrollTop += sc.scrollHeight - h0; // 滚动锚点：上面长了多少，视口就下移多少，眼前内容不动
+  } catch (e) {
+    toast(e.message, "err");
+    updateEarlierBtn();
+  } finally {
+    if (historyMore) historyMore.loading = false;
+  }
+}
+
+export function renderHistory(events, meta) {
+  clearStream();
+  S.usageStart = events?.[0]?.ts ? Date.parse(events[0].ts) : null; // /usage 的"用时"基准 = 这条会话第一条记录的时间
+  renderEventRange(events || []);
+  historyMore = meta && meta.total > (events || []).length
+    ? { total: meta.total, loadedFrom: meta.total - (events || []).length, more: true, loading: false } // 复核#4：more 必须真给，按钮才有得亮
+    : null;
+  updateEarlierBtn();
   if (!colEl().children.length) renderWelcome();
   refreshTurnRail();
   scrollEnd(true);
@@ -1527,7 +1722,7 @@ export function renderUsage() {
   const total = S.tokens.input + S.tokens.output;
   const cachePct = S.tokens.cached && S.tokens.input ? Math.min(100, Math.round((S.tokens.cached / S.tokens.input) * 100)) : 0;
   $("#usage").textContent = total ? `本轮 ${total} tokens` + (cachePct ? ` · 缓存 ${cachePct}%` : "") : "";
-  // 模式芯片以 S.mode 为准：状态条一刷新就顺带对齐（服务端中途改档、Shift+Tab、/mode 都覆盖到）
+  // 模式芯片以 S.mode 为准：状态条一刷新就顺带对齐（服务端中途改档、Ctrl+Shift+M、/mode 都覆盖到）
   if (lastRenderedMode !== S.mode) {
     lastRenderedMode = S.mode;
     renderModeBtn();
@@ -1686,20 +1881,129 @@ export function setSendUI() {
 }
 
 export function abortRun() {
+  // 评审 #5/#7：停止要真停服务端那一轮（带 runId，防竞态误杀新一轮）；本地连接一起掐，UI 立刻收尾
+  try { api.abort(S.sessionId, S.runId); } catch {}
   window.__abort?.abort();
+}
+
+// 切走时只掐本地这条连接：服务端任务照跑，回来再 reattachIfNeeded 重接（评审 #5）
+let detachRequested = false;
+export function detachRun() {
+  if (!S.sending) return;
+  detachRequested = true;
+  window.__abort?.abort();
+}
+
+// 刷新/切回后发现这一轮还在跑：接上事件流接着看（不重发、不重跑工具、待审批照常弹）
+// 打开会话时上一轮没正常收尾（服务重启/断流）：给用户一行说明（评审 #5 的用户可见面）
+export function noteInterrupted() {
+  noteLine("上一轮没有正常收尾——可能刷新过页面、断过网或重启过服务。先检查现场（已执行的命令、已落盘的改动），再决定继续还是重做。");
+}
+
+export async function reattachIfNeeded(sessionId, opts = {}) {
+  if (S.sending || !sessionId) return;
+  let st = null;
+  try { st = await api.runStatus(sessionId); } catch { return; }
+  const snapshotHadRun = typeof opts.expectRunId === "string" && !!opts.expectRunId; // runId 是字符串（复核4#1）
+  if (!st?.running) {
+    // 复核3#3：历史快照读到「在跑」、这里已经跑完——快照里没有这一轮，重取完整历史补上
+    if (snapshotHadRun && S.sessionId === sessionId) {
+      try {
+        const fresh = await api.session(sessionId);
+        if (S.sessionId !== sessionId) return;
+        renderHistory(fresh.events, fresh);
+        if (fresh.interrupted) noteInterrupted();
+      } catch { /* 读不到就维持现状（下次刷新自愈） */ }
+    }
+    drainQueueSoon();
+    return;
+  }
+  if (S.sending || S.sessionId !== sessionId) return;
+  S.runId = st.runId;
+  S.sending = true;
+  setSendUI();
+  noteLine("这一轮还在跑（刷新前的任务已接上，下面是实时进度）");
+  // 复核4#2：首次会话的欢迎页必须先让位（回放 user 事件会触发 addUser → clearStream），
+  // 否则先创建的流节点会被那一下 clearStream 连带移除、后续增量全部写进脱管节点
+  if ($(".welcome")) { setHome(false); clearStream(); }
+  // 复核5：流节点懒创建——回放先来的是 mode/user 事件，预建流节点会排在用户消息上面
+  // （第一段回答出现在提问之前）；等第一段内容真正到达时才建，DOM 顺序天然正确。
+  // 复核#3：流状态用真闭包——assistant_message 会收旧气泡开新气泡，
+  // 空实现会让后续增量写进已移除的节点（多段回答全部消失）
+  let cur = null;
+  const ensureStream = () => cur || (cur = addStream());
+  let fullBuf = "";
+  const c = {
+    replay: true, // 重放路径：mode/compact 这类事件不弹提示（复核3#2，该说的卡已在历史里）
+    tools: new Map(),
+    subs: new Map(),
+    think: { node: null, text: "", started: 0, timer: null },
+    stats: { t0: Date.now(), firstAt: 0, chars: 0, estTok: 0, genMs: 0, segStart: 0, startUsage: { input: S.tokens.input || 0, output: S.tokens.output || 0, cached: S.tokens.cached || 0 } },
+    getStream: () => ensureStream(), // 懒创建：首段内容到达才建节点，回答永远排在用户消息之后（复核5）
+    setStream: (n) => (cur = n),
+    getFull: () => fullBuf,
+    setFull: (t) => (fullBuf = t),
+  };
+  const ctrl = new AbortController();
+  window.__abort = ctrl; // 停止按钮先掐这条读流；服务端那一轮由 abortRun 里的 api.abort 叫停
+  try {
+    const res = await api.chatEvents(sessionId, ctrl.signal); // 从 0 完整回放：历史快照已把「正在跑的这一轮」裁掉（复核2#3）
+    if (!res.ok || !res.body) throw new Error("服务返回 " + res.status);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 2);
+        if (!line.startsWith("data:")) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5)); } catch { continue; }
+        handleEvent(ev, c);
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      if (detachRequested) detachRequested = false; // 切走了：静默
+    } else {
+      addError("直播断了：" + e.message + "（任务在服务端多半还在跑——切走再切回来就能重接）");
+    }
+  } finally {
+    stopThink({ think: c.think });
+    window.__abort = null;
+    S.sending = false;
+    setSendUI();
+    S.onSessionTouched && S.onSessionTouched();
+    // 回放渲染的是运行时流；跑完重取一次完整历史，分页状态（载入更早的游标）才对得上（复核3#3）
+    if (S.sessionId === sessionId && !S.sending) {
+      try {
+        const fresh = await api.session(sessionId);
+        if (S.sessionId === sessionId && !S.sending) renderHistory(fresh.events, fresh);
+      } catch { /* 重取失败就维持回放画面（下次刷新自愈） */ }
+    }
+    drainQueueSoon(); // 这一轮收了尾，属于本会话的队列接着发（复核#2）
+  }
 }
 
 /* ================= 高危确认 ================= */
 const queue = [];
 function queueConfirm(ev) {
+  // 复核#3：重接会把「还没裁决的审批」补发一遍——同一条别弹两次
+  if (queue.some((q) => q.confirmId === ev.confirmId) || showingConfirmId === ev.confirmId) return;
   queue.push(ev);
   if (queue.length === 1) showConfirm();
   // 要人拍板、人却不在跟前 —— 这是最该喊一声的场景
   ping("需要你确认一个操作", `${ev.name}：${ev.args?.path || ev.args?.command || ev.args?.query || ev.args?.url || ""}`);
 }
+let showingConfirmId = "";
 function showConfirm() {
   const ev = queue[0];
   if (!ev) return;
+  showingConfirmId = ev.confirmId || "";
   $("#cfmMeta").textContent = `${ev.name} · 风险等级 ${ev.risk || "high"}` + (ev.reason ? " · " + ev.reason : "");
   // 「为什么问你」要说清楚（例如同一个调用重复第 3 次）
   const why = $("#cfmWhy");
@@ -2322,7 +2626,8 @@ export async function doCompact(instruction = "") {
 async function exportSession() {
   if (!S.sessionId || !colEl().querySelector(".msg-user")) return toast("还没有对话内容可导出", "err");
   try {
-    const j = await api.session(S.sessionId);
+    // 评审复核#5：导出要完整历史——tail=all 拉全量，别拿分页尾段冒充整份记录
+    const j = await api.session(S.sessionId, S.provider || S.active, "all");
     const name = (S.title || "u-agent 会话").replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 40);
     const blob = new Blob([sessionMarkdown(S.title, j.events)], { type: "text/markdown;charset=utf-8" });
     const a = document.createElement("a");
@@ -2431,7 +2736,7 @@ export async function showStatus(full) {
   let st = {};
   try { st = await api.settings(); } catch {}
   const lines = [
-    `模型通道：${S.active || "未选择"}`,
+    `模型通道：${(S.providers || []).find((p) => p.id === S.active || p.name === S.active)?.name || S.active || "未选择"}`,
     `权限模式：${MODES.find((m) => m.id === S.mode)?.name || S.mode}`,
     `工作区：${st.workspace || "（还没设置）"}`,
     `上下文：约 ${kb((S.budget.chars || 0) * 2)}${S.budget.over ? "（建议压缩）" : ""}`,
@@ -2444,20 +2749,36 @@ export async function showStatus(full) {
 
 /* ================= 附件 ================= */
 const TEXT_EXT = /\.(txt|md|json|jsonl|js|mjs|ts|tsx|jsx|py|html|css|yml|yaml|csv|log|ini|toml|sh|ps1|bat|cmd|c|h|cpp|java|go|rs|xml|sql|env)$/i;
+// 图片上限与 core/server/chat.mjs 是同一份契约（评审 #2）：前端拦在第 5 张并明说，后端对漏网的整条拒绝
+const MAX_IMAGES = 4;
+let readingFiles = 0; // 还在 FileReader 里的附件数：读取中禁发，附件条上给状态
+
+export function attachmentsBusy() {
+  return readingFiles > 0;
+}
 
 export function addFiles(files) {
+  let pendingTextBytes = 0; // 还在读的文本附件合计大小：并发多选时也守住 200KB 线
   for (const f of files) {
     if (/^image\//.test(f.type)) {
       if (f.size > 5 * 1048576) { toast(`${f.name} 超过 5MB，已跳过`, "err"); continue; }
+      if (S.images.length + readingFiles >= MAX_IMAGES) { toast(`最多附 ${MAX_IMAGES} 张图片，${f.name} 没加上`, "err"); continue; }
+      readingFiles++;
+      renderAttachments();
       const url = URL.createObjectURL(f);
       const reader = new FileReader();
-      reader.onload = () => { S.images.push({ mediaType: f.type, data: String(reader.result).split(",")[1], url }); renderAttachments(); };
+      reader.onload = () => { readingFiles--; S.images.push({ mediaType: f.type, data: String(reader.result).split(",")[1], url }); renderAttachments(); };
+      reader.onerror = () => { readingFiles--; URL.revokeObjectURL(url); toast(`${f.name} 读不出来，已跳过`, "err"); renderAttachments(); };
       reader.readAsDataURL(f);
     } else if (/^text\//.test(f.type) || TEXT_EXT.test(f.name)) {
       const total = S.texts.reduce((a, t) => a + t.text.length, 0);
-      if (total + f.size > 204800) { toast(`文本附件合计上限 200KB，跳过 ${f.name}`, "err"); continue; }
+      if (total + pendingTextBytes + f.size > 204800) { toast(`文本附件合计上限 200KB，跳过 ${f.name}`, "err"); continue; }
+      pendingTextBytes += f.size;
+      readingFiles++;
+      renderAttachments();
       const reader = new FileReader();
-      reader.onload = () => { S.texts.push({ name: f.name, text: String(reader.result).slice(0, 102400) }); renderAttachments(); toast(`已附上 ${f.name}`, "ok"); };
+      reader.onload = () => { readingFiles--; pendingTextBytes -= f.size; S.texts.push({ name: f.name, text: String(reader.result).slice(0, 102400) }); renderAttachments(); toast(`已附上 ${f.name}`, "ok"); };
+      reader.onerror = () => { readingFiles--; pendingTextBytes -= f.size; toast(`${f.name} 读不出来，已跳过`, "err"); renderAttachments(); };
       reader.readAsText(f);
     } else toast(`跳过 ${f.name}（只要图片或文本文件）`, "err");
   }
@@ -2466,6 +2787,9 @@ export function addFiles(files) {
 export function renderAttachments() {
   const box = $("#imgs");
   box.innerHTML = "";
+  if (S.images.length || readingFiles) {
+    box.appendChild(el(`<div class="attach-count">图片 ${S.images.length}/${MAX_IMAGES}${readingFiles ? " · 读取中…" : ""}</div>`));
+  }
   S.images.forEach((p, ix) => {
     const n = el(`<div class="attach-item"><img src="${p.url}"><span>${esc(p.mediaType.replace("image/", ""))}</span><button class="x" title="移除">${icon("close", "ic ic-sm")}</button></div>`);
     n.querySelector(".x").onclick = () => { URL.revokeObjectURL(p.url); S.images.splice(ix, 1); renderAttachments(); };
@@ -2476,7 +2800,7 @@ export function renderAttachments() {
     n.querySelector(".x").onclick = () => { S.texts.splice(ix, 1); renderAttachments(); };
     box.appendChild(n);
   });
-  box.hidden = !S.images.length && !S.texts.length;
+  box.hidden = !S.images.length && !S.texts.length && !readingFiles; // 读取中也要显示（计数条就是状态）
   autoGrow();
 }
 export function clearAttachments() {
@@ -2532,29 +2856,48 @@ export function autoGrow() {
 }
 export function setInput(v) { txtEl().value = v; autoGrow(); focusInput(); }
 
-/* ---- 草稿持久化（v9.10）：按会话隔离存 localStorage，刷新/切会话不丢；发完自动清 ---- */
+/* ---- 草稿持久化（v9.10 → 评审便携版）：正文草稿存 U 盘 data/drafts.json（实例+会话隔离），
+   换电脑/浏览器/端口都接得回来；localStorage 只作一次性迁移来源。停手 300ms 落一次 ---- */
 const DRAFT_PREFIX = "ua_draft:";
-const draftScope = () => DRAFT_PREFIX + (S.sessionId || "__draft__");
 let draftTimer = null;
+let draftSeq = 0; // 快速切会话：只认最后一次恢复请求，过期响应作废
 function saveDraftNow() {
+  clearTimeout(draftTimer);
+  draftTimer = null;
+  const v = txtEl().value;
   try {
-    const v = txtEl().value;
-    if (v.trim()) localStorage.setItem(draftScope(), v.slice(0, 20000));
-    else localStorage.removeItem(draftScope());
+    const sid = S.sessionId || "__draft__";
+    if (v.trim()) localStorage.setItem(DRAFT_PREFIX + sid, v.slice(0, 20000));
+    else localStorage.removeItem(DRAFT_PREFIX + sid);
   } catch {}
+  // 评审：正文草稿上 U 盘。失败不扰人——本地那份还在
+  api.saveDraft(S.sessionId || "__draft__", v.slice(0, 20000)).catch(() => {});
 }
 // 切会话 / 新会话前必须先调它：草稿是停手 300ms 后才落盘的，晚一步 S.sessionId 就变了，
 // 挂着的定时器会把内容写进新会话的槽位、旧会话刚打的字就丢了（审查 一.5）
 export function flushDraft() {
-  clearTimeout(draftTimer);
-  draftTimer = null;
-  saveDraftNow();
+  if (draftTimer) saveDraftNow();
 }
 export function restoreDraft() {
-  try {
-    txtEl().value = localStorage.getItem(draftScope()) || "";
+  const sid = S.sessionId || "__draft__";
+  const my = ++draftSeq;
+  const before = txtEl().value; // 复核#6：恢复是异步的——等待期间用户动了键盘就放弃，绝不覆盖新输入
+  const stale = () => my !== draftSeq || sid !== (S.sessionId || "__draft__") || txtEl().value !== before;
+  api.getDraft(sid).then((r) => {
+    if (stale()) return;
+    let text = r.text || "";
+    if (!text.trim()) {
+      // 旧版存在浏览器里的草稿一次性搬上 U 盘，之后以 U 盘为准
+      try { text = localStorage.getItem(DRAFT_PREFIX + sid) || ""; } catch {}
+      if (text.trim()) api.saveDraft(sid, text.slice(0, 20000)).catch(() => {});
+    }
+    if (stale()) return; // 等待期间又动了（双保险，比如分叉回填原话）
+    txtEl().value = text;
     autoGrow();
-  } catch {}
+  }).catch(() => {
+    if (stale()) return; // 失败分支同一条守卫
+    try { txtEl().value = localStorage.getItem(DRAFT_PREFIX + sid) || ""; autoGrow(); } catch {}
+  });
 }
 // ↑ 翻历史：干净输入框按一下捞上一条，连续按继续往前翻
 export function recallPrev() {
@@ -2837,7 +3180,7 @@ const KEYS = [
   ["Ctrl / ⌘ + /", "这张快捷键表"],
   ["Ctrl / ⌘ + Shift + N", "新会话"],
   ["Esc", "关浮层；没有浮层且正在跑 → 停止这一轮"],
-  ["Shift + Tab", "循环切换权限档"],
+  ["Ctrl / ⌘ + Shift + M", "循环切换权限档（Shift+Tab 留给反向焦点导航）"],
   ["Enter / Shift + Enter", "发送 / 换行"],
   ["↑ / ↓（输入框空时）", "翻历史输入"],
   ["/ 或 @", "命令与文件补全"],
@@ -2876,7 +3219,7 @@ export function closeOverlays() {
 /* ================= 模型通道（顶栏按钮由 picker 渲染） ================= */
 export function fillProviders(st) {
   S.providers = st.providers || [];
-  S.active = st.active || S.providers[0]?.name || "";
+  S.active = st.active || S.providers[0]?.id || S.providers[0]?.name || ""; // 通道引用以 id 为主（评审 #1）
   S.provider = S.active;
   S.workspace = st.workspace || "";
   renderModelBtn();
@@ -2909,7 +3252,7 @@ export function initChat() {
   syncPlanQuick();
   window.addEventListener("resize", refreshTurnRail); // 导航条按消息列左缘定位，窗口变了跟一下
   // 滚动
-  streamEl().addEventListener("scroll", () => { nearBottom = atBottom(); scrollEnd(); });
+  streamEl().addEventListener("scroll", () => { nearBottom = atBottom(); scrollEnd(); if (streamEl().scrollTop < 120) loadOlder(); });
   // 滚轮往上 = 明说要看前面的：立刻停跟随，别等滚动事件把十几像素的位移算成「还在底部」。
   // （滚动条拖动本身没有 DOM 事件可监听，靠 atBottom 的小阈值兜住：拖过 10px 就停止吸底）
   // 注意必须判「真的可滚动」：内容没溢出时滚一下滚轮不该把跟随关掉（否则「回到最新」无缘无故冒出来）
@@ -2947,7 +3290,9 @@ export function initChat() {
     if (e.key === "ArrowDown" && histIdx >= 0 && (txtEl().selectionStart ?? 0) === txtEl().value.length) {
       if (recallNext()) { e.preventDefault(); return; }
     }
-    if (e.key === "Tab" && e.shiftKey) { e.preventDefault(); cycleMode(); return; } // Shift+Tab 循环权限档
+    // Shift+Tab 交还给浏览器：反向焦点导航是标准可访问性动作（评审复核：键盘用户必须能从输入框
+    // 回到上一个控件）。切权限模式走顶栏权限胶囊的点击，或 Ctrl+Shift+M——明确的动作，不占导航键
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "m") { e.preventDefault(); cycleMode(); return; }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); return sendMessage(txtEl().value); }
   });
   // 粘贴：清掉不可见字符（提示词走私/伪装字符），命中时明确告诉用户

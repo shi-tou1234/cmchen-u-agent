@@ -132,8 +132,22 @@ export function askConfirm({ title = "确认操作", body = "", okText = "确定
 /* ---------- Markdown ----------
    行式解析：先抽代码块，再逐行识别标题/分隔线/引用/列表/表格，最后做行内格式。
    只用浏览器原生能力渲染，不引任何库。                                        */
+// 评审 #4：已完成回答的渲染缓存——回放历史/向上补页时同一段文本不再重复解析。
+// 只缓存短文本（长文直接算），超量整体清空：粗但零维护，胜在没有任何失效逻辑要管。
+const mdCache = new Map();
 export function md(src) {
-  src = String(src ?? "");
+  const s = String(src ?? "");
+  if (s.length > 20000) return mdRaw(s);
+  let hit = mdCache.get(s);
+  if (hit === undefined) {
+    hit = mdRaw(s);
+    if (mdCache.size >= 400) mdCache.clear();
+    mdCache.set(s, hit);
+  }
+  return hit;
+}
+
+function mdRaw(src) {
   const blocks = [];
   src = src.replace(/```([\w-]*)[ \t]*\n?([\s\S]*?)(?:```|$)/g, (_, lang, code) => {
     blocks.push({ lang: lang || "code", code: code.replace(/\n$/, "") });

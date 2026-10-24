@@ -50,14 +50,29 @@ export const api = {
   memoryCompact: () => post("/api/memory-compact", {}), // 借模型把记忆压成要点
   persona: () => get("/api/persona"), // 人格正文 + 预设 + 三档风格选项
   savePersona: (text) => post("/api/persona", { text }),
+  // 便携草稿（评审）：正文草稿跟着 U 盘走，按「实例 + 会话」隔离
+  getDraft: (sessionId) => get("/api/draft?sessionId=" + encodeURIComponent(sessionId)),
+  saveDraft: (sessionId, text) => post("/api/draft", { sessionId, text }),
+  // 收工入口（评审）：立即锁定 / 停止服务准备拔盘
+  lockNow: () => post("/api/lock-now", {}),
+  shutdown: () => post("/api/shutdown", {}),
+  workspaceStatus: () => get("/api/workspace-status"),
 
   sessions: () => get("/api/sessions"),
-  session: (id, provider) => get("/api/session?id=" + encodeURIComponent(id) + (provider ? "&provider=" + encodeURIComponent(provider) : "")),
+  session: (id, provider, tail) => get("/api/session?id=" + encodeURIComponent(id) + (provider ? "&provider=" + encodeURIComponent(provider) : "") + (tail ? "&tail=" + tail : "")),
+  // 向上补更早的历史（评审 #4）：before = 已载入的最早一条在可见事件里的下标
+  sessionPage: (id, before, limit) => get("/api/session-page?id=" + encodeURIComponent(id) + "&before=" + (before || 0) + "&limit=" + (limit || 300)),
   renameSession: (id, title) => post("/api/session-rename", { id, title }),
   dropSession: (id) => req("/api/session?id=" + encodeURIComponent(id), { method: "DELETE" }),
 
   confirm: (confirmId, approve, note, rememberPrefix, opts) => post("/api/confirm", { confirmId, approve, note: note || "", rememberPrefix: rememberPrefix || "", ...(opts || {}) }),
-  abort: (sessionId) => post("/api/abort", { sessionId }),
+  abort: (sessionId, runId) => post("/api/abort", { sessionId, runId }),
+  // 评审 #5：断线重接——在跑任务的状态与事件流（返回原始 Response，调用方读 SSE）
+  runs: () => get("/api/runs"),
+  runStatus: (sessionId) => get("/api/run-status?sessionId=" + encodeURIComponent(sessionId)),
+  chatEvents(sessionId, signal, since = 0) {
+    return fetch("/api/chat-events?sessionId=" + encodeURIComponent(sessionId) + "&since=" + (since || 0), { credentials: "same-origin", signal });
+  },
   compact: (sessionId, provider, instruction) => post("/api/compact", { sessionId, provider, instruction: instruction || "" }),
   modelInfo: (provider) => post("/api/model-info", { provider }),
   commands: () => get("/api/commands"),

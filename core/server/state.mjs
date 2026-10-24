@@ -4,27 +4,53 @@ import fs from "node:fs";
 import { modelInfo, budgetOfModel, reasoningDepths } from "../model-windows.mjs";
 import { DEFAULT_AUTO_APPROVE } from "../modes.mjs";
 import { normalizeVoice } from "../persona.mjs";
-import { readJson, writeJson } from "../util.mjs";
+import { genId, readJson, writeJson } from "../util.mjs";
 import { CONFIG, DEFAULT_KEEP_TOKENS, EXAMPLE, MASK, SETTINGS, defaultProviders, vaultLoad, vaultSave } from "./runtime.mjs";
 let stateCache = null; // 每个请求都读盘 + 解密 vault 太亏（U 盘上尤其费时）；saveState 写盘后置空
+
+// 通道稳定 ID（评审 #1）：名字只是展示名，可随便改；钥匙、当前通道、轻量通道全部按 id 关联。
+// 老配置没有 id → 载入时补一个并当场写回 config.json（不含钥匙），id 从此不再漂移。
+function withIds(providers) {
+  return (providers || []).map((p) => (p && p.id ? p : { ...p, id: genId("pv") }));
+}
+// 引用（active / assist）解析：先认 id，再认名字（老配置/老前端按名引用的兼容路）；找不到返回 ""
+function resolveRef(key, providers) {
+  const k = String(key || "").trim();
+  if (!k) return "";
+  const hit = providers.find((p) => p.id === k) || providers.find((p) => p.name === k);
+  return hit ? hit.id : "";
+}
+// 按 id 或名字找通道（服务端统一入口，别再各处手写 find(p => p.name === …)）
+function findProvider(st, key) {
+  const k = String(key || "").trim();
+  if (!k) return null;
+  return st.providers.find((p) => p.id === k) || st.providers.find((p) => p.name === k) || null;
+}
 function loadState() {
   if (stateCache) return stateCache;
   const base = readJson(CONFIG, null) || readJson(EXAMPLE, null) || {};
   const vault = vaultLoad();
   const settings = readJson(SETTINGS, {});
-  const providers = (base.providers || defaultProviders()).map((p) => ({
+  const raw = base.providers || defaultProviders();
+  const providers = withIds(raw).map((p) => ({
     ...p,
-    secret: vault.providers?.[p.name] || "",
+    // 钥匙：先按 id 取，再按名字兜底（老钥匙库按名存；下次保存起按 id 存，名字键也一并写上）
+    secret: vault.providers?.[p.id] || vault.providers?.[p.name] || "",
   }));
+  if (raw.some((p) => !p?.id)) {
+    // 一次性迁移：把补好的 id 落盘（钥匙绝不落 config.json）。写失败不挡启动——
+    // 进程内 id 依然自洽，下次保存时自然补齐
+    try { writeJson(CONFIG, { providers: providers.map(({ secret, ...p }) => p), active: base.active ?? "" }); } catch {}
+  }
   const built = {
     providers,
-    active: base.active || settings.active || providers[0]?.name,
+    active: resolveRef(base.active || settings.active || "", providers) || providers[0]?.id || "",
     workspace: settings.workspace || "",
     extraRoots: Array.isArray(settings.extraRoots) ? settings.extraRoots.filter(Boolean).map(String) : [], // 额外可访问的目录（和主工作区同等对待）
     proxy: String(settings.proxy || ""), // 联网工具用的 HTTP 代理（空 = 直连）
     searchKeys: vault.searchKeys || {},
     autoApprove: { ...DEFAULT_AUTO_APPROVE, ...(settings.autoApprove || {}), actions: { ...DEFAULT_AUTO_APPROVE.actions, ...((settings.autoApprove || {}).actions || {}) } },
-    assist: settings.assist || "", // 轻量通道：起名/压缩这类杂活用，留空=跟随当前通道
+    assist: resolveRef(settings.assist || "", providers), // 轻量通道：按 id 引用（老配置按名存的在载入时已归一）
     // 人格与表达风格（全默认 = 什么都不注入，模型原样输出）
     voice: normalizeVoice(settings.voice),
     autoCompactAt: settings.autoCompactAt === 0 ? 0 : Number(settings.autoCompactAt) > 0 ? Number(settings.autoCompactAt) : 0.8, // 上下文涨到这个比例就自动压缩（0=关）
@@ -37,8 +63,10 @@ function loadState() {
 }
 function saveState(patch) {
   const cur = loadState();
-  const providers = patch.providers || cur.providers;
-  const active = patch.active ?? cur.active;
+  const providers = withIds(patch.providers || cur.providers);
+  // active / assist 一律归一成 id 再落盘（前端可能按名传，老配置可能按名存）——
+  // 引用跟 id 走，改名 / 改排序都不再牵连钥匙与指向
+  const active = resolveRef(patch.active ?? cur.active, providers) || providers[0]?.id || "";
   const workspace = patch.workspace ?? cur.workspace;
   // 搜索钥匙：空串/掩码 = 不改（跟 providers 一个口径）。前端每次保存都会带上这两个字段，
   // 原先的「整份替换」会把用户已存的 Tavily/Brave 钥匙静默清掉（审查 #1 实锤）
@@ -53,16 +81,17 @@ function saveState(patch) {
   const extraRoots = patch.extraRoots ?? cur.extraRoots;
   const proxy = patch.proxy ?? cur.proxy;
   const autoApprove = patch.autoApprove ?? cur.autoApprove;
-  const assist = patch.assist ?? cur.assist;
+  const assist = resolveRef(patch.assist ?? cur.assist, providers);
   const autoCompactAt = patch.autoCompactAt ?? cur.autoCompactAt;
   const keepTokens = patch.keepTokens ?? cur.keepTokens;
   const voice = patch.voice !== undefined ? normalizeVoice(patch.voice) : cur.voice;
   const checks = patch.checks
     ? { test: String(patch.checks.test || "").slice(0, 300), lint: String(patch.checks.lint || "").slice(0, 300), auto: patch.checks.auto !== false }
     : cur.checks;
-  writeJson(CONFIG, { providers: providers.map((p) => ({ ...p, secret: "" })), active });
+  writeJson(CONFIG, { providers: providers.map(({ secret, ...p }) => p), active });
   const vault = { providers: {}, searchKeys: searchKeys || {} };
-  for (const p of providers) if (p.secret) vault.providers[p.name] = p.secret;
+  // 双键写入：id 是主键，名字键是给「旧版本应用 / 旧数据」兜底的——任何一个方向升级都不丢钥匙
+  for (const p of providers) if (p.secret) { vault.providers[p.id] = p.secret; if (p.name) vault.providers[p.name] = p.secret; }
   vaultSave(vault);
   writeJson(SETTINGS, { workspace, active, autoApprove, assist, autoCompactAt, keepTokens, checks, extraRoots, proxy, voice });
   stateCache = null; // 写盘了，缓存作废
@@ -98,4 +127,4 @@ function contextInfoOf(p) {
 }
 
 
-export { contextInfoOf, invalidateState, isLocalProvider, limitsOf, loadState, saveState, settingsReady, stateCache };
+export { contextInfoOf, findProvider, invalidateState, isLocalProvider, limitsOf, loadState, resolveRef, saveState, settingsReady, stateCache };

@@ -251,6 +251,18 @@ export function wasLastTurnAborted(events) {
   return false;
 }
 
+// 评审 #5：上一轮「没正常收尾」（没有 done 就到了日志末尾）= 刷新/断流/服务重启造成的中断。
+// 与 wasLastTurnAborted（用户主动停止，有 done 只是 aborted 标记）区分开，给模型的现场提醒措辞不同。
+export function wasTurnInterrupted(events) {
+  for (let i = (events?.length || 0) - 1; i >= 0; i--) {
+    const t = events[i].type;
+    if (t === "done") return false;
+    if (t === "user") return true; // 有 user 却没有 done：这一轮没跑完
+    if (t === "error") return false; // 以报错收场的算「已了结」
+  }
+  return false;
+}
+
 // 预算：按「这个模型真实能吃多少 token」算占比，而不是拿一个写死的字数上限吓唬人。
 // opts: { limitTokens 可用预算, windowTokens 模型窗口, overheadTokens 固定开销 }
 export function budgetOf(messages, opts = {}) {

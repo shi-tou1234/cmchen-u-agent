@@ -2,15 +2,15 @@
 // （2026-10-15 从 server.mjs 拆出；一个功能一个文件）
 import path from "node:path";
 import { normalizeBase } from "../providers.mjs";
-import { buildHistory, budgetOf, rewindRanges, isDropped, wasLastTurnAborted, estTokens, toolsTokensOf } from "../context.mjs";
+import { buildHistory, budgetOf, rewindRanges, isDropped, wasLastTurnAborted, wasTurnInterrupted, estTokens, toolsTokensOf } from "../context.mjs";
 import { loadSkills, skillsPromptSection } from "../skills.mjs";
 import { MODES } from "../modes.mjs";
 import { loadHookSources, matchHooks, runHookBatch } from "../hooks.mjs";
 import { genId } from "../util.mjs";
 import { runChecks, fixPrompt, checkSummary, CHECKS_MAX_FIX } from "../checks.mjs";
 import { DATA, UA_HOME, VERSION, checkpoints, confirmGate, registry, sessions } from "./runtime.mjs";
-import { contextInfoOf, limitsOf, loadState, settingsReady } from "./state.mjs";
-import { approveHook, auditLine, briefArgs, hookIsTrusted, hookPromptDenied, running, savedPrefixes, sessionCmdAllow } from "./perm.mjs";
+import { contextInfoOf, findProvider, limitsOf, loadState, settingsReady } from "./state.mjs";
+import { approveHook, auditLine, briefArgs, hookIsTrusted, hookPromptDenied, running, savedPrefixes, sessionCmdAllow, stashFinished } from "./perm.mjs";
 import { agentsMdOf, readMemory, readPersona, sessionLoopGuard, spillResult } from "./workspace.mjs";
 import { LOG_TYPES, sendJson, sse, sseHead } from "./reply.mjs";
 import { pruneCheckpointsSoon, snapPathsOf } from "./checkpoints.mjs";
@@ -23,7 +23,7 @@ async function handleChat(req, res, body) {
   // 同一会话不许并发两条流：会互相覆盖「停止」句柄、日志交错（多标签页/重放才会走到这）
   if (running.has(sessionId)) return sendJson(res, 409, { error: "这个会话上一轮还在跑——等它结束或先停止，再发下一条" });
   const mode = MODES.includes(body.mode) ? body.mode : "confirm";
-  const picked = st.providers.find((p) => p.name === (body.provider || st.active)) || st.providers[0];
+  const picked = findProvider(st, body.provider || st.active) || st.providers[0];
   if (!picked) return sendJson(res, 400, { error: "没有可用的模型通道，请先在设置里配置" });
   // 网关（如 OpenCode Go）按会话做路由与缓存：把这次会话的 id 当会话标识带上；
   // 顺手自报家门（u-agent/x.y.z），别让网关只看到默认的 HTTP 库名
@@ -32,7 +32,11 @@ async function handleChat(req, res, body) {
 
   const msg = body.message || {};
   const text = String(msg.text || "").trim();
-  const images = (msg.images || []).slice(0, 4).map((i) => ({
+  // 图片上限与前端 chat.js 的 MAX_IMAGES 是同一份契约（评审 #2）：超了整条明确拒绝，
+  // 不许静默裁剪——用户看不到的第 5 张图就是丢内容
+  const rawImages = Array.isArray(msg.images) ? msg.images : [];
+  if (rawImages.length > 4) return sendJson(res, 400, { error: `一次最多附 4 张图片（这次带了 ${rawImages.length} 张），删掉几张再发` });
+  const images = rawImages.map((i) => ({
     mediaType: /^image\/(png|jpeg|webp|gif)$/.test(i.mediaType) ? i.mediaType : "image/png",
     data: String(i.data || "").replace(/^data:[^,]*,/, ""),
   }));
@@ -42,13 +46,33 @@ async function handleChat(req, res, body) {
   if (!text && !images.length) return sendJson(res, 400, { error: "消息为空" });
 
   const abort = new AbortController();
-  running.set(sessionId, { abort, mode });
+  // 评审 #5：任务执行与页面连接分开管。runId 标识这一轮；事件在 run.events 留底并广播给
+  // 所有接上来的页面——原始连接断了任务照跑，刷新后可从 /api/chat-events 任意 seq 重接。
+  const runId = genId("run");
+  const run = { abort, mode, runId, startedAt: Date.now(), seq: 0, events: [], clients: new Set(), primary: res };
+  running.set(sessionId, run);
+  const emit = (ev) => {
+    run.seq++;
+    run.events.push({ seq: run.seq, ev });
+    try { if (!run.primary.writableEnded && !run.primary.destroyed) sse(run.primary, ev); } catch {}
+    for (const c of run.clients) {
+      try { if (!c.writableEnded && !c.destroyed) sse(c, ev); } catch {}
+    }
+  };
+  // 落日志 + 进留底 + 广播，三件事一次做对（评审复核2#3：mode/user/turn_context 也进留底，
+  // 重接从 0 回放时当前轮的用户气泡才不会丢）
+  const logEmit = (ev) => {
+    sessions.append(sessionId, ev);
+    emit(ev);
+  };
+  run.emit = (ev) => logEmit(ev);
   // 从这里到主循环的 finally 之间还有一段起始活（读日志、建上下文、起标题等）：
   // 这段里抛错原先会把 running 里的句柄落下——这个会话从此永久 409（发消息、删除全被堵，领导报过"无法删除对话"）。
   // 外层兜底 catch 保证任何路径都把锁摘掉。
   try {
   // 多轮上下文：从会话日志重建历史（含 compact 摘要替换与回退裁剪），再拼上本条消息
   let pastEvents = sessions.read(sessionId);
+  run.startLog = pastEvents.length; // 评审复核2#3：本轮从日志哪一条开始——/api/session 据此裁掉「正在跑的这一轮」
   let history = buildHistory(pastEvents);
   const turnSeq = pastEvents.filter((e) => e.type === "user").length + 1; // 第几轮：写进快照清单，回滚时看得懂
   // 「现场信息」（当前时间 / 上一轮被手动停止的提醒）挪进每轮补充 turnContext 了：
@@ -56,6 +80,11 @@ async function handleChat(req, res, body) {
   const resumeNote = wasLastTurnAborted(pastEvents)
     ? "（注意：上一轮是用户主动点了停止。被中断的命令/工具可能已部分执行——先检查现状，别把已完成的事再做一遍；后台可能还有进程。）"
     : "";
+  // 评审 #5：服务重启/断流导致的「没有收尾」也要说清，别让模型对着半截现场盲目重放
+  const interruptedNote = wasTurnInterrupted(pastEvents)
+    ? "（注意：上一轮没有正常收尾——可能刷新过页面、断过网或重启过服务。先检查现场（已执行的命令、已落盘的改动）再继续，别重复已完成的步骤。）"
+    : "";
+  const note = resumeNote + interruptedNote;
   let outgoingText = text;
   let messages = null; // 等 lastPlan 就位后再拼（那段提醒里要带当前计划）
   const limits = limitsOf(provider); // 这个模型真实能吃多少：按窗口算，不再用写死的字数
@@ -73,7 +102,7 @@ async function handleChat(req, res, body) {
     state: lastPlan ? { plan: lastPlan } : {},
     goal: lastGoal(sessionId),
     memory: readMemory(),
-    note: resumeNote,
+    note,
     allowAnyPath: mode === "full", // 跟权限模式一起走（模式变了才变，正好和这段的位置一致）
     extraRoots: st.extraRoots,
   });
@@ -99,18 +128,18 @@ async function handleChat(req, res, body) {
 
   messages = [...history, { role: "user", text: outgoingText, reminder: turnReminderText, ...(images.length ? { images } : {}) }];
   let budget = budgetOf(messages, limitsWithOverhead);
-  sessions.append(sessionId, { type: "mode", mode });
-  sessions.append(sessionId, { type: "user", text, images });
-  if (turnReminderText) sessions.append(sessionId, { type: "turn_context", text: turnReminderText }); // 与上面那条 user 成对（缓存前缀要逐字稳定）
+  sseHead(res); // 必须先于 logEmit：落日志与广播现在是一体的，别让首条数据裸写头
+  logEmit({ type: "mode", mode });
+  logEmit({ type: "user", text, images });
+  if (turnReminderText) logEmit({ type: "turn_context", text: turnReminderText }); // 与上面那条 user 成对（缓存前缀要逐字稳定）
 
-  sseHead(res);
-  sse(res, { type: "session", sessionId, provider: provider.name, mode, budget, context });
+  emit({ type: "session", sessionId, provider: provider.name, providerId: provider.id || "", runId, mode, budget, context });
 
   // 上下文涨到阈值（默认 80%）就自动压缩一遍再问模型——别等模型报超限，也别让人手动盯着用量条
   try {
     const auto = await autoCompactIfNeeded(sessionId, provider, st, limitsWithOverhead);
     if (auto) {
-      sse(res, { type: "compact", auto: true, before: auto.before, after: auto.after, summary: auto.summary });
+      emit({ type: "compact", auto: true, before: auto.before, after: auto.after, summary: auto.summary });
       pastEvents = sessions.read(sessionId);
       history = buildHistory(pastEvents);
       messages = patchCurrentUser([...history], outgoingText, images); // 本轮消息贴在历史最后那条 user 上（摘要与留存的用户原文已在历史里）
@@ -141,7 +170,7 @@ async function handleChat(req, res, body) {
     promptOverheadTokens, // 系统提示 + 工具 schema 的固定 token 开销（PERF-001）
     checks: st.checks, // test / lint 命令（run_checks 工具与轮末自动检查共用）
     goal: lastGoal(sessionId), // 本次任务的完成标准（/goal 设的）
-    note: resumeNote, // 「上一轮被手动停止」的提醒（已并进 turnReminderText）
+    note, // 「上一轮被手动停止」的提醒（已并进 turnReminderText）
     turnReminderText, // 本轮冻结的那段（与日志里那条 turn_context 逐字一致）
     limits: limitsWithOverhead, // 当前模型的可用 token 预算（get_context_remaining 工具用它算余量）
     jobLogDir: path.join(DATA, "jobs"), // 后台任务的输出落这里
@@ -206,7 +235,7 @@ async function handleChat(req, res, body) {
       const paths = snapPathsOf(tc.name, tc.args, st, mode === "full");
       if (!paths.length) return null;
       pruneCheckpointsSoon();
-      const { id } = checkpoints.begin(sessionId, { tool: tc.name, toolCallId: tc.toolCallId, turn: turnSeq, paths });
+      const { id } = checkpoints.begin(sessionId, { tool: tc.name, toolCallId: tc.toolCallId, turn: turnSeq, paths, ws: st.workspace });
       return {
         id,
         finish: async () => {
@@ -231,7 +260,7 @@ async function handleChat(req, res, body) {
       const p = pickAssist(st, provider);
       if (p) {
         const r = await compactSession(sessionId, { ...p, baseURL: normalizeBase(p.baseURL), sessionId, userAgent: `u-agent/${VERSION}` }, { auto: true, keepTokens: keepTokensOf(st, limits), keepBudgetTokens: keepUserBudgetOf(limits) });
-        sse(res, { type: "compact", auto: true, before: r.before, keptMsgs: r.keptMsgs, summary: r.summary });
+        emit({ type: "compact", auto: true, before: r.before, keptMsgs: r.keptMsgs, summary: r.summary });
       }
       runMessages = patchCurrentUser(buildHistory(sessions.read(sessionId)), outgoingText, images);
       return runMessages;
@@ -256,7 +285,7 @@ async function handleChat(req, res, body) {
         const preview = [...new Set(lines)].slice(0, 6);
         const reason = "项目或 U 盘自带的 hooks 会在你电脑上执行命令，先确认一次（按内容哈希记着；改了就再问）";
         const { id: hid, done: hdone } = ctx.confirm({ tool: "hook_review", args: { 文件: files, 将执行: preview }, risk: "high", reason });
-        sse(res, { type: "confirm_request", confirmId: hid, name: "hook_review", args: { 文件: files, 将执行: preview }, risk: "high", reason });
+        emit({ type: "confirm_request", confirmId: hid, name: "hook_review", args: { 文件: files, 将执行: preview }, risk: "high", reason });
         const hv = await hdone;
         const hok = hv && typeof hv === "object" ? !!hv.ok : !!hv;
         if (hok) {
@@ -273,11 +302,11 @@ async function handleChat(req, res, body) {
           { hook_event_name: "UserPromptSubmit", session_id: sessionId, cwd: st.workspace, prompt: text },
           { cwd: st.workspace, shouldRun: allowed, onEvent: (e) => hookEvents.push(e) }
         );
-        for (const e of hookEvents) sse(res, e);
+        for (const e of hookEvents) emit(e);
         if (batch.blocked) {
           const msg = `被项目 hook 拦下了这条消息：${batch.reason}`;
           sessions.append(sessionId, { type: "error", message: msg });
-          sse(res, { type: "error", message: msg });
+          emit({ type: "error", message: msg });
           return;
         }
         if (batch.context) {
@@ -300,7 +329,7 @@ async function handleChat(req, res, body) {
           usageTotal.input += cachedTok > inTok ? inTok + cachedTok : inTok;
           usageTotal.output += ev.output || 0;
           usageTotal.cached += cachedTok; // 缓存命中 tokens（各家字段不同，在 providers 里归一）
-          sse(res, { type: "usage", input: usageTotal.input, output: usageTotal.output, cached: usageTotal.cached });
+          emit({ type: "usage", input: usageTotal.input, output: usageTotal.output, cached: usageTotal.cached });
           continue;
         }
         if (ev.type === "assistant_message") replyText = ev.text || replyText;
@@ -311,7 +340,7 @@ async function handleChat(req, res, body) {
           sessions.append(sessionId, { ...ev.event, sub: ev.name });
           changedThisPass = true;
         }
-        sse(res, ev);
+        emit(ev);
       }
       // 改动后自动检查（对标 Aider /test、Kiro PostFileSave hook）：只在改过东西且配了命令时跑
       let autoFix = "";
@@ -319,12 +348,12 @@ async function handleChat(req, res, body) {
       if (checksOn && changedThisPass && !abort.signal.aborted) {
         const check = await runChecks(st.checks, st.workspace);
         sessions.append(sessionId, { type: "check", ...check });
-        sse(res, { type: "check", ...check, summary: checkSummary(check) });
+        emit({ type: "check", ...check, summary: checkSummary(check) });
         if (!check.skipped && !check.ok) {
           if (fixRounds >= CHECKS_MAX_FIX) {
             const msg = "自动检查连续 " + CHECKS_MAX_FIX + " 次没过，先停在这里，你来看看";
             sessions.append(sessionId, { type: "error", message: msg });
-            sse(res, { type: "error", message: msg });
+            emit({ type: "error", message: msg });
           } else {
             fixRounds++;
             autoFix = fixPrompt(check);
@@ -333,7 +362,7 @@ async function handleChat(req, res, body) {
       }
       if (autoFix) {
         sessions.append(sessionId, { type: "user", text: autoFix, auto: true });
-        sse(res, { type: "auto_fix", round: fixRounds, message: autoFix.slice(0, 300) });
+        emit({ type: "auto_fix", round: fixRounds, message: autoFix.slice(0, 300) });
         runMessages = [...buildHistory(sessions.read(sessionId)), { role: "user", text: autoFix }];
         continue;
       }
@@ -353,26 +382,33 @@ async function handleChat(req, res, body) {
       }
       if (!verdict) break;
       sessions.append(sessionId, { type: "goal_check", met: verdict.met, reason: verdict.reason });
-      sse(res, { type: "goal_check", met: verdict.met, reason: verdict.reason, text: goal });
+      emit({ type: "goal_check", met: verdict.met, reason: verdict.reason, text: goal });
       if (verdict.met) break;
       judgeRounds++;
       const nudge =
         "完成标准还没达成（判定意见：" + (verdict.reason || "缺少实据") + "）。\n完成标准：" + goal + "\n请继续做，直到真有实据（命令输出/测试结果/文件内容）能证明达成；别只是说'已完成'。";
       sessions.append(sessionId, { type: "user", text: nudge, auto: true });
-      sse(res, { type: "auto_fix", round: judgeRounds, goal: true, message: nudge.slice(0, 300) });
+      emit({ type: "auto_fix", round: judgeRounds, goal: true, message: nudge.slice(0, 300) });
       runMessages = [...buildHistory(sessions.read(sessionId)), { role: "user", text: nudge }];
     }
   } catch (e) {
     sessions.append(sessionId, { type: "error", message: e.message });
-    sse(res, { type: "error", message: e.message });
+    emit({ type: "error", message: e.message });
   } finally {
     running.delete(sessionId);
     // 一轮跑完上下文又长了：把最新的预算推回去，前端那根用量条才是活的
     try {
-      sse(res, { type: "budget", budget: budgetOf(buildHistory(sessions.read(sessionId)), limitsWithOverhead), context });
+      emit({ type: "budget", budget: budgetOf(buildHistory(sessions.read(sessionId)), limitsWithOverhead), context });
     } catch {}
-    sse(res, { type: "stream_end", sessionId });
-    res.end();
+    emit({ type: "stream_end", sessionId, runId });
+    try { if (!res.writableEnded) res.end(); } catch {}
+    // 给重接连上来的页面也收尾；这一轮的留底转进 finishedRuns——跑完才回来的用户能补看
+    for (const c of run.clients) {
+      try { sse(c, { type: "stream_end", sessionId, runId }); } catch {}
+      try { c.end(); } catch {}
+    }
+    run.clients.clear();
+    stashFinished(sessionId, run);
   }
   // 流已关，起标题在后台跑：不拖慢这轮回复，写进 titles.json 后前端下次刷会话列表就能看到
   autoTitle(sessionId, text, replyText, provider, st).catch(() => {});

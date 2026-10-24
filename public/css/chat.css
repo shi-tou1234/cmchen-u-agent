@@ -34,6 +34,16 @@
 /* 选中：中性底 + 标题加重（不再刷一层棕），一眼分得清"这一行"但不抢戏 */
 .sess.on { background: var(--selected); color: var(--fg); font-weight: 500; }
 .sess .ic { opacity: .55; }
+/* 运行中小灯（评审 #5）：在跑的会话一眼认得出；呼吸一下但不扎眼 */
+.run-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none;
+  animation: runPulse 1.6s var(--ease) infinite; }
+@keyframes runPulse { 50% { opacity: .35; } }
+/* 「载入更早的消息」（评审 #4）：历史分页的入口，做成居中的幽灵细条 */
+.load-earlier { display: flex; align-items: center; gap: 6px; margin: 4px auto 10px; padding: 4px 14px;
+  border-radius: 99px; border: 1px solid var(--line); color: var(--muted); font-size: var(--fs-xs);
+  transition: color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease), background var(--t-fast) var(--ease); }
+.load-earlier:hover { color: var(--fg); border-color: var(--line-strong); background: var(--hover); }
+.load-earlier:disabled { opacity: .6; }
 .sess .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sess .acts { display: flex; gap: 1px; opacity: 0; border-radius: var(--r-xs);
   transition: opacity var(--t-fast) var(--ease); }
@@ -76,6 +86,31 @@
 .main.home .stream-inner { padding: 0 24px; }
 .main.home .statusbar .ctx, .main.home .statusbar #ctxCompact, .main.home .composer-hint { display: none; }
 .welcome { position: relative; text-align: center; padding: 0 0 26px; }
+/* 三步开张（评审·首次使用）：替代"自动弹整套设置"的轻引导；未完成项给直达按钮 */
+.setup-steps { position: relative; z-index: 1; margin: 18px auto 0; max-width: 460px; text-align: left;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 10px 14px; }
+.setup-steps .ss-head { font-size: var(--fs-xs); color: var(--faint); letter-spacing: .07em; padding: 2px 0 6px; }
+.ss-item { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: var(--fs-sm); color: var(--fg); }
+.ss-item.ok { color: var(--faint); }
+.ss-item.ok .ss-text { text-decoration: line-through; text-decoration-color: var(--line-strong); }
+.ss-box { width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--line-strong); display: grid; place-items: center;
+  font-size: var(--fs-2xs); flex: none; color: var(--muted); }
+.ss-item.ok .ss-box { background: var(--ok-soft); border-color: transparent; color: var(--ok); }
+.ss-text { flex: 1; min-width: 0; }
+.ss-go { padding: 2px 10px; border-radius: 99px; border: 1px solid var(--line); color: var(--accent); font-size: var(--fs-xs); flex: none; }
+.ss-go:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: var(--hover); }
+.ss-off { display: flex; align-items: center; gap: 6px; margin: 8px auto 2px; padding: 4px 14px; border-radius: 99px;
+  border: 1px dashed var(--line-strong); color: var(--muted); font-size: var(--fs-xs); }
+.ss-off:hover { color: var(--fg); border-color: var(--accent); }
+/* 离线推荐的对齐说明（评审：离线推荐必须可兑现） */
+.ht-note { font-size: var(--fs-xs); color: var(--faint); padding: 6px 4px 2px; text-align: left; line-height: 1.6; }
+/* 任务结果卡（评审）：轮末一行式小结——完成了什么/改了哪些文件/检查/计划 */
+.result-card { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 14px; margin: 10px 0 4px; padding: 8px 13px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); font-size: var(--fs-xs); color: var(--muted); }
+.result-card .ic { color: var(--ok); flex: none; align-self: center; }
+.result-card .rc-row { display: inline-flex; gap: 6px; min-width: 0; }
+.result-card .rc-row b { color: var(--fg); font-weight: 500; flex: none; }
+.result-card .rc-row { overflow-wrap: anywhere; }
 .welcome-brand { display: flex; justify-content: center; margin: 0 0 14px; }
 .welcome-brand svg { width: 40px; height: 40px; color: var(--accent); }
 .welcome-hello, .welcome-sub { position: relative; z-index: 1; }
@@ -150,7 +185,8 @@
 .md > *:last-child { margin-bottom: 0; }
 .md p { margin: 8px 0; }
 .md h1, .md h2, .md h3 { margin: 18px 0 7px; line-height: 1.4; font-weight: 600; }
-.md h1 { font-size: 17px; } .md h2 { font-size: var(--fs-lg); } .md h3 { font-size: var(--fs-body); }
+/* 标题跟着正文字号走（阅读设置 14/16/18 时标题仍比正文大半档） */
+.md h1 { font-size: calc(var(--fs-body) + 3px); } .md h2 { font-size: calc(var(--fs-body) + 1.5px); } .md h3 { font-size: calc(var(--fs-body) + .5px); }
 .md ul, .md ol { margin: 8px 0; padding-left: 22px; }
 .md li { margin: 3px 0; }
 .md blockquote { border-left: 2px solid var(--line-strong); padding: 1px 14px; margin: 10px 0; color: var(--muted); }

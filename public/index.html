@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" href="/icon.png">
 <meta name="color-scheme" content="light dark">
-<meta name="ua-version" content="1.3.0">
+<meta name="ua-version" content="1.4.0">
 <title>u-agent · 随身 AI</title>
 <script src="/js/theme-boot.js"></script><!-- 先于样式表同步跑：暗色/跟随系统的用户不闪白（CSP 只放行同源脚本，此处不能内联） -->
 <link rel="stylesheet" href="/css/theme.css"><!-- 顺序=原 app.css 的段落顺序，别调 -->
@@ -173,6 +173,8 @@
     <div class="side-foot">
       <div class="usage-ring" id="sideMeta" title="本机工具数量"></div>
       <button class="side-btn" id="gearBtn"><svg class="ic"><use href="#i-settings"/></svg><span data-i18n="side.settings">设置</span></button>
+      <button class="side-btn" id="lockNowBtn" title="作废本机登录，回到锁屏（U 盘上的钥匙库不受影响）"><svg class="ic"><use href="#i-shield"/></svg><span>立即锁定</span></button>
+      <button class="side-btn" id="shutBtn" title="停掉对话轮、后台命令与扩展，然后退出服务——之后就可以拔盘了"><svg class="ic"><use href="#i-stop"/></svg><span>收工拔盘</span></button>
     </div>
   </aside>
 
@@ -658,6 +660,34 @@
                 <span class="field-help" id="mcpStatus">还没有配置</span>
                 <button class="btn btn-warn" id="mcpSave">保存并重连</button>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 阅读（评审：字号与字体是本机阅读偏好，留在浏览器里） -->
+        <section class="panel" data-panel="reading" hidden>
+          <div class="card">
+            <div class="card-head">
+              <h3>阅读</h3>
+              <p>回答正文的字号与字体。存在这台电脑的浏览器里，不跟着 U 盘走——不同屏幕各调各的</p>
+            </div>
+            <div class="card-body">
+              <div class="prov-grid">
+                <label class="field"><span class="field-label">正文字号</span>
+                  <select class="input" id="readSize">
+                    <option value="14">小（14px）</option>
+                    <option value="16" selected>标准（16px）</option>
+                    <option value="18">大（18px）</option>
+                  </select>
+                </label>
+                <label class="field"><span class="field-label">正文字体</span>
+                  <select class="input" id="readFont">
+                    <option value="serif" selected>宋体（衬线，默认）</option>
+                    <option value="system">系统黑体（无衬线）</option>
+                  </select>
+                </label>
+              </div>
+              <p class="field-help">标题会跟着字号一起缩放；代码块始终保持等宽字体不受影响。</p>
             </div>
           </div>
         </section>

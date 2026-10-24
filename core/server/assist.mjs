@@ -3,10 +3,11 @@
 import { streamChat, normalizeBase } from "../providers.mjs";
 import { rewindRanges, isDropped } from "../context.mjs";
 import { VERSION, sessions } from "./runtime.mjs";
+import { findProvider } from "./state.mjs";
 import { loadTitles, saveTitles } from "./workspace.mjs";
 const isReadyProvider = (p) => p && (p.protocol === "mock" || (p.baseURL && p.model && p.secret));
 function pickAssist(st, fallback) {
-  const a = st.providers.find((p) => p.name === st.assist);
+  const a = findProvider(st, st.assist); // assist 按 id 引用（老数据按名的也认）
   if (isReadyProvider(a) && a.protocol !== "mock") return a;
   if (fallback && fallback.protocol !== "mock") return fallback;
   return null;

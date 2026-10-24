@@ -6,35 +6,69 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { streamChat, normalizeBase, buildHeaders, describeFetchError } from "../providers.mjs";
-import { buildHistory, budgetOf } from "../context.mjs";
+import { buildHistory, budgetOf, wasTurnInterrupted } from "../context.mjs";
 import { resolveInside } from "../sandbox.mjs";
 import { loadCommands, loadSkills, expandCommand } from "../skills.mjs";
 import { PERSONA_PRESETS, VOICE_LENGTHS, VOICE_STYLES, VOICE_LANGS, normalizeVoice } from "../persona.mjs";
-import { readJson, writeJson, writeFileAtomic, truncate } from "../util.mjs";
+import { genId, readJson, writeJson, writeFileAtomic, truncate } from "../util.mjs";
 import { runChecks, checkSummary } from "../checks.mjs";
 import { listJobs, jobLog, stopJob, runningCount } from "../jobs.mjs";
-import { DATA, LOCK, MASK, UA_HOME, VERSION, applyMcp, checkpoints, confirmGate, mcpHub, readMcpRaw, registry, sessions, vaultRewrap, vaultSetup, vaultUnlock } from "./runtime.mjs";
-import { contextInfoOf, invalidateState, limitsOf, loadState, saveState, settingsReady } from "./state.mjs";
+import { DATA, LOCK, MASK, UA_HOME, VERSION, applyMcp, checkpoints, confirmGate, killAllJobs, mcpHub, readMcpRaw, registry, sessions, vaultRewrap, vaultSetup, vaultUnlock } from "./runtime.mjs";
+import { contextInfoOf, findProvider, invalidateState, limitsOf, loadState, saveState, settingsReady } from "./state.mjs";
 import { FREE_PATHS, TOKEN_TTL_MS, cooldownLeft, lockFail, lockHash, lockVerify, maskState, noteFail, sessionTokens, unlocked } from "./auth.mjs";
-import { dropPermPrefix, running, savePermPrefix, savedPrefixes, sessionCmdAllow } from "./perm.mjs";
+import { dropPermPrefix, finishedRuns, running, savePermPrefix, savedPrefixes, sessionCmdAllow } from "./perm.mjs";
 import { MEMORY, PERSONA, listWorkspaceFiles, loadTitles, readMemory, readPersona, saveTitles } from "./workspace.mjs";
-import { LOG_TYPES, SEC_HEADERS, readBody, sendJson } from "./reply.mjs";
+import { LOG_TYPES, SEC_HEADERS, readBody, sendJson, sse, sseHead } from "./reply.mjs";
 import { askOnce, lastGoal, pickAssist } from "./assist.mjs";
 import { compactSession, keepTokensOf, keepUserBudgetOf } from "./compact.mjs";
 import { handleChat } from "./chat.mjs";
 
-// 已存的真实钥匙只跟随「同名 + 同地址」的通道。
+// 已存的真实钥匙只跟随「同一通道（稳定 id）+ 同地址」。
 // SEC-002：/api/test-provider 与 /api/list-models 原先只按 name 取 secret，请求体把 baseURL
 // 改到任意主机就会把钥匙发过去（与「已保存不回显」的承诺相反）。改地址就必须重新输入钥匙。
+// 评审 #1 起通道有稳定 id：改名不再换身份，钥匙照跟；地址变了仍按老规矩要求重输。
 function boundSecretOf(cur, p, base) {
   if (p.secret && p.secret !== MASK) return { secret: String(p.secret), mismatch: false };
-  const saved = (cur.providers || []).find((o) => o.name === p.name);
+  const saved = findProvider(cur, p.id) || findProvider(cur, p.name);
   if (!saved) return { secret: "", mismatch: false };
   const savedBase = normalizeBase(saved.baseURL || "");
   if (!savedBase || savedBase !== base) return { secret: "", mismatch: true };
   return { secret: saved.secret || "", mismatch: false };
 }
 const KEY_MOVED = "服务地址改过了，请重新填一次钥匙（已保存的钥匙只会发往原来保存的地址）";
+
+// 可见事件统一在此算好（评审复核3#1）：回退区间（atIndex/marker 都是完整日志下标）跨页也要生效——
+// 在服务端按整份日志算好可见性，前端每一页拿到的就是「确实该显示」的事件，
+// 补载旧页不会再把跨页回退掉的消息重新显示出来。
+function visibleOf(all) {
+  const hidden = new Set();
+  for (let i = 0; i < all.length; i++) {
+    const e = all[i];
+    if (e.type === "rewind" && Number.isInteger(e.atIndex)) {
+      for (let j = e.atIndex + 1; j < i; j++) hidden.add(j);
+    }
+  }
+  const visible = [];
+  for (let i = 0; i < all.length; i++) {
+    if (hidden.has(i)) continue;
+    const e = all[i];
+    if (LOG_TYPES.has(e.type) || e.type === "user") visible.push({ ...e, _log: i });
+  }
+  return visible;
+}
+
+// 应用实例 id（评审：便携草稿按「实例 + 会话」隔离）。一只 U 盘一个实例，存 data/instance.json
+let INSTANCE_ID = "";
+function instanceId() {
+  if (INSTANCE_ID) return INSTANCE_ID;
+  const f = path.join(DATA, "instance.json");
+  const j = readJson(f, null);
+  if (j?.id) { INSTANCE_ID = j.id; return INSTANCE_ID; }
+  INSTANCE_ID = genId("inst");
+  try { writeJson(f, { id: INSTANCE_ID, ts: Date.now() }); } catch {}
+  return INSTANCE_ID;
+}
+const instanceKey = (sid) => `${instanceId()}:${sid}`;
 
 export async function handleRequest(req, res) {
   for (const [k, v] of Object.entries(SEC_HEADERS)) res.setHeader(k, v);
@@ -153,6 +187,27 @@ export async function handleRequest(req, res) {
     if (req.method === "GET" && u.pathname === "/api/health") {
       return sendJson(res, 200, { ok: true, name: "u-agent", version: VERSION, tools: registry.list().length });
     }
+    // 立即锁定（评审：收工入口）：作废全部会话令牌，网页下一次请求就会回到锁屏
+    if (req.method === "POST" && u.pathname === "/api/lock-now") {
+      sessionTokens.clear();
+      return sendJson(res, 200, { ok: true });
+    }
+    // 停止服务并准备拔盘（评审：收工入口）：先叫停对话轮并等它们收尾（≤3 秒，别把正在写盘
+    // 的任务硬掐在半路），再停后台命令与 MCP，回完这一句才退出进程
+    if (req.method === "POST" && u.pathname === "/api/shutdown") {
+      for (const [, r] of running) { try { r.abort.abort(); } catch {} }
+      const t0 = Date.now();
+      while (running.size && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 100));
+      try { killAllJobs(); } catch {}
+      try { mcpHub.stop(); } catch {}
+      setTimeout(() => process.exit(0), 250); // 给 res 一点时间落完
+      return sendJson(res, 200, { ok: true, stopped: running.size });
+    }
+    // 工作区还活着吗（评审：便携迁移）：换电脑/换盘符后启动时给出明确的重新选择入口
+    if (req.method === "GET" && u.pathname === "/api/workspace-status") {
+      const ws = loadState().workspace;
+      return sendJson(res, 200, { workspace: ws, exists: ws ? fs.existsSync(ws) : null });
+    }
     if (req.method === "POST" && u.pathname === "/api/chat") return await handleChat(req, res, await readBody(req));
     if (req.method === "POST" && u.pathname === "/api/confirm") {
       const b = await readBody(req);
@@ -178,8 +233,46 @@ export async function handleRequest(req, res) {
     }
     if (req.method === "POST" && u.pathname === "/api/abort") {
       const b = await readBody(req);
-      running.get(b.sessionId)?.abort?.abort();
-      return sendJson(res, 200, { ok: true });
+      const run = running.get(b.sessionId);
+      // 停止要对应到 runId（评审 #5）：页面刷新后重接的停止按钮拿的是当前 runId，
+      // 拿旧 runId 来停（竞态）就当没点过，别把新一轮误杀
+      if (run && (!b.runId || run.runId === b.runId)) run.abort.abort();
+      return sendJson(res, 200, { ok: !!run });
+    }
+    // 在跑的任务清单（评审 #5）：侧栏「运行中」标记 + 刷新后恢复靠它
+    if (req.method === "GET" && u.pathname === "/api/runs") {
+      return sendJson(res, 200, { runs: [...running.entries()].map(([sessionId, r]) => ({ sessionId, runId: r.runId, mode: r.mode, startedAt: r.startedAt })) });
+    }
+    if (req.method === "GET" && u.pathname === "/api/run-status") {
+      const sessionId = u.searchParams.get("sessionId") || "";
+      const run = running.get(sessionId);
+      if (run) return sendJson(res, 200, { running: true, runId: run.runId, mode: run.mode, startedAt: run.startedAt, seq: run.seq });
+      const fin = finishedRuns.get(sessionId);
+      return sendJson(res, 200, { running: false, ...(fin ? { recentlyFinished: { runId: fin.runId, endedAt: fin.endedAt } } : {}) });
+    }
+    // 断线重接（评审 #5）：把留底事件从 since 之后补放一遍，然后挂进广播名单接着收直播。
+    // 会话不在跑：若 10 分钟内刚跑完，补放完整一段再收尾；都没有就明确 404。
+    if (req.method === "GET" && u.pathname === "/api/chat-events") {
+      const sessionId = u.searchParams.get("sessionId") || "";
+      const since = Math.max(0, Number(u.searchParams.get("since")) || 0);
+      const run = running.get(sessionId);
+      if (!run) {
+        const fin = finishedRuns.get(sessionId);
+        if (!fin) return sendJson(res, 404, { running: false, error: "这个会话现在没有在跑的任务" });
+        sseHead(res);
+        for (const it of fin.events) if (it.seq > since) sse(res, it.ev);
+        sse(res, { type: "stream_end", sessionId, runId: fin.runId, replayed: true });
+        return res.end();
+      }
+      sseHead(res);
+      for (const it of run.events) if (it.seq > since) sse(res, it.ev);
+      // 评审复核#3：还没裁决的审批在重接时必须重弹（已处理过的不会再进 pending；前端有同 id 去重）
+      for (const it of run.events) {
+        if (it.ev?.type === "confirm_request" && confirmGate.pending.has(it.ev.confirmId)) sse(res, it.ev);
+      }
+      run.clients.add(res);
+      res.on("close", () => run.clients.delete(res));
+      return;
     }
     if (req.method === "GET" && u.pathname === "/api/settings") return sendJson(res, 200, maskState(loadState()));
     if (req.method === "POST" && u.pathname === "/api/settings") {
@@ -187,10 +280,11 @@ export async function handleRequest(req, res) {
       const patch = {};
       if (Array.isArray(b.providers)) {
         const cur = loadState();
-        // key 字段为掩码时保留原值
+        // 通道身份看 id（评审 #1）：改名的通道靠 id 认出是原来那条，钥匙原样保留；
+        // 老前端/老数据只报名字的，退回按名字认。key 字段为掩码时保留原值
         patch.providers = b.providers.map((p) => {
-          const old = cur.providers.find((o) => o.name === p.name);
-          return { ...p, secret: !p.secret || p.secret === MASK ? old?.secret || "" : p.secret };
+          const old = findProvider(cur, p.id) || findProvider(cur, p.name);
+          return { ...p, ...(old && !p.id ? { id: old.id } : {}), secret: !p.secret || p.secret === MASK ? old?.secret || "" : p.secret };
         });
       }
       if (b.active !== undefined) patch.active = b.active;
@@ -237,6 +331,29 @@ export async function handleRequest(req, res) {
       return sendJson(res, 200, { ok: true, title: t });
     }
     if (req.method === "GET" && u.pathname === "/api/memory") return sendJson(res, 200, { text: readMemory() });
+    // 便携草稿（评审）：正文草稿跟着 U 盘走（data/drafts.json），按「实例 id + 会话 id」隔离——
+    // 换电脑、换浏览器、换端口都接得回来；主题/通知这类纯本机偏好才留在浏览器
+    if (req.method === "GET" && u.pathname === "/api/draft") {
+      const sessionId = u.searchParams.get("sessionId") || "";
+      if (!/^[a-z0-9_-]+$/i.test(sessionId)) return sendJson(res, 400, { error: "非法会话 id" });
+      const drafts = readJson(path.join(DATA, "drafts.json"), {});
+      return sendJson(res, 200, { text: drafts[instanceKey(sessionId)]?.text || "" });
+    }
+    if (req.method === "POST" && u.pathname === "/api/draft") {
+      const b = await readBody(req);
+      const sessionId = String(b.sessionId || "");
+      if (!/^[a-z0-9_-]+$/i.test(sessionId)) return sendJson(res, 400, { error: "非法会话 id" });
+      const f = path.join(DATA, "drafts.json");
+      const drafts = readJson(f, {});
+      const key = instanceKey(sessionId);
+      const text = String(b.text ?? "").slice(0, 20000);
+      if (text.trim()) drafts[key] = { text, ts: Date.now() };
+      else delete drafts[key];
+      const entries = Object.entries(drafts).sort((a, x) => (a[1].ts || 0) - (x[1].ts || 0));
+      while (entries.length > 300) { const [k] = entries.shift(); delete drafts[k]; } // 上限收拾：最旧的先走
+      writeJson(f, drafts);
+      return sendJson(res, 200, { ok: true });
+    }
     if (req.method === "POST" && u.pathname === "/api/memory") {
       const b = await readBody(req);
       const t = String(b.text || "").slice(0, 8192);
@@ -270,7 +387,7 @@ export async function handleRequest(req, res) {
       const st = loadState();
       const cur = readMemory();
       if (!cur.trim()) return sendJson(res, 400, { error: "记忆还是空的，不用整理" });
-      const provider = pickAssist(st, st.providers.find((p) => p.name === st.active));
+      const provider = pickAssist(st, findProvider(st, st.active));
       if (!provider) return sendJson(res, 400, { error: "没有可用的模型通道（整理要借一个模型跑一遍）" });
       const prompt =
         "下面是一份「跨会话记忆」清单（agent 用来记住主人的偏好与约定）。请把它压缩整理成更短的要点：\n" +
@@ -376,7 +493,7 @@ export async function handleRequest(req, res) {
       const b = await readBody(req);
       const p = b.provider || {};
       const st = loadState();
-      const cur = st.providers.find((o) => o.name === p.name);
+      const cur = findProvider(st, p.id) || findProvider(st, p.name);
       const merged = { ...(cur || {}), ...p, baseURL: normalizeBase(p.baseURL || cur?.baseURL || "") };
       return sendJson(res, 200, contextInfoOf(merged));
     }
@@ -402,12 +519,16 @@ export async function handleRequest(req, res) {
       if (!sid) return sendJson(res, 400, { error: "缺少会话 id" });
       try { sessions.fileOf(sid); } catch { return sendJson(res, 400, { error: "非法会话 id" }); }
       const text = String(b.text || "").trim().slice(0, 500);
+      // 运行中改目标也要广播（评审复核2#3）：goal 事件同样属于「正在跑的这一轮」的日志流
+      const goalEvent = { type: "goal", text };
       if (!text) {
         const cur = lastGoal(sid);
-        sessions.append(sid, { type: "goal", text: "" });
+        sessions.append(sid, goalEvent);
+        running.get(sid)?.emit?.(goalEvent);
         return sendJson(res, 200, { ok: true, goal: "", cleared: !!cur });
       }
-      sessions.append(sid, { type: "goal", text });
+      sessions.append(sid, goalEvent);
+      running.get(sid)?.emit?.(goalEvent);
       return sendJson(res, 200, { ok: true, goal: text });
     }
     if (req.method === "GET" && u.pathname === "/api/goal") {
@@ -472,6 +593,16 @@ export async function handleRequest(req, res) {
           if (ev.type === "text") { sample += ev.delta; if (sample.length > 24) break; }
           else if (ev.type === "error") throw new Error(ev.message);
           else if (ev.type === "end") break;
+        }
+        // 评审 #6：空响应（连接通、没报错、但一个字没回）不能算「连接可用」——
+        // 把「连通」与「有有效回复」分开说，提示才指得到真正要改的地方
+        if (!sample.trim()) {
+          return sendJson(res, 200, {
+            ok: false,
+            connected: true,
+            sample: "",
+            error: "接口连通、鉴权也没报错，但模型没有返回任何内容——常见原因：模型名填错、账户没有余额/额度，或这个网关把该模型挂在别的协议上",
+          });
         }
         return sendJson(res, 200, {
           ok: true,
@@ -571,7 +702,7 @@ export async function handleRequest(req, res) {
       if (b.withFiles) {
         const cpids = events.slice(at + 1).filter((e) => e.type === "change" && e.cp).map((e) => e.cp);
         if (cpids.length) {
-          files = checkpoints.rollback(sid, cpids, { force: !!b.force });
+          files = checkpoints.rollback(sid, cpids, { force: !!b.force, ws: st.workspace });
           if (!files.ok) {
             const msg = files.needForce ? `有 ${files.conflicts.length} 个文件在这之后又被改过` : files.error || "文件回滚没成功";
             return sendJson(res, files.needForce ? 409 : 400, { ...files, error: msg });
@@ -579,7 +710,7 @@ export async function handleRequest(req, res) {
         }
       }
       sessions.append(sid, { type: "rewind", atIndex: at, dropped, ...(files ? { files: (files.reverted || []).length } : {}) });
-      const budget = budgetOf(buildHistory(sessions.read(sid)), limitsOf(st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]));
+      const budget = budgetOf(buildHistory(sessions.read(sid)), limitsOf(findProvider(st, b.provider || st.active) || st.providers[0]));
       return sendJson(res, 200, { ok: true, atIndex: at, dropped, files, budget });
     }
     // 会话分叉：从某条消息处复制出一份新会话（原会话不动）
@@ -642,7 +773,7 @@ export async function handleRequest(req, res) {
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
-      const picked = pickAssist(st, st.providers.find((p) => p.name === (b.provider || st.active)) || st.providers[0]);
+      const picked = pickAssist(st, findProvider(st, b.provider || st.active) || st.providers[0]);
       if (!picked) return sendJson(res, 400, { error: "没有可用的模型通道" });
       const provider = { ...picked, baseURL: normalizeBase(picked.baseURL), sessionId: sid, userAgent: `u-agent/${VERSION}` };
       const limits = limitsOf(provider);
@@ -672,9 +803,10 @@ export async function handleRequest(req, res) {
       const sid = String(b.sessionId || "");
       if (!sid) return sendJson(res, 400, { error: "缺少会话 id" });
       if (running.has(sid)) return sendJson(res, 409, { error: "这一轮还在跑，等它停下来再撤销" });
+      const st = loadState(); // 评审：回滚前核对检查点的工作区身份
       let out;
       try {
-        out = checkpoints.rollback(sid, b.ids || [], { force: !!b.force });
+        out = checkpoints.rollback(sid, b.ids || [], { force: !!b.force, ws: st.workspace });
       } catch (e) {
         return sendJson(res, 400, { error: e.message });
       }
@@ -720,19 +852,56 @@ export async function handleRequest(req, res) {
     if (req.method === "GET" && u.pathname === "/api/session") {
       const id = u.searchParams.get("id") || "";
       const st = loadState();
-      const forProv = st.providers.find((p) => p.name === (u.searchParams.get("provider") || st.active)) || st.providers[0];
+      const forProv = findProvider(st, u.searchParams.get("provider") || st.active) || st.providers[0];
       const limits = limitsOf(forProv);
       let events = [];
       let budget = { chars: 0, tokens: 0, over: false };
       try {
         const all = sessions.read(id);
-        events = all.filter((e) => LOG_TYPES.has(e.type) || e.type === "user");
+        // 评审复核#1 + 复核3#1：_log = 完整日志下标；回退可见性在 visibleOf 里按整份日志统一算好，
+        // 每一页（含向上补载的旧页）拿到的都是「确实该显示」的事件，跨页回退不会再复活
+        const visible = visibleOf(all);
+        // 评审复核2#3：会话正在跑时，把「正在跑的这一轮」（startLog 之后的全部）从历史快照里
+        // 裁掉——重接会从 0 完整回放这一轮，历史与回放各渲染一遍才不打架不漏事件。
+        // 例外：tail=all 是导出用的，要「请求时已落盘的全部事件」，不裁（评审复核3#4）
+        const tailRaw = u.searchParams.get("tail");
+        const isExportAll = tailRaw === "all";
+        const run = running.get(id);
+        const startLog = !isExportAll && Number.isInteger(run?.startLog) ? run.startLog : null;
+        const shown = startLog === null ? visible : visible.filter((e) => e._log < startLog);
+        // 评审 #4：长会话先给最近一段（默认 300 条可见事件），更早的走 /api/session-page 向上补——
+        // 500 轮的会话整篇回放要 6 秒 + 1.5 万个 DOM 节点，首屏不该陪葬。tail=all 给导出用
+        const tail = isExportAll ? Infinity : Math.min(2000, Math.max(20, Number(tailRaw) || 300));
+        const start = tail === Infinity ? 0 : Math.max(0, shown.length - tail);
+        events = shown.slice(start);
         // 切回旧会话时，用量条要立刻反映这个会话已有的体量
         budget = budgetOf(buildHistory(all), limits);
+        const total = shown.length;
+        // 评审 #5：上一轮没正常收尾（服务重启/断流）要在界面上明说，别让人对着半截现场发懵
+        return sendJson(res, 200, {
+          id, events, budget, context: contextInfoOf(forProv),
+          total, more: total > events.length,
+          interrupted: wasTurnInterrupted(all),
+          ...(startLog === null ? {} : { runningTurn: true, runFrom: shown.length, runId: run.runId }),
+        });
       } catch {
         return sendJson(res, 404, { error: "会话不存在" });
       }
-      return sendJson(res, 200, { id, events, budget, context: contextInfoOf(forProv) });
+    }
+    // 向上补更早的历史（评审 #4）：before = 当前已载入的最早一条在「可见事件」里的下标，from = 本段起点
+    if (req.method === "GET" && u.pathname === "/api/session-page") {
+      const id = u.searchParams.get("id") || "";
+      try { sessions.fileOf(id); } catch { return sendJson(res, 400, { error: "非法会话 id" }); }
+      const before = Math.max(0, Number(u.searchParams.get("before")) || 0);
+      const limit = Math.min(1000, Math.max(20, Number(u.searchParams.get("limit")) || 300));
+      const all = sessions.read(id);
+      // 与 /api/session 同一套可见性 + 裁剪：跨页回退不掉消息，正在跑的轮次不掺进分页空间
+      const visible = visibleOf(all);
+      const run = running.get(id);
+      const startLog = Number.isInteger(run?.startLog) ? run.startLog : null;
+      const shown = startLog === null ? visible : visible.filter((e) => e._log < startLog);
+      const from = Math.max(0, Math.min(before, shown.length) - limit);
+      return sendJson(res, 200, { events: shown.slice(from, Math.min(before, shown.length)), from, more: from > 0 });
     }
     if (req.method === "GET") {
       let p = u.pathname === "/" ? "/index.html" : u.pathname;

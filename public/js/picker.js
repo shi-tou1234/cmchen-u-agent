@@ -109,12 +109,13 @@ function renderModelList() {
   box.innerHTML = list
     .map(({ p, i }) => {
       const ready = providerReady(p);
+      const isOn = p.id === S.active || p.name === S.active; // 在用按 id 判（评审 #1）；老引用按名也认
       // 只显示厂商（2026-10-17 领导：模型名每天都在变、写着就是过时的；要看具体模型去设置里看）
-      return `<button class="pop-item ${p.name === S.active ? "on" : ""}" data-i="${i}" role="option" title="${esc(p.model || "未填模型")}">
+      return `<button class="pop-item ${isOn ? "on" : ""}" data-i="${i}" role="option" title="${esc(p.model || "未填模型")}">
         ${brandChip(p)}
         <span class="pop-main"><b>${esc(p.name)}</b></span>
         <span class="pop-dot ${ready ? "ok" : "warn"}" title="${ready ? "能用" : "还没填钥匙或模型"}"></span>
-        ${p.name === S.active ? icon("check", "ic ic-sm") : ""}
+        ${isOn ? icon("check", "ic ic-sm") : ""}
       </button>`;
     })
     .join("");
@@ -122,7 +123,7 @@ function renderModelList() {
     b.onclick = () => pickProvider(+b.dataset.i);
     b.onmouseenter = () => { modelIdx = +b.dataset.i; markActive(box, modelIdx); };
   });
-  modelIdx = Math.max(0, S.providers.findIndex((p) => p.name === S.active));
+  modelIdx = Math.max(0, S.providers.findIndex((p) => p.id === S.active || p.name === S.active));
   markActive(box, modelIdx);
 }
 
@@ -134,10 +135,10 @@ function markActive(box, i) {
 async function pickProvider(i) {
   const p = S.providers[i];
   if (!p) return;
-  S.active = p.name;
+  S.active = p.id || p.name; // 引用跟 id 走（评审 #1）
   renderModelBtn();
   closeAll();
-  try { await api.saveSettings({ active: p.name }); } catch (e) { toast(e.message, "err"); }
+  try { await api.saveSettings({ active: S.active }); } catch (e) { toast(e.message, "err"); }
   window.dispatchEvent(new CustomEvent("ua:model-change", { detail: { name: p.name } }));
   toast("已切到 " + p.name, "ok");
 }

@@ -4,10 +4,13 @@
    设置导航 176px，选中走中性 --selected（不再刷棕）；弹层 10px 圆角、菜单项 30px。
    ============================================================ */
 /* ---------- 8 弹窗 / 设置 ---------- */
-.modal-root { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 24px; }
+/* 评审 #3：显式 1fr 轨道。原来的 auto 轨道让 max-width:100% 在「轨道由内容撑开」里循环解析，
+   940px 在 680/390px 视口原样溢出、保存按钮够不着——轨道先钉成可视宽，max-width 才有得参照 */
+.modal-root { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 24px;
+  grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 .backdrop { position: absolute; inset: 0; background: color-mix(in srgb, var(--fg) 34%, transparent); backdrop-filter: blur(3px);
   transition: opacity var(--t) var(--ease); }
-.sheet { position: relative; width: 940px; max-width: 100%; height: min(760px, 88vh); display: flex; flex-direction: column;
+.sheet { position: relative; width: 940px; max-width: 100%; max-height: 100%; height: min(760px, 88vh); display: flex; flex-direction: column;
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-xl); box-shadow: var(--shadow-lg);
   overflow: hidden; transition: opacity var(--t-slow) var(--ease), transform var(--t-slow) var(--ease); }
 .sheet-sm { width: 620px; height: min(620px, 84vh); }
@@ -37,6 +40,24 @@
 .sheet-content { overflow-y: auto; padding: 16px 18px 20px; }
 .sheet-foot { display: flex; align-items: center; gap: 10px; padding: 11px 16px; border-top: 1px solid var(--line); }
 
+/* ---------- 窄窗（分屏 / 小本 / 浏览器缩放）：评审 #3 的可达性底线 ----------
+   680×768、1024×768、125%/150% 缩放下，导航收成横排标签、双列表单变单列、
+   弹窗贴边但关闭/保存始终在视口内。 */
+@media (max-width: 760px) {
+  .modal-root { padding: 10px; }
+  .sheet { height: auto; } /* 内容定高、上限仍由 max-height:100% 兜住（可滚的是内容区） */
+  .sheet-sm { width: 100%; }
+  .sheet-body { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .sheet-body.single { grid-template-rows: minmax(0, 1fr); }
+  .sheet-nav { display: flex; align-items: center; gap: 2px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 6px 8px; }
+  .sheet-nav button { width: auto; flex: none; white-space: nowrap; margin-bottom: 0; }
+  .sheet-nav .nav-sep { display: none; }
+  .sheet-content { padding: 12px 14px 16px; }
+  .sheet-foot { flex-wrap: wrap; }
+  .prov-grid, .vendor-grid { grid-template-columns: 1fr; }
+  .prov-meta { white-space: normal; overflow-wrap: anywhere; }
+}
+
 /* 通道列表（2026-10-17 重做）：一整张发丝边表 + 行间发丝分隔——原来是每张卡自己描边、再用一条空隙隔开、
    在用的还套一圈彩色外环，跟站内其它列表（侧栏会话、弹层菜单）完全不是一个语言。
    在用 = --selected 淡底 + 名称加粗（跟侧栏选中的会话同款），不再画环。 */
@@ -61,6 +82,8 @@
 .prov-body-in { border-top: 1px solid var(--line); padding: 13px 14px; display: grid; gap: 12px; background: var(--surface-2); }
 .prov-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .prov-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* 长路径/长串在窄弹窗里换行，别把列撑爆（评审 #3） */
+.sheet-content .field-help, .sheet-content .kv { overflow-wrap: anywhere; }
 .test-result { font-size: var(--fs-sm); }
 .test-result.ok { color: var(--ok); }
 .test-result.bad { color: var(--danger); }

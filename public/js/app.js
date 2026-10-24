@@ -20,6 +20,20 @@ async function refreshSessions() {
   renderSessionList();
 }
 
+// 在跑的会话（评审 #5）：侧栏「运行中」小灯。4 秒一轮轻轮询，集合没变就不重绘列表
+const runningSids = new Set();
+let lastRunSig = "";
+async function pollRuns() {
+  let runs = [];
+  try { runs = (await api.runs()).runs || []; } catch { return; }
+  const sig = runs.map((r) => r.sessionId).sort().join(",");
+  if (sig === lastRunSig) return;
+  lastRunSig = sig;
+  runningSids.clear();
+  for (const r of runs) runningSids.add(r.sessionId);
+  renderSessionList();
+}
+
 function renderSessionList() {
   const box = $("#sessList");
   const q = $("#sessSearch").value.trim().toLowerCase();
@@ -32,8 +46,8 @@ function renderSessionList() {
     // 排序纪律（学 ZCode）：运行中的会话钉最前；其余按时间倒序；时间相同用 id 兜底——
     // 不能让流式事件频繁改 mtime 时两行来回跳
     .sort((a, b) => {
-      const runA = a.id === S.sessionId && S.sending ? 1 : 0;
-      const runB = b.id === S.sessionId && S.sending ? 1 : 0;
+      const runA = runningSids.has(a.id) || (a.id === S.sessionId && S.sending) ? 1 : 0;
+      const runB = runningSids.has(b.id) || (b.id === S.sessionId && S.sending) ? 1 : 0;
       if (runA !== runB) return runB - runA;
       if (b.mtime !== a.mtime) return b.mtime - a.mtime;
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
@@ -68,6 +82,7 @@ function renderSessionList() {
 
   const row = (s) => `<div class="sess ${s.id === S.sessionId ? "on" : ""} ${managing ? "man" : ""} ${sessSelect?.has(s.id) ? "sel" : ""}" data-id="${esc(s.id)}">
       ${managing ? `<span class="sess-check">${sessSelect.has(s.id) ? "✓" : ""}</span>` : icon("message", "ic ic-sm")}
+      ${runningSids.has(s.id) ? `<span class="run-dot" title="这一轮还在跑（点开可接上实时进度）"></span>` : ""}
       <span class="t" title="${esc(s.title || "新会话")}">${esc(s.title || "新会话")}</span>
       <span class="acts">${managing ? "" : `<button data-act="rename" title="重命名">${icon("pen", "ic ic-sm")}</button>
         <button data-act="del" class="del" title="删除">${icon("trash", "ic ic-sm")}</button>`}</span>
@@ -149,7 +164,7 @@ async function exportSelectedSessions() {
   for (const id of ids) {
     const meta = allSessions.find((x) => x.id === id);
     let j;
-    try { j = await api.session(id); } catch { continue; }
+    try { j = await api.session(id, undefined, "all"); } catch { continue; } // 复核2#4：批量导出同样要全量
     done++;
     parts.push("---", "", `## ${meta?.title || id}`, `> ${new Date(meta?.mtime || Date.now()).toLocaleString("zh-CN")}`, "");
     for (const ev of j.events || []) {
@@ -235,8 +250,9 @@ function deleteRow(node, id) {
 
 let loadSeq = 0; // 快速连点切换会话：只认最后一次请求的结果，过期响应丢掉（审查 #24 串台）
 async function loadSession(id) {
-  // 运行中不给切：说一声，别让人对着没反应的列表怀疑卡了（审查 二.2）
-  if (S.sending) return toast("这一轮还在跑，跑完才能切会话（想现在停：点「停止」）");
+  // 评审 #5：运行中允许切会话——切走只掐本地显示（chat.detachRun），任务在服务端照跑，
+  // 切回来 loadSession 末尾会重接事件流；不再把人锁在当前会话里
+  chat.detachRun();
   chat.flushDraft(); // 先落盘当前会话的草稿：下方 S.sessionId 一变，挂着的防抖定时器就会把内容写进新槽位（审查 一.5）
   const mySeq = ++loadSeq;
   try {
@@ -246,13 +262,17 @@ async function loadSession(id) {
     S.tokens = { input: 0, output: 0 };
     if (j.budget) S.budget = j.budget;
     if (j.context) S.context = j.context;
-  chat.renderHistory(j.events);
+  chat.renderHistory(j.events, j);
+  if (j.interrupted) chat.noteInterrupted(); // 评审 #5：上一轮没收尾要明说
   chat.renderUsage();
   chat.restoreDraft(); // 草稿按会话隔离：切过来先把自己那份填回去（v9.10）
   chat.clearAttachments(); // 附件不跟会话跑：A 会话贴的图不许静默带进 B（审查 #18）
   const hit = allSessions.find((s) => s.id === id);
     setTitle(hit?.title || "新会话");
     refreshSessions();
+    // 这一轮还在跑（比如刷新过页面、或刚才切走了）：接上事件流接着看；
+    // 带上快照里的 runId——若恰好在快照后跑完，重接流程会重取完整历史补上（复核3#3）
+    chat.reattachIfNeeded(id, { expectRunId: j.runId });
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -262,7 +282,7 @@ function setTitle(t) {
 }
 
 function newChat() {
-  if (S.sending) return toast("这一轮还在跑，跑完才能开新会话（想现在停：点「停止」）");
+  chat.detachRun(); // 评审 #5：旧会话在跑也让它后台跑完，新会话随时可开
   chat.flushDraft(); // 同上：先把当前草稿落到它自己的槽位，再换新会话槽位
   S.sessionId = null;
   S.plan = null;
@@ -283,9 +303,11 @@ function newChat() {
 let booted = false;
 async function bootMain() {
   refreshSessions();
+  pollRuns();
   if (booted) return;
   booted = true;
   S.ready = true;
+  setInterval(pollRuns, 4000); // 评审 #5：侧栏「运行中」小灯的轻轮询（集合没变不重绘）
 
   let info = null;
   try { info = await api.info(); } catch {}
@@ -301,10 +323,16 @@ async function bootMain() {
 
   chat.renderWelcome();
   chat.renderUsage();
-  chat.restoreDraft(); // 开机把「新会话」的草稿填回来（v9.10；按会话隔离，别的会话切过去时各自恢复）
+  chat.restoreDraft(); // 开机把「新会话」的草稿填回来（便携版：草稿在 U 盘 data/drafts.json）
 
-  if (!S.workspace) {
-    setTimeout(() => openSettings({ panel: "general" }).catch(() => {}), 350);
+  // 评审（便携迁移）：上次的工作区不在了（换电脑/换盘符）——给明确入口重新选，别让工具一路报「越界」
+  if (S.workspace) {
+    api.workspaceStatus().then((ws) => {
+      if (ws.exists === false) {
+        toast("原工作区不见了（换电脑或换盘符了？）——重新选一个", "err");
+        openSettings({ panel: "general" }).catch(() => {});
+      }
+    }).catch(() => {});
   }
 }
 
@@ -324,6 +352,48 @@ function bindGlobal() {
   };
   $("#gearBtn").onclick = () => openSettings();
   $("#gearTop").onclick = () => openSettings();
+  // 收工入口（评审）：立即锁定 / 停止服务准备拔盘
+  $("#lockNowBtn").onclick = async () => {
+    chat.flushDraft(); // 锁之前把手里的草稿落上 U 盘
+    try { await api.lockNow(); } catch {}
+    location.reload(); // 令牌已作废：刷新即回锁屏
+  };
+  $("#shutBtn").onclick = async () => {
+    const runs = runningSids.size;
+    const jobs = await api.jobs().then((j) => j.running || 0).catch(() => 0);
+    const busy = runs + jobs;
+    const yes = await askConfirm({
+      title: "收工并准备拔盘？",
+      body: busy
+        ? `还有 ${busy} 件事在跑（对话轮 ${runs}、后台命令 ${jobs}）——会先叫停它们再退出服务。已落盘的改动都在，之后就可以拔盘。`
+        : "会停掉服务（对话轮、后台命令、扩展一并收掉）。已落盘的改动都在，之后就可以拔盘。",
+      okText: "停止服务",
+      danger: true,
+    });
+    if (!yes) return;
+    // 复核#7：失败不许承诺「可以拔盘」。受理成功 = 停；网络断了 = 探测健康接口确认；
+    // 明确失败/服务还活着 = 保留界面给重试
+    let stopped = false;
+    try {
+      const r = await api.shutdown();
+      stopped = r?.ok === true;
+    } catch {
+      await new Promise((r2) => setTimeout(r2, 700)); // 给服务一点退出时间再探
+      stopped = await fetch("/api/health", { cache: "no-store" })
+        .then((r2) => false) // 还能应答 = 没停成
+        .catch(() => true); // 连不上 = 服务确实没了
+    }
+    if (!stopped) {
+      toast("服务没有停成——看看服务窗口里的报错，或直接关掉那个控制台窗口再拔盘", "err");
+      return;
+    }
+    document.body.innerHTML = `<div style="min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font-family:var(--sans)">
+      <div style="text-align:center;padding:24px">
+        <svg style="width:44px;height:44px;color:var(--accent)" viewBox="0 0 48 48"><use href="#i-brand"/></svg>
+        <p style="font-size:20px;font-weight:600;margin:14px 0 6px">服务已停止</p>
+        <p style="color:var(--muted);font-size:14px">可以拔盘了。下次双击「启动U-Agent.bat」再见面。</p>
+      </div></div>`;
+  };
   // （#sbWs 工作区胶囊的点击绑在 picker.js：点开就是换工作区的面板，不再直接跳设置）
   // 侧栏收起/展开：桌面点左上菜单键直接收起整列（状态记本地）；窄屏仍走抽屉
   try { if (localStorage.getItem("ua_side") === "hidden") $("#app").classList.add("side-hidden"); } catch {}

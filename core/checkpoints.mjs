@@ -69,8 +69,8 @@ export class Checkpoints {
   }
 
   /* ---------- 拍快照 ---------- */
-  // paths: [{ path: 绝对路径, rel: 给人看的相对路径 }]
-  begin(sessionId, { tool, toolCallId, turn, paths }) {
+  // paths: [{ path: 绝对路径, rel: 给人看的相对路径 }]；ws = 当时的工作区（回滚时核对身份用）
+  begin(sessionId, { tool, toolCallId, turn, paths, ws }) {
     const id = genId("cp");
     const entries = [];
     const state = { files: 0, bytes: 0, full: false };
@@ -78,7 +78,7 @@ export class Checkpoints {
       if (!p?.path) continue;
       this.snapOne(sessionId, id, p.path, p.rel || p.path, entries, state);
     }
-    this.append(sessionId, { id, tool, toolCallId, turn: turn || 0, entries });
+    this.append(sessionId, { id, tool, toolCallId, turn: turn || 0, ws: ws || "", entries });
     this.prune(sessionId);
     return { id, entries };
   }
@@ -188,11 +188,23 @@ export class Checkpoints {
 
   /* ---------- 回滚 ---------- */
   // ids: 要撤销的检查点（按「本轮改动」卡片上的顺序给，内部会倒着放回去）
-  rollback(sessionId, ids, { force = false } = {}) {
+  // ws = 当前工作区（评审：便携身份核对）。检查点认工作区身份——换电脑/换盘符后，
+  // 同样的盘符不代表同一个目录，绝对路径盲目还原会把文件写进不相干的地方，所以身份对不上直接拒绝（force 也不放行）。
+  rollback(sessionId, ids, { force = false, ws = "" } = {}) {
     const recs = this.read(sessionId).filter((r) => r.id && !r.type);
     const byId = new Map(recs.map((r) => [r.id, r]));
     const targets = (ids || []).map((i) => byId.get(i)).filter(Boolean).sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     if (!targets.length) return { ok: false, error: "找不到这些检查点（可能已被清理，或这个会话不是本机产生的）" };
+    const IDENTITY = (hint) => `这些检查点是在另一个工作区记的（可能换过电脑或盘符），不能盲目还原${hint}`;
+    for (const rec of targets) {
+      if (rec.ws) {
+        if (ws && rec.ws !== ws) return { ok: false, error: IDENTITY(`：检查点记于「${rec.ws}」，当前工作区是「${ws}」。先在设置里确认工作区。`) };
+      } else {
+        // 老记录没记 ws：退回看条目绝对路径是否还在当前工作区里
+        const sample = (rec.entries || [])[0]?.path || "";
+        if (sample && ws && !sample.startsWith(ws)) return { ok: false, error: IDENTITY("。") };
+      }
+    }
 
     // 先查一遍：这批改动之后文件是否又被动过？
     // 同一文件在一批里只看最后一次记录的指纹——前面那些本来就是被后面盖掉的中间态
